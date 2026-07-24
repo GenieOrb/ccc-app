@@ -5,30 +5,32 @@ import { getConfig } from './config';
 
 neonConfig.webSocketConstructor = ws;
 
-let globalPool: Pool | null = null;
-
-export function getDbPool(): Pool {
-  if (!globalPool) {
-    const config = getConfig();
-    if (!config.databaseUrl) {
-      throw new Error('DATABASE_URL is not defined in environment.');
-    }
-    globalPool = new Pool({
-      connectionString: config.databaseUrl,
-      max: 10,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
-    });
+function createDbPool(): Pool {
+  const config = getConfig();
+  if (!config.databaseUrl) {
+    throw new Error('DATABASE_URL is not defined in environment.');
   }
-  return globalPool;
+  return new Pool({
+    connectionString: config.databaseUrl,
+    max: 1,
+    connectionTimeoutMillis: 10000,
+  });
 }
 
 export async function withTransaction<T>(
   callback: (client: PoolClient) => Promise<T>,
   options?: { lockTimeoutMs?: number; statementTimeoutMs?: number }
 ): Promise<T> {
-  const pool = getDbPool();
-  const client = await pool.connect();
+  const pool = createDbPool();
+  let client: PoolClient;
+
+  try {
+    client = await pool.connect();
+  } catch (error) {
+    try { await pool.end(); } catch {}
+    throw error;
+  }
+
   const lockTimeout = options?.lockTimeoutMs ?? 3000;
   const statementTimeout = options?.statementTimeoutMs ?? 10000;
 
@@ -48,6 +50,11 @@ export async function withTransaction<T>(
     throw error;
   } finally {
     client.release();
+    try {
+      await pool.end();
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -56,8 +63,16 @@ export async function queryDb<T = Record<string, unknown>>(
   params: unknown[] = [],
   options?: { statementTimeoutMs?: number }
 ): Promise<T[]> {
-  const pool = getDbPool();
-  const client = await pool.connect();
+  const pool = createDbPool();
+  let client: PoolClient;
+
+  try {
+    client = await pool.connect();
+  } catch (error) {
+    try { await pool.end(); } catch {}
+    throw error;
+  }
+
   const statementTimeout = options?.statementTimeoutMs ?? 10000;
 
   try {
@@ -75,5 +90,10 @@ export async function queryDb<T = Record<string, unknown>>(
     throw error;
   } finally {
     client.release();
+    try {
+      await pool.end();
+    } catch {
+      // ignore
+    }
   }
 }

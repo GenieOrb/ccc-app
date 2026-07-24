@@ -161,6 +161,7 @@ Antes de aceptar un comentario generado:
 
 ## 19. Base de Datos
 - Neon PostgreSQL vía `@neondatabase/serverless` (WebSocket `Pool` para transacciones interactivas).
+- En Vercel, los pools WebSocket no se reutilizan globalmente. Cada operación (consulta o transacción) crea, utiliza y cierra su propio pool individual para evitar errores de conexión terminada. Las transacciones interactivas siguen usando `PoolClient`.
 - Tablas: `campaigns`, `campaign_posts`, `generation_cycles`, `generation_jobs`, `suggestions`, `visitors`, `assignments`, `admin_login_attempts`, `public_assignment_rate_limits`.
 
 ## 20. Autenticación Administrativa
@@ -281,3 +282,4 @@ Aún no están implementados:
 - `v1.2.0 (Fase 1)`: Implementada rotación segura de posts por visitante. Nuevas tablas (`visitor_campaign_states`, `assignment_post_clicks`) y reestructuración transaccional para garantizar inmutabilidad, idempotencia robusta y protección contra carreras. El botón `Post` ahora reserva la pestaña sincrónicamente y notifica avance para rotar al siguiente post en futuras visitas.
 - `Fixes Fase 1`: Corrección quirúrgica implementando validación estricta de UUID en `/complete`, unificación en transacción única con bloqueo `FOR SHARE` en campañas para evitar carreras de retirada, validación rigurosa de pertenencia y estado activo antes de completar clics, bloqueo síncrono del cliente contra dobles clics evitando cierres prematuros, manejo seguro del fallback y reintento en UI, e idempotencia real en `setup-db.sql` utilizando verificaciones internas y claves foráneas compuestas.
 - `v1.3.0 (Fase 2)`: Añadidas campañas manuales y perpetuas con `campaign_accounts` y duración configurable. Implementada gestión administrativa de cuentas y nuevos endpoints. Base de datos de `campaign_posts` preparada para cuenta de origen y expiración. Todavía sin Filtered Stream ni ingestión automática. Migración aún pendiente.
+- `v1.3.1`: Corregido el ciclo de vida de las conexiones Neon en entornos serverless para evitar reutilizar conexiones WebSocket terminadas, creando y cerrando un pool local por cada transacción.
