@@ -1,0 +1,863 @@
+import 'server-only';
+import { queryDb, withTransaction } from './db';
+import { parseMultipleXUrls, fetchXPosts } from './x-api';
+import { normalizeXAccounts } from './x-accounts';
+import { checkCampaignSafety } from './openai';
+import { generateSecureSlug } from './crypto';
+import { generateDeterministicSlotPlans } from './planner';
+import { processBackgroundQueue } from './worker';
+import { getConfig } from './config';
+
+export interface CampaignSummary {
+  id: string;
+  internalNumber: number;
+  internalId: string; // e.g. "Campaña 001"
+  slug: string;
+  publicUrl: string;
+  direction?: string;
+  isActive: boolean;
+  safetyAllowed: boolean;
+  safetyCategory?: string;
+  safetyReason?: string;
+  xPosts: { id: string; url: string; isRetired: boolean }[];
+  generationProgress: number; // percentage
+  validGeneratedCount: number;
+  availableCount: number;
+  assignedCount: number;
+  pendingProcessingJobsCount: number;
+  failedJobsCount: number;
+  hasUnresolvedFailedCycle: boolean;
+  campaignType: 'manual' | 'perpetual';
+  postActiveLifetimeHours?: number;
+  xAccounts: {
+    id: string;
+    username: string;
+    usernameNormalized: string;
+    isRemoved: boolean;
+    createdAt: string;
+    removedAt?: string;
+  }[];
+  withdrawnCount: number;
+  createdAt: string;
+}
+
+export async function getAllCampaigns(appBaseUrl: string): Promise<CampaignSummary[]> {
+  const campaigns = await queryDb<{
+    id: string;
+    internal_number: number;
+    slug: string;
+    campaign_type: 'manual' | 'perpetual';
+    post_active_lifetime_hours: number | null;
+    direction: string | null;
+    is_active: boolean;
+    safety_allowed: boolean;
+    safety_category: string | null;
+    safety_reason: string | null;
+    created_at: Date;
+  }>(`SELECT id, internal_number, slug, campaign_type, post_active_lifetime_hours, direction, is_active, safety_allowed, safety_category, safety_reason, created_at FROM campaigns ORDER BY internal_number DESC`);
+
+  const results: CampaignSummary[] = [];
+
+  for (const c of campaigns) {
+    const posts = await queryDb<{ id: string; canonical_url: string; retired_at: string | null }>(
+      `SELECT id, canonical_url, retired_at FROM campaign_posts WHERE campaign_id = $1 ORDER BY created_at ASC`,
+      [c.id]
+    );
+
+    const counts = await queryDb<{
+      valid_generated: string;
+      available: string;
+      assigned: string;
+      withdrawn: string;
+      pending_processing_jobs: string;
+      failed_jobs: string;
+      has_failed_cycle: boolean;
+    }>(
+      `SELECT 
+         (SELECT COUNT(*) FROM suggestions WHERE campaign_id = $1) as valid_generated,
+         (SELECT COUNT(*) FROM suggestions WHERE campaign_id = $1 AND status = 'available') as available,
+         (SELECT COUNT(*) FROM suggestions WHERE campaign_id = $1 AND status = 'assigned') as assigned,
+         (SELECT COUNT(*) FROM suggestions WHERE campaign_id = $1 AND status = 'withdrawn') as withdrawn,
+         (SELECT COUNT(*) FROM generation_jobs WHERE campaign_id = $1 AND status IN ('pending', 'processing')) as pending_processing_jobs,
+         (SELECT COUNT(*) FROM generation_jobs WHERE campaign_id = $1 AND status = 'failed') as failed_jobs,
+         EXISTS (SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND status = 'failed') as has_failed_cycle`,
+      [c.id]
+    );
+
+    const countData = counts[0] || {
+      valid_generated: '0',
+      available: '0',
+      assigned: '0',
+      withdrawn: '0',
+      pending_processing_jobs: '0',
+      failed_jobs: '0',
+      has_failed_cycle: false,
+    };
+
+    const validGen = parseInt(countData.valid_generated, 10);
+    const avail = parseInt(countData.available, 10);
+    const assig = parseInt(countData.assigned, 10);
+    const withdrawn = parseInt(countData.withdrawn || '0', 10);
+    const pendProcJobs = parseInt(countData.pending_processing_jobs, 10);
+    const failJobs = parseInt(countData.failed_jobs, 10);
+
+    const internalId = `Campaña ${String(c.internal_number).padStart(3, '0')}`;
+    const publicUrl = `${appBaseUrl.replace(/\/+$/, '')}/comment/${c.slug}`;
+
+    // Progress percentage based on 50 initial target
+    const progress = Math.min(100, Math.round((validGen / 50) * 100));
+
+    const accounts = await queryDb<{
+      id: string;
+      username: string;
+      username_normalized: string;
+      created_at: string;
+      removed_at: string | null;
+    }>(
+      `SELECT id, username, username_normalized, created_at, removed_at 
+       FROM campaign_accounts 
+       WHERE campaign_id = $1 
+       ORDER BY created_at ASC`,
+      [c.id]
+    );
+
+    results.push({
+      id: c.id,
+      internalNumber: c.internal_number,
+      internalId,
+      slug: c.slug,
+      campaignType: c.campaign_type,
+      postActiveLifetimeHours: c.post_active_lifetime_hours ?? undefined,
+      publicUrl,
+      direction: c.direction || undefined,
+      isActive: c.is_active,
+      safetyAllowed: c.safety_allowed,
+      safetyCategory: c.safety_category || undefined,
+      safetyReason: c.safety_reason || undefined,
+      xPosts: posts.map((p) => ({ id: p.id, url: p.canonical_url, isRetired: p.retired_at !== null })),
+      xAccounts: accounts.map(a => ({
+        id: a.id,
+        username: a.username,
+        usernameNormalized: a.username_normalized,
+        isRemoved: a.removed_at !== null,
+        createdAt: new Date(a.created_at).toISOString(),
+        removedAt: a.removed_at ? new Date(a.removed_at).toISOString() : undefined
+      })),
+      generationProgress: progress,
+      validGeneratedCount: validGen,
+      availableCount: avail,
+      assignedCount: assig,
+      pendingProcessingJobsCount: pendProcJobs,
+      failedJobsCount: failJobs,
+      hasUnresolvedFailedCycle: countData.has_failed_cycle,
+      withdrawnCount: withdrawn,
+      createdAt: new Date(c.created_at).toISOString(),
+    });
+  }
+
+  return results;
+}
+
+export async function createCampaign(params: {
+  urlsInput: string;
+  direction?: string;
+}): Promise<{ id: string; slug: string }> {
+  // 1. Validate & deduplicate X URLs
+  const extractedUrls = parseMultipleXUrls(params.urlsInput);
+
+  // 2. Fetch posts from X API
+  const fetchedPosts = await fetchXPosts(extractedUrls);
+
+  // 3. Safety Preflight via OpenAI
+  const postsTexts = fetchedPosts.map((fp) => fp.textContent);
+  const safetyResult = await checkCampaignSafety(postsTexts, params.direction);
+
+  if (!safetyResult.allowed) {
+    throw new Error(
+      `La campaña fue rechazada por la política de seguridad. Categoria: ${safetyResult.category}. Motivo: ${safetyResult.reason}`
+    );
+  }
+
+  // 4. Generate random slug
+  const slug = generateSecureSlug(16);
+
+  // 5. Execute transactional campaign creation
+  const created = await withTransaction(async (client) => {
+    // Insert Campaign
+    const campRes = await client.query<{ id: string }>(
+      `INSERT INTO campaigns (
+         slug, campaign_type, direction, post_active_lifetime_hours, is_active, safety_allowed, safety_category, safety_reason,
+         initial_size, replenishment_threshold, replenishment_size
+       ) VALUES (
+         $1, 'manual', $2, NULL, false, true, $3, $4, 50, 20, 50
+       ) RETURNING id`,
+      [slug, params.direction || null, safetyResult.category, safetyResult.reason]
+    );
+    const campaignId = campRes.rows[0].id;
+
+    // Insert Campaign Posts and collect IDs
+    const campaignPostIds: string[] = [];
+    for (const fp of fetchedPosts) {
+      const postRes = await client.query<{ id: string }>(
+        `INSERT INTO campaign_posts (
+           campaign_id, x_post_id, input_url, canonical_url, author_name, author_username,
+           text_content, language, conversation_id, posted_at, accessible_context
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+         ) RETURNING id`,
+        [
+          campaignId,
+          fp.postId,
+          fp.inputUrl,
+          fp.canonicalUrl,
+          fp.authorName,
+          fp.authorUsername,
+          fp.textContent,
+          fp.language,
+          fp.conversationId,
+          fp.postedAt ? new Date(fp.postedAt) : null,
+          JSON.stringify(fp.accessibleContext),
+        ]
+      );
+      campaignPostIds.push(postRes.rows[0].id);
+    }
+
+    // Generate 50 slot plans balanced across posts
+    const slotPlans = generateDeterministicSlotPlans(campaignPostIds, 50);
+
+    // Create Initial Generation Cycle
+    const cycleRes = await client.query<{ id: string }>(
+      `INSERT INTO generation_cycles (
+         campaign_id, cycle_type, target_count, status, model_name, prompt_version
+       ) VALUES (
+         $1, 'initial', 50, 'pending', $2, 1
+       ) RETURNING id`,
+      [campaignId, getConfig().openaiModel]
+    );
+    const cycleId = cycleRes.rows[0].id;
+
+    // Create 50 Generation Jobs
+    for (const plan of slotPlans) {
+      await client.query(
+        `INSERT INTO generation_jobs (
+           cycle_id, campaign_id, campaign_post_id, slot_index, slot_plan,
+           length_mode, emoji_policy, rhetorical_form, texture, status,
+           model_name, prompt_version
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, 1
+         )`,
+        [
+          cycleId,
+          campaignId,
+          plan.assignedPostId,
+          plan.slotIndex,
+          JSON.stringify(plan),
+          plan.lengthMode,
+          plan.emojiPolicy,
+          plan.rhetoricalForm,
+          plan.texture,
+          getConfig().openaiModel,
+        ]
+      );
+    }
+
+    return { id: campaignId, slug };
+  });
+
+  // Background trigger worker execution
+  processBackgroundQueue().catch((err) => {
+    console.error('Background worker trigger error after campaign creation:', err);
+  });
+
+  return created;
+}
+
+export async function toggleCampaignStatus(campaignId: string): Promise<boolean> {
+  return await withTransaction(async (client) => {
+    const campRes = await client.query<{ is_active: boolean; campaign_type: 'manual' | 'perpetual' }>(
+      `SELECT is_active, campaign_type FROM campaigns WHERE id = $1 FOR UPDATE`,
+      [campaignId]
+    );
+    if (campRes.rows.length === 0) {
+      throw new Error('Campaña no encontrada.');
+    }
+
+    const currentStatus = campRes.rows[0].is_active;
+    const campaignType = campRes.rows[0].campaign_type;
+
+    if (!currentStatus) {
+      if (campaignType === 'manual') {
+        // Trying to activate: check if initial cycle generated its target count, and at least 1 comment is available.
+        const cycleRes = await client.query<{ status: string; target_count: number; valid_produced_count: number }>(
+          `SELECT status, target_count, valid_produced_count 
+           FROM generation_cycles 
+           WHERE campaign_id = $1 AND cycle_type = 'initial' 
+           ORDER BY created_at ASC LIMIT 1`,
+          [campaignId]
+        );
+
+        if (cycleRes.rows.length === 0 || cycleRes.rows[0].status !== 'completed') {
+          throw new Error('No se puede activar: ciclo inicial inexistente o incompleto.');
+        }
+
+        const cycle = cycleRes.rows[0];
+
+        if (cycle.valid_produced_count < cycle.target_count) {
+          throw new Error('No se puede activar: ciclo inicial sin haber producido el objetivo.');
+        }
+
+        const availRes = await client.query<{ avail_count: string }>(
+          `SELECT COUNT(*) as avail_count FROM suggestions WHERE campaign_id = $1 AND status = 'available'`,
+          [campaignId]
+        );
+        const avail = parseInt(availRes.rows[0]?.avail_count || '0', 10);
+
+        if (avail < 1) {
+          throw new Error('No se puede activar: ausencia de comentarios disponibles.');
+        }
+      } else {
+        // Perpetual campaign activation logic
+        const accountsRes = await client.query<{ count: string }>(
+          `SELECT COUNT(*) FROM campaign_accounts WHERE campaign_id = $1 AND removed_at IS NULL`,
+          [campaignId]
+        );
+        const activeAccountsCount = parseInt(accountsRes.rows[0]?.count || '0', 10);
+        
+        if (activeAccountsCount < 1) {
+          throw new Error('No se puede activar: debe tener al menos una cuenta de X activa.');
+        }
+      }
+
+      await client.query(`UPDATE campaigns SET is_active = true, updated_at = NOW() WHERE id = $1`, [
+        campaignId,
+      ]);
+      return true;
+    } else {
+      await client.query(`UPDATE campaigns SET is_active = false, updated_at = NOW() WHERE id = $1`, [
+        campaignId,
+      ]);
+      return false;
+    }
+  });
+}
+
+export async function retryFailedCampaignJobs(campaignId: string): Promise<void> {
+  await withTransaction(async (client) => {
+    // Find a cycle that has failed jobs, prioritizing 'initial' over others, oldest first.
+    const cycleRes = await client.query<{ id: string }>(
+      `SELECT id 
+       FROM generation_cycles 
+       WHERE campaign_id = $1 
+         AND EXISTS (
+           SELECT 1 FROM generation_jobs 
+           WHERE cycle_id = generation_cycles.id AND status = 'failed'
+         )
+       ORDER BY CASE WHEN cycle_type = 'initial' THEN 0 ELSE 1 END ASC, created_at ASC
+       LIMIT 1
+       FOR UPDATE`,
+      [campaignId]
+    );
+
+    if (cycleRes.rows.length === 0) {
+      throw new Error('No hay trabajos fallidos que reintentar en esta campaña.');
+    }
+
+    const cycleId = cycleRes.rows[0].id;
+
+    // Reset all failed jobs in cycle to pending
+    await client.query(
+      `UPDATE generation_jobs 
+       SET status = 'pending',
+           attempts_count = 0,
+           error_message = NULL,
+           lease_owner = NULL,
+           lease_expires_at = NULL,
+           next_attempt_at = NOW(),
+           updated_at = NOW()
+       WHERE cycle_id = $1 AND status = 'failed'`,
+      [cycleId]
+    );
+
+    // Reset cycle status to processing
+    await client.query(
+      `UPDATE generation_cycles 
+       SET status = 'processing',
+           error_message = NULL
+       WHERE id = $1`,
+      [cycleId]
+    );
+  });
+
+  // Trigger worker
+  processBackgroundQueue().catch((err) => {
+    console.error('Background worker error after retrying jobs:', err);
+  });
+}
+
+export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<void> {
+  const availRows = await queryDb<{ count: string }>(
+    `SELECT COUNT(*) as count FROM suggestions WHERE campaign_id = $1 AND status = 'available'`,
+    [campaignId]
+  );
+  const availableCount = parseInt(availRows[0]?.count || '0', 10);
+
+  if (availableCount > 20) {
+    return; // Inventory is safe
+  }
+
+  // Fast path check outside transaction
+  const cycleRows = await queryDb<{ status: string }>(
+    `SELECT status FROM generation_cycles WHERE campaign_id = $1 AND status IN ('pending', 'processing', 'failed') ORDER BY created_at DESC LIMIT 1`,
+    [campaignId]
+  );
+
+  if (cycleRows.length > 0) {
+    // An active or failed cycle already exists, do not create infinite cycles
+    return;
+  }
+
+  try {
+    await withTransaction(async (client) => {
+      // 1. Acquire campaign row-level lock to prevent concurrent replenishment runs
+      await client.query(`SELECT 1 FROM campaigns WHERE id = $1 FOR UPDATE`, [campaignId]);
+
+      // Re-verify inventory under lock
+      const availRowsLock = await client.query<{ count: string }>(
+        `SELECT COUNT(*) as count FROM suggestions WHERE campaign_id = $1 AND status = 'available'`,
+        [campaignId]
+      );
+      const availableCountLock = parseInt(availRowsLock.rows[0]?.count || '0', 10);
+      if (availableCountLock > 20) return;
+
+      // Re-verify cycles under lock
+      const checkRes = await client.query(
+        `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND status IN ('pending', 'processing', 'failed') LIMIT 1`,
+        [campaignId]
+      );
+      if (checkRes.rows.length > 0) return;
+
+      // Get active campaign posts for slot assignment under lock
+      const postRows = await client.query<{ id: string }>(
+        `SELECT id FROM campaign_posts WHERE campaign_id = $1 AND retired_at IS NULL ORDER BY created_at ASC`,
+        [campaignId]
+      );
+      const campaignPostIds = postRows.rows.map((p) => p.id);
+      if (campaignPostIds.length === 0) return;
+
+      const slotPlans = generateDeterministicSlotPlans(campaignPostIds, 50);
+
+      const cycleRes = await client.query<{ id: string }>(
+        `INSERT INTO generation_cycles (
+           campaign_id, cycle_type, target_count, status, model_name, prompt_version
+         ) VALUES (
+           $1, 'replenishment', 50, 'pending', $2, 1
+         ) RETURNING id`,
+        [campaignId, getConfig().openaiModel]
+      );
+      const cycleId = cycleRes.rows[0].id;
+
+      for (const plan of slotPlans) {
+        await client.query(
+          `INSERT INTO generation_jobs (
+             cycle_id, campaign_id, campaign_post_id, slot_index, slot_plan,
+             length_mode, emoji_policy, rhetorical_form, texture, status,
+             model_name, prompt_version
+           ) VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, 1
+           )`,
+          [
+            cycleId,
+            campaignId,
+            plan.assignedPostId,
+            plan.slotIndex,
+            JSON.stringify(plan),
+            plan.lengthMode,
+            plan.emojiPolicy,
+            plan.rhetoricalForm,
+            plan.texture,
+            getConfig().openaiModel,
+          ]
+        );
+      }
+    });
+
+    processBackgroundQueue().catch((err) => {
+      console.error('Background worker error after triggering replenishment:', err);
+    });
+  } catch {
+    // Ignore duplicate cycle creation conflicts gracefully
+  }
+}
+
+export type AssignmentResponse =
+  | { status: 'success'; assignmentId: string; comment: string; postUrl: string }
+  | { status: 'expired' }
+  | { status: 'unavailable' }
+  | { status: 'no_inventory' }
+  | { status: 'rate_limited' };
+
+type InternalAssignmentResponse = 
+  | { status: 'success'; assignmentId: string; comment: string; postUrl: string; isNewAssignment?: boolean; campaignId?: string }
+  | { status: 'expired' }
+  | { status: 'unavailable' }
+  | { status: 'no_inventory'; campaignId: string }
+  | { status: 'rate_limited' };
+
+export async function assignCommentToVisitor(
+  slug: string,
+  visitorHash: string,
+  checkRateLimit?: () => Promise<boolean>
+): Promise<AssignmentResponse> {
+  const txResult = await withTransaction<InternalAssignmentResponse>(async (client) => {
+    // 1. Fetch campaign by slug FOR SHARE
+    const campaignRows = await client.query<{ id: string; is_active: boolean }>(
+      `SELECT id, is_active FROM campaigns WHERE slug = $1 FOR SHARE`,
+      [slug]
+    );
+
+    if (campaignRows.rows.length === 0 || !campaignRows.rows[0].is_active) {
+      return { status: 'expired' };
+    }
+
+    const campaignId = campaignRows.rows[0].id;
+    // 2. Ensure visitor record exists
+    const visitorRes = await client.query<{ id: string }>(
+      `INSERT INTO visitors (visitor_hash)
+       VALUES ($1)
+       ON CONFLICT (visitor_hash) DO UPDATE SET visitor_hash = EXCLUDED.visitor_hash
+       RETURNING id`,
+      [visitorHash]
+    );
+    const visitorId = visitorRes.rows[0].id;
+
+    // 3. Upsert visitor_campaign_states and lock it
+    await client.query(
+      `INSERT INTO visitor_campaign_states (campaign_id, visitor_id)
+       VALUES ($1, $2)
+       ON CONFLICT (campaign_id, visitor_id) DO NOTHING`,
+      [campaignId, visitorId]
+    );
+
+    const stateRes = await client.query<{ active_assignment_id: string | null }>(
+      `SELECT active_assignment_id
+       FROM visitor_campaign_states
+       WHERE campaign_id = $1 AND visitor_id = $2
+       FOR UPDATE`,
+      [campaignId, visitorId]
+    );
+
+    const activeAssignmentId = stateRes.rows[0].active_assignment_id;
+
+    // 4. If there's an active assignment, return it directly
+    if (activeAssignmentId) {
+      const existingRes = await client.query<{
+        comment_text: string;
+        canonical_url: string;
+      }>(
+        `SELECT s.comment_text, p.canonical_url
+         FROM assignments a
+         JOIN suggestions s ON a.suggestion_id = s.id
+         JOIN campaign_posts p ON a.campaign_post_id = p.id
+         WHERE a.id = $1`,
+        [activeAssignmentId]
+      );
+      
+      if (existingRes.rows.length > 0) {
+        const row = existingRes.rows[0];
+        return {
+          status: 'success',
+          assignmentId: activeAssignmentId,
+          comment: row.comment_text,
+          postUrl: row.canonical_url,
+        };
+      }
+    }
+
+    // 5. No active assignment. Check if there are any valid unseen posts
+    const unseenPostRes = await client.query<{ id: string }>(
+      `SELECT cp.id
+       FROM campaign_posts cp
+       WHERE cp.campaign_id = $1 
+         AND cp.retired_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM assignments a 
+           WHERE a.campaign_id = cp.campaign_id 
+             AND a.visitor_id = $2 
+             AND a.campaign_post_id = cp.id
+         )
+       LIMIT 1`,
+      [campaignId, visitorId]
+    );
+
+    if (unseenPostRes.rows.length === 0) {
+      return { status: 'unavailable' };
+    }
+
+    // 6. Apply rate limit ONLY for new assignments
+    if (checkRateLimit) {
+      const allowed = await checkRateLimit();
+      if (!allowed) {
+        return { status: 'rate_limited' };
+      }
+    }
+
+    // 7. Select available suggestion FOR UPDATE SKIP LOCKED
+    const suggestionRes = await client.query<{
+      suggestion_id: string;
+      campaign_post_id: string;
+      comment_text: string;
+      canonical_url: string;
+    }>(
+      `SELECT s.id as suggestion_id, s.campaign_post_id, s.comment_text, p.canonical_url
+       FROM suggestions s
+       JOIN campaign_posts p ON s.campaign_post_id = p.id
+       WHERE s.campaign_id = $1 AND s.status = 'available' AND p.retired_at IS NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM assignments a 
+           WHERE a.campaign_id = s.campaign_id 
+             AND a.visitor_id = $2 
+             AND a.campaign_post_id = s.campaign_post_id
+       )
+       ORDER BY s.delivery_order ASC, s.created_at ASC
+       LIMIT 1
+       FOR UPDATE OF s SKIP LOCKED`,
+      [campaignId, visitorId]
+    );
+
+    if (suggestionRes.rows.length === 0) {
+      return { status: 'no_inventory', campaignId };
+    }
+
+    const claimedSuggestion = suggestionRes.rows[0];
+
+    // 8. Create Assignment record
+    const insertAssignmentRes = await client.query<{ id: string }>(
+      `INSERT INTO assignments (campaign_id, visitor_id, campaign_post_id, suggestion_id)
+       VALUES ($1, $2, $3, $4) RETURNING id`,
+      [campaignId, visitorId, claimedSuggestion.campaign_post_id, claimedSuggestion.suggestion_id]
+    );
+
+    const newAssignmentId = insertAssignmentRes.rows[0].id;
+
+    // 9. Update Suggestion status to assigned Conditionally
+    const updateSuggRes = await client.query(
+      `UPDATE suggestions
+       SET status = 'assigned', assigned_at = NOW()
+       WHERE id = $1 AND status = 'available'
+       RETURNING id`,
+      [claimedSuggestion.suggestion_id]
+    );
+
+    if (updateSuggRes.rows.length !== 1) {
+      throw new Error('Failed to update suggestion status securely');
+    }
+
+    // 10. Update visitor_campaign_states with active assignment Conditionally
+    const updateStateRes = await client.query(
+      `UPDATE visitor_campaign_states
+       SET active_assignment_id = $1, updated_at = NOW()
+       WHERE campaign_id = $2 AND visitor_id = $3 AND active_assignment_id IS NULL
+       RETURNING 1`,
+      [newAssignmentId, campaignId, visitorId]
+    );
+
+    if (updateStateRes.rows.length !== 1) {
+      throw new Error('Failed to assign active assignment state securely');
+    }
+
+    return {
+      status: 'success',
+      assignmentId: newAssignmentId,
+      comment: claimedSuggestion.comment_text,
+      postUrl: claimedSuggestion.canonical_url,
+      isNewAssignment: true,
+      campaignId,
+    };
+  });
+
+  if ((txResult.status === 'success' && txResult.isNewAssignment) || txResult.status === 'no_inventory') {
+    if (txResult.campaignId) {
+      // 11. Check replenishment threshold asynchronously AFTER commit
+      triggerReplenishmentIfNeeded(txResult.campaignId).catch(() => {});
+    }
+  }
+
+  // Map to public AssignmentResponse
+  if (txResult.status === 'success') {
+    return {
+      status: 'success',
+      assignmentId: txResult.assignmentId,
+      comment: txResult.comment,
+      postUrl: txResult.postUrl,
+    };
+  }
+  
+  if (txResult.status === 'no_inventory') {
+    return { status: 'no_inventory' };
+  }
+
+  return txResult;
+}
+
+export async function createPerpetualCampaign(params: {
+  accountsInput: string;
+  direction?: string;
+  postActiveLifetimeHours: number;
+}): Promise<{ id: string; slug: string }> {
+  const normalizedAccounts = normalizeXAccounts(params.accountsInput);
+
+  if (params.postActiveLifetimeHours < 1 || params.postActiveLifetimeHours > 720 || !Number.isInteger(params.postActiveLifetimeHours)) {
+    throw new Error('La duración de los posts debe ser un número entero entre 1 y 720 horas.');
+  }
+
+  const slug = generateSecureSlug(16);
+
+  return await withTransaction(async (client) => {
+    // Insert Campaign
+    const campRes = await client.query<{ id: string }>(
+      `INSERT INTO campaigns (
+         slug, campaign_type, direction, post_active_lifetime_hours, is_active, safety_allowed,
+         initial_size, replenishment_threshold, replenishment_size
+       ) VALUES (
+         $1, 'perpetual', $2, $3, false, true, 50, 20, 50
+       ) RETURNING id`,
+      [slug, params.direction || null, params.postActiveLifetimeHours]
+    );
+    const campaignId = campRes.rows[0].id;
+
+    for (const acc of normalizedAccounts) {
+      await client.query(
+        `INSERT INTO campaign_accounts (
+           campaign_id, username, username_normalized
+         ) VALUES ($1, $2, $3)`,
+        [campaignId, acc.username, acc.username_normalized]
+      );
+    }
+
+    return { id: campaignId, slug };
+  });
+}
+
+export async function addAccountsToCampaign(campaignId: string, accountsInput: string) {
+  const normalizedAccounts = normalizeXAccounts(accountsInput);
+
+  return await withTransaction(async (client) => {
+    const campRes = await client.query<{ campaign_type: string }>(
+      `SELECT campaign_type FROM campaigns WHERE id = $1 FOR UPDATE`,
+      [campaignId]
+    );
+
+    if (campRes.rows.length === 0) {
+      throw new Error('Campaña no encontrada.');
+    }
+
+    if (campRes.rows[0].campaign_type !== 'perpetual') {
+      throw new Error('Solo se pueden añadir cuentas a campañas perpetuas.');
+    }
+
+    const addedAccounts = [];
+
+    for (const acc of normalizedAccounts) {
+      // Check if it already exists and is active
+      const existingRes = await client.query<{ id: string }>(
+        `SELECT id FROM campaign_accounts 
+         WHERE campaign_id = $1 AND username_normalized = $2 AND removed_at IS NULL`,
+        [campaignId, acc.username_normalized]
+      );
+
+      if (existingRes.rows.length === 0) {
+        const insertRes = await client.query<{ id: string; username: string; username_normalized: string; created_at: Date; removed_at: Date | null }>(
+          `INSERT INTO campaign_accounts (campaign_id, username, username_normalized) 
+           VALUES ($1, $2, $3) 
+           RETURNING id, username, username_normalized, created_at, removed_at`,
+          [campaignId, acc.username, acc.username_normalized]
+        );
+        addedAccounts.push({
+          id: insertRes.rows[0].id,
+          username: insertRes.rows[0].username,
+          usernameNormalized: insertRes.rows[0].username_normalized,
+          isRemoved: false,
+          createdAt: new Date(insertRes.rows[0].created_at).toISOString(),
+          removedAt: undefined
+        });
+      }
+    }
+
+    return addedAccounts;
+  });
+}
+
+export async function removeAccountFromCampaign(campaignId: string, accountId: string) {
+  return await withTransaction(async (client) => {
+    const campRes = await client.query<{ campaign_type: string }>(
+      `SELECT campaign_type FROM campaigns WHERE id = $1 FOR UPDATE`,
+      [campaignId]
+    );
+
+    if (campRes.rows.length === 0) {
+      throw new Error('Campaña no encontrada.');
+    }
+
+    if (campRes.rows[0].campaign_type !== 'perpetual') {
+      throw new Error('Las campañas manuales no gestionan cuentas.');
+    }
+
+    const updateRes = await client.query(
+      `UPDATE campaign_accounts 
+       SET removed_at = NOW() 
+       WHERE id = $1 AND campaign_id = $2 AND removed_at IS NULL 
+       RETURNING id`,
+      [accountId, campaignId]
+    );
+
+    if (updateRes.rows.length !== 1) {
+      throw new Error('La cuenta no pertenece a esta campaña, o ya estaba retirada.');
+    }
+
+    return { success: true };
+  });
+}
+
+export async function updateCampaignDuration(campaignId: string, postActiveLifetimeHours: number) {
+  if (postActiveLifetimeHours < 1 || postActiveLifetimeHours > 720 || !Number.isInteger(postActiveLifetimeHours)) {
+    throw new Error('La duración de los posts debe ser un número entero entre 1 y 720 horas.');
+  }
+
+  return await withTransaction(async (client) => {
+    const campRes = await client.query<{ campaign_type: string }>(
+      `SELECT campaign_type FROM campaigns WHERE id = $1 FOR UPDATE`,
+      [campaignId]
+    );
+
+    if (campRes.rows.length === 0) {
+      throw new Error('Campaña no encontrada.');
+    }
+
+    if (campRes.rows[0].campaign_type !== 'perpetual') {
+      throw new Error('Solo se puede cambiar la duración automática de posts en campañas perpetuas.');
+    }
+
+    await client.query(
+      `UPDATE campaigns SET post_active_lifetime_hours = $1, updated_at = NOW() WHERE id = $2`,
+      [postActiveLifetimeHours, campaignId]
+    );
+
+    // Recalcular expiración
+    await client.query(
+      `UPDATE campaign_posts 
+       SET expires_at = COALESCE(posted_at, created_at) + interval '1 hour' * $1
+       WHERE campaign_id = $2 AND retired_at IS NULL`,
+      [postActiveLifetimeHours, campaignId]
+    );
+
+    // Retirar instantáneamente los que quedaron expirados
+    await client.query(
+      `UPDATE campaign_posts 
+       SET retired_at = NOW() 
+       WHERE campaign_id = $1 AND retired_at IS NULL AND expires_at <= NOW()`,
+      [campaignId]
+    );
+
+    return { success: true };
+  });
+}

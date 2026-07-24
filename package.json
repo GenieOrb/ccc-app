@@ -1,0 +1,39 @@
+{
+  "name": "genieorb-comment-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "db:setup": "node scripts/setup-db.mjs",
+    "admin:hash-password": "node scripts/hash-admin-password.mjs"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.4",
+    "next": "^15.1.7",
+    "openai": "^4.85.4",
+    "postcss": "^8.5.22",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "sharp": "^0.35.3",
+    "ws": "^8.18.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@types/ws": "^8.5.14",
+    "eslint": "^9.20.1",
+    "eslint-config-next": "^15.1.7",
+    "typescript": "^5.7.3"
+  },
+  "overrides": {
+    "postcss": "^8.5.22",
+    "sharp": "^0.35.3"
+  }
+}
