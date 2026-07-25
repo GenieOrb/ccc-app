@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { getConfig } from '@/lib/config';
 import { safeCompareStrings } from '@/lib/crypto';
 import { processBackgroundQueue } from '@/lib/worker';
+import { processPerpetualCampaigns } from '@/lib/perpetual-monitor';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -37,9 +38,20 @@ async function handleProcess(req: Request) {
   }
 
   try {
-    const result = await processBackgroundQueue();
+    const startPerpetual = Date.now();
+    // Le damos 15 segundos al monitor de campañas perpetuas
+    const perpetualResult = await processPerpetualCampaigns(15000);
+
+    // El worker puede usar el resto del tiempo hasta llegar cerca de los 60s
+    const workerBudgetMs = Math.max(0, 50000 - (Date.now() - startPerpetual));
+    const workerResult = await processBackgroundQueue(undefined, workerBudgetMs);
+
     return NextResponse.json(
-      { success: true, ...result },
+      {
+        success: true,
+        monitor: perpetualResult,
+        worker: workerResult
+      },
       { headers: { 'Cache-Control': 'no-store' } }
     );
   } catch {

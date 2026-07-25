@@ -1,6 +1,6 @@
 import 'server-only';
 import { queryDb, withTransaction } from './db';
-import { parseMultipleXUrls, fetchXPosts } from './x-api';
+import { parseMultipleXUrls, fetchXPosts, resolveXUsername } from './x-api';
 import { normalizeXAccounts } from './x-accounts';
 import { checkCampaignSafety } from './openai';
 import { generateSecureSlug } from './crypto';
@@ -395,59 +395,61 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
 }
 
 export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<void> {
-  const availRows = await queryDb<{ count: string }>(
-    `SELECT COUNT(*) as count FROM suggestions WHERE campaign_id = $1 AND status = 'available'`,
+  // Determine campaign type first outside transaction for fast paths
+  const campTypeRes = await queryDb<{ campaign_type: string, replenishment_threshold: number, replenishment_size: number }>(
+    `SELECT campaign_type, replenishment_threshold, replenishment_size FROM campaigns WHERE id = $1`,
     [campaignId]
   );
-  const availableCount = parseInt(availRows[0]?.count || '0', 10);
+  if (campTypeRes.length === 0) return;
+  const campaignInfo = campTypeRes[0];
+  const threshold = campaignInfo.replenishment_threshold;
+  const repSize = campaignInfo.replenishment_size;
 
-  if (availableCount > 20) {
-    return; // Inventory is safe
-  }
+  if (campaignInfo.campaign_type === 'manual') {
+    const availRows = await queryDb<{ count: string }>(
+      `SELECT COUNT(*) as count FROM suggestions WHERE campaign_id = $1 AND status = 'available'`,
+      [campaignId]
+    );
+    const availableCount = parseInt(availRows[0]?.count || '0', 10);
 
-  // Fast path check outside transaction
-  const cycleRows = await queryDb<{ status: string }>(
-    `SELECT status FROM generation_cycles WHERE campaign_id = $1 AND status IN ('pending', 'processing', 'failed') ORDER BY created_at DESC LIMIT 1`,
-    [campaignId]
-  );
+    if (availableCount > threshold) {
+      return;
+    }
 
-  if (cycleRows.length > 0) {
-    // An active or failed cycle already exists, do not create infinite cycles
-    return;
-  }
+    const cycleRows = await queryDb<{ status: string }>(
+      `SELECT status FROM generation_cycles WHERE campaign_id = $1 AND status IN ('pending', 'processing', 'failed') AND campaign_post_id IS NULL ORDER BY created_at DESC LIMIT 1`,
+      [campaignId]
+    );
 
-  try {
-    await withTransaction(async (client) => {
-      // 1. Acquire campaign row-level lock to prevent concurrent replenishment runs
-      await client.query(`SELECT 1 FROM campaigns WHERE id = $1 FOR UPDATE`, [campaignId]);
+    if (cycleRows.length > 0) return;
 
-      // Re-verify inventory under lock
-      const availRowsLock = await client.query<{ count: string }>(
-        `SELECT COUNT(*) as count FROM suggestions WHERE campaign_id = $1 AND status = 'available'`,
-        [campaignId]
-      );
-      const availableCountLock = parseInt(availRowsLock.rows[0]?.count || '0', 10);
-      if (availableCountLock > 20) return;
+    try {
+      await withTransaction(async (client) => {
+        await client.query(`SELECT 1 FROM campaigns WHERE id = $1 FOR UPDATE`, [campaignId]);
 
-      // Re-verify cycles under lock
-      const checkRes = await client.query(
-        `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND status IN ('pending', 'processing', 'failed') LIMIT 1`,
-        [campaignId]
-      );
-      if (checkRes.rows.length > 0) return;
+        const availRowsLock = await client.query<{ count: string }>(
+          `SELECT COUNT(*) as count FROM suggestions WHERE campaign_id = $1 AND status = 'available'`,
+          [campaignId]
+        );
+        if (parseInt(availRowsLock.rows[0]?.count || '0', 10) > threshold) return;
 
-      // Get active campaign posts for slot assignment under lock
-      const postRows = await client.query<{ id: string }>(
-        `SELECT id FROM campaign_posts WHERE campaign_id = $1 AND retired_at IS NULL ORDER BY created_at ASC`,
-        [campaignId]
-      );
-      const campaignPostIds = postRows.rows.map((p) => p.id);
-      if (campaignPostIds.length === 0) return;
+        const checkRes = await client.query(
+          `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND status IN ('pending', 'processing', 'failed') AND campaign_post_id IS NULL LIMIT 1`,
+          [campaignId]
+        );
+        if (checkRes.rows.length > 0) return;
 
-      const slotPlans = generateDeterministicSlotPlans(campaignPostIds, 50);
+        const postRows = await client.query<{ id: string }>(
+          `SELECT id FROM campaign_posts WHERE campaign_id = $1 AND retired_at IS NULL ORDER BY created_at ASC`,
+          [campaignId]
+        );
+        const campaignPostIds = postRows.rows.map((p) => p.id);
+        if (campaignPostIds.length === 0) return;
 
-      const cycleRes = await client.query<{ id: string }>(
-        `INSERT INTO generation_cycles (
+        const slotPlans = generateDeterministicSlotPlans(campaignPostIds, repSize);
+
+        const cycleRes = await client.query<{ id: string }>(
+          `INSERT INTO generation_cycles (
            campaign_id, cycle_type, target_count, status, model_name, prompt_version
          ) VALUES (
            $1, 'replenishment', 50, 'pending', $2, 1
@@ -487,6 +489,81 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
   } catch {
     // Ignore duplicate cycle creation conflicts gracefully
   }
+} else {
+  // Perpetual campaigns replenishment logic (per-post)
+  try {
+    await withTransaction(async (client) => {
+      // Get all non-retired posts for this campaign
+      const postRows = await client.query<{ id: string }>(
+        `SELECT id FROM campaign_posts WHERE campaign_id = $1 AND retired_at IS NULL`,
+        [campaignId]
+      );
+      if (postRows.rows.length === 0) return;
+      const campaignPostIds = postRows.rows.map((p) => p.id);
+
+      for (const postId of campaignPostIds) {
+        const availRowsLock = await client.query<{ count: string }>(
+          `SELECT COUNT(*) as count FROM suggestions WHERE campaign_id = $1 AND campaign_post_id = $2 AND status = 'available'`,
+          [campaignId, postId]
+        );
+        const availableCountLock = parseInt(availRowsLock.rows[0]?.count || '0', 10);
+        if (availableCountLock > threshold) continue;
+
+        const checkRes = await client.query(
+          `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND campaign_post_id = $2 AND status IN ('pending', 'processing', 'failed') LIMIT 1`,
+          [campaignId, postId]
+        );
+        if (checkRes.rows.length > 0) continue;
+
+        // Post lock to prevent concurrent replenishment for the same post
+        await client.query(`SELECT 1 FROM campaign_posts WHERE id = $1 FOR UPDATE`, [postId]);
+
+        const slotPlans = generateDeterministicSlotPlans([postId], repSize);
+        if (slotPlans.length === 0) continue;
+
+        const cycleRes = await client.query<{ id: string }>(
+          `INSERT INTO generation_cycles (
+             campaign_id, campaign_post_id, cycle_type, target_count, status, model_name, prompt_version
+           ) VALUES (
+             $1, $2, 'replenishment', 50, 'pending', $3, 1
+           ) RETURNING id`,
+          [campaignId, postId, getConfig().openaiModel]
+        );
+        const cycleId = cycleRes.rows[0].id;
+
+        for (const plan of slotPlans) {
+          await client.query(
+            `INSERT INTO generation_jobs (
+               cycle_id, campaign_id, campaign_post_id, slot_index, slot_plan,
+               length_mode, emoji_policy, rhetorical_form, texture, status,
+               model_name, prompt_version
+             ) VALUES (
+               $1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, 1
+             )`,
+            [
+              cycleId,
+              campaignId,
+              plan.assignedPostId,
+              plan.slotIndex,
+              JSON.stringify(plan),
+              plan.lengthMode,
+              plan.emojiPolicy,
+              plan.rhetoricalForm,
+              plan.texture,
+              getConfig().openaiModel,
+            ]
+          );
+        }
+      }
+    });
+
+    processBackgroundQueue().catch((err) => {
+      console.error('Background worker error after triggering replenishment:', err);
+    });
+  } catch {
+    // Ignore concurrency conflicts
+  }
+}
 }
 
 export type AssignmentResponse =
@@ -618,7 +695,7 @@ export async function assignCommentToVisitor(
              AND a.visitor_id = $2 
              AND a.campaign_post_id = s.campaign_post_id
        )
-       ORDER BY s.delivery_order ASC, s.created_at ASC
+       ORDER BY p.posted_at DESC NULLS LAST, p.created_at DESC, s.delivery_order ASC, s.created_at ASC
        LIMIT 1
        FOR UPDATE OF s SKIP LOCKED`,
       [campaignId, visitorId]
@@ -766,11 +843,20 @@ export async function addAccountsToCampaign(campaignId: string, accountsInput: s
       );
 
       if (existingRes.rows.length === 0) {
+        // Resolve X user ID before inserting
+        let xUserId: string | null = null;
+        try {
+          xUserId = await resolveXUsername(acc.username);
+        } catch (error: unknown) {
+          const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+          throw new Error(`Error al resolver el usuario @${acc.username}: ${errorMsg}`);
+        }
+
         const insertRes = await client.query<{ id: string; username: string; username_normalized: string; created_at: Date; removed_at: Date | null }>(
-          `INSERT INTO campaign_accounts (campaign_id, username, username_normalized) 
-           VALUES ($1, $2, $3) 
+          `INSERT INTO campaign_accounts (campaign_id, username, username_normalized, x_user_id, monitoring_started_at)
+           VALUES ($1, $2, $3, $4, NOW())
            RETURNING id, username, username_normalized, created_at, removed_at`,
-          [campaignId, acc.username, acc.username_normalized]
+          [campaignId, acc.username, acc.username_normalized, xUserId]
         );
         addedAccounts.push({
           id: insertRes.rows[0].id,

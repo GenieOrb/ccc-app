@@ -1,4 +1,5 @@
 import 'server-only';
+import type { PoolClient } from '@neondatabase/serverless';
 import { randomUUID } from 'node:crypto';
 import { queryDb, withTransaction } from './db';
 import { SlotPlan } from './planner';
@@ -25,13 +26,16 @@ export interface ClaimedJob {
   campaignDirection?: string;
 }
 
-export async function processBackgroundQueue(workerId: string = randomUUID()): Promise<{
+export async function processBackgroundQueue(
+  workerId: string = randomUUID(),
+  budgetMs: number = 50000
+): Promise<{
   processed: number;
   completed: number;
   failed: number;
 }> {
   const startTime = Date.now();
-  const maxExecutionTimeMs = 50000; // 50 seconds soft budget
+  const maxExecutionTimeMs = budgetMs;
   const maxParallelConcurrency = 3;
 
   let totalProcessed = 0;
@@ -119,7 +123,10 @@ async function claimNextJob(workerId: string): Promise<ClaimedJob | null> {
          OR (j.status = 'processing' AND j.lease_expires_at < NOW())
        )
        AND cy.status IN ('pending', 'processing')
-       ORDER BY j.created_at ASC
+       ORDER BY
+         (NOT EXISTS (SELECT 1 FROM suggestions s WHERE s.campaign_post_id = p.id AND s.status = 'available')) DESC,
+         p.posted_at DESC NULLS LAST,
+         j.created_at ASC
        LIMIT 1
        FOR UPDATE OF j SKIP LOCKED`
     );
@@ -183,6 +190,19 @@ async function executeJobTask(
   let rawComment = '';
   let validationReason = '';
 
+  // Check if post is retired or expired before calling OpenAI
+  const preCheckRows = await queryDb<{ id: string }>(
+    `SELECT id FROM campaign_posts WHERE id = $1 AND retired_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())`,
+    [job.campaignPostId]
+  );
+
+  if (preCheckRows.length === 0) {
+    await withTransaction(async (client) => {
+      await cancelJobAndCheckCycle(client, job.jobId, job.cycleId);
+    });
+    return { success: true };
+  }
+
   try {
     // Call OpenAI generation
     rawComment = await generateSingleComment({
@@ -223,6 +243,17 @@ async function executeJobTask(
     const normHash = computeNormalizedHash(normText);
 
     await withTransaction(async (client) => {
+      // Re-check post status under transaction
+      const postLockRes = await client.query(
+        `SELECT 1 FROM campaign_posts WHERE id = $1 AND retired_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()) FOR SHARE`,
+        [job.campaignPostId]
+      );
+
+      if (postLockRes.rows.length === 0) {
+        await cancelJobAndCheckCycle(client, job.jobId, job.cycleId);
+        return; // Post was retired while OpenAI was working
+      }
+
       // Create suggestion
       const sugRes = await client.query<{ id: string }>(
         `INSERT INTO suggestions (
@@ -293,6 +324,7 @@ async function executeJobTask(
       }
     });
 
+    // If job was cancelled inside transaction (postLockRes empty), success is still true so we don't retry
     return { success: true };
   } catch (error: unknown) {
     const errorMsg = (error instanceof Error ? error.message : 'Unknown generation error').slice(0, 300);
@@ -358,5 +390,52 @@ async function executeJobTask(
     });
 
     return { success: false, error: errorMsg };
+  }
+}
+
+async function cancelJobAndCheckCycle(client: PoolClient, jobId: string, cycleId: string) {
+  await client.query(
+    `UPDATE generation_jobs
+     SET status = 'cancelled',
+         lease_owner = NULL,
+         lease_expires_at = NULL,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [jobId]
+  );
+
+  // Check if cycle should be cancelled (no active/pending jobs remaining)
+  // We only count pending and processing. Completed or failed jobs mean the cycle is mixed.
+  // Actually, if a cycle only has cancelled, completed or failed, we can determine its state.
+  // Let's count pending/processing.
+  const checkJobsRes = await client.query<{ count: string }>(
+    `SELECT COUNT(*) as count FROM generation_jobs
+     WHERE cycle_id = $1 AND status IN ('pending', 'processing')`,
+    [cycleId]
+  );
+
+  if (parseInt(checkJobsRes.rows[0].count, 10) === 0) {
+    // There are no pending/processing jobs left.
+    // Is the cycle completed?
+    const cycleRes = await client.query<{
+      target_count: number;
+      valid_produced_count: number;
+    }>(`SELECT target_count, valid_produced_count FROM generation_cycles WHERE id = $1`, [cycleId]);
+
+    const cData = cycleRes.rows[0];
+    if (cData) {
+      if (cData.valid_produced_count >= cData.target_count) {
+        await client.query(`UPDATE generation_cycles SET status = 'completed', finished_at = NOW() WHERE id = $1`, [cycleId]);
+      } else {
+        // If not completed and no pending/processing left, check if any job is failed.
+        const failedRes = await client.query<{ count: string }>(`SELECT COUNT(*) as count FROM generation_jobs WHERE cycle_id = $1 AND status = 'failed'`, [cycleId]);
+        if (parseInt(failedRes.rows[0].count, 10) > 0) {
+           await client.query(`UPDATE generation_cycles SET status = 'failed', finished_at = NOW() WHERE id = $1`, [cycleId]);
+        } else {
+           // Only cancelled (and maybe some completed, but not enough). Mark cycle as cancelled.
+           await client.query(`UPDATE generation_cycles SET status = 'cancelled', finished_at = NOW() WHERE id = $1`, [cycleId]);
+        }
+      }
+    }
   }
 }

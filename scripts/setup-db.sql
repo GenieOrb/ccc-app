@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS campaign_accounts (
     username TEXT NOT NULL,
     username_normalized TEXT NOT NULL,
     x_user_id TEXT,
+    monitoring_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_post_id TEXT,
+    last_polled_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     removed_at TIMESTAMPTZ
 );
@@ -108,13 +111,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS campaign_posts_active_idx
 ON campaign_posts(campaign_id, x_post_id)
 WHERE retired_at IS NULL;
 
+-- Prevent perpetual campaigns from inserting the same post twice even if retired,
+-- while preserving manual campaigns behaviour (which allows re-adding retired posts).
+CREATE UNIQUE INDEX IF NOT EXISTS campaign_posts_perpetual_unique_idx
+ON campaign_posts(campaign_account_id, x_post_id)
+WHERE campaign_account_id IS NOT NULL;
+
 -- Table: generation_cycles
 CREATE TABLE IF NOT EXISTS generation_cycles (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE RESTRICT,
+    campaign_post_id UUID,
     cycle_type TEXT NOT NULL CHECK (cycle_type IN ('initial', 'replenishment')),
     target_count INT NOT NULL DEFAULT 50,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled')),
     model_name TEXT NOT NULL DEFAULT 'gpt-5.4',
     prompt_version INT NOT NULL DEFAULT 1,
     valid_produced_count INT NOT NULL DEFAULT 0,
@@ -125,11 +135,6 @@ CREATE TABLE IF NOT EXISTS generation_cycles (
     started_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ
 );
-
--- Index to enforce single active cycle per campaign
-CREATE UNIQUE INDEX IF NOT EXISTS unique_active_cycle_per_campaign
-ON generation_cycles(campaign_id)
-WHERE status IN ('pending', 'processing');
 
 -- Table: generation_jobs
 CREATE TABLE IF NOT EXISTS generation_jobs (
@@ -143,7 +148,7 @@ CREATE TABLE IF NOT EXISTS generation_jobs (
     emoji_policy TEXT NOT NULL CHECK (emoji_policy IN ('one_emoji', 'no_emoji')),
     rhetorical_form TEXT NOT NULL,
     texture TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled')),
     attempts_count INT NOT NULL DEFAULT 0 CHECK (attempts_count <= 3),
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     lease_owner TEXT,
@@ -244,6 +249,13 @@ BEFORE UPDATE OR DELETE ON assignments
 FOR EACH ROW EXECUTE FUNCTION prevent_assignment_mutation();
 
 -- --- Idempotent Schema Updates for Existing DBs ---
+
+-- 1. Añadir columnas nuevas a instalaciones existentes
+ALTER TABLE campaign_accounts ADD COLUMN IF NOT EXISTS monitoring_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE campaign_accounts ADD COLUMN IF NOT EXISTS last_seen_post_id TEXT;
+ALTER TABLE campaign_accounts ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ;
+
+ALTER TABLE generation_cycles ADD COLUMN IF NOT EXISTS campaign_post_id UUID;
 
 ALTER TABLE campaign_posts DROP CONSTRAINT IF EXISTS unique_campaign_x_post_id;
 
@@ -348,5 +360,60 @@ INSERT INTO visitor_campaign_states (campaign_id, visitor_id, active_assignment_
 SELECT campaign_id, visitor_id, id, assigned_at, assigned_at
 FROM assignments
 ON CONFLICT (campaign_id, visitor_id) DO NOTHING;
+
+-- 5. Actualizaciones idempotentes para monitorización de perpetuals y estados cancelados
+
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (
+        SELECT oid, conname
+        FROM pg_constraint
+        WHERE conrelid = 'generation_cycles'::regclass AND contype = 'c'
+          AND conname LIKE '%status%'
+          AND pg_get_constraintdef(oid) ILIKE '%status%'
+    ) LOOP
+        EXECUTE 'ALTER TABLE generation_cycles DROP CONSTRAINT ' || quote_ident(r.conname);
+    END LOOP;
+END $$;
+ALTER TABLE generation_cycles ADD CONSTRAINT generation_cycles_status_check CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled'));
+
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (
+        SELECT oid, conname
+        FROM pg_constraint
+        WHERE conrelid = 'generation_jobs'::regclass AND contype = 'c'
+          AND conname LIKE '%status%'
+          AND pg_get_constraintdef(oid) ILIKE '%status%'
+    ) LOOP
+        EXECUTE 'ALTER TABLE generation_jobs DROP CONSTRAINT ' || quote_ident(r.conname);
+    END LOOP;
+END $$;
+ALTER TABLE generation_jobs ADD CONSTRAINT generation_jobs_status_check CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled'));
+
+-- Sustituir índice activo global por índices parciales (si existía el antiguo sin filtro post_id, eliminarlo de forma segura)
+DROP INDEX IF EXISTS unique_active_cycle_per_campaign;
+
+-- Index to enforce single active cycle per campaign globally (manual)
+CREATE UNIQUE INDEX IF NOT EXISTS unique_active_cycle_per_campaign_global
+ON generation_cycles(campaign_id)
+WHERE status IN ('pending', 'processing') AND campaign_post_id IS NULL;
+
+-- Index to enforce single active cycle per post (perpetual)
+CREATE UNIQUE INDEX IF NOT EXISTS unique_active_cycle_per_post
+ON generation_cycles(campaign_post_id)
+WHERE status IN ('pending', 'processing') AND campaign_post_id IS NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_generation_cycles_campaign_post_compound' AND conrelid = 'generation_cycles'::regclass) THEN
+        ALTER TABLE generation_cycles ADD CONSTRAINT fk_generation_cycles_campaign_post_compound
+        FOREIGN KEY (campaign_post_id, campaign_id) REFERENCES campaign_posts (id, campaign_id) ON DELETE RESTRICT;
+    END IF;
+END $$;
 
 COMMIT;

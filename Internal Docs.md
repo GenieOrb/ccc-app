@@ -251,16 +251,17 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 * `DELETE /api/admin/campaigns/[id]/accounts/[accountId]`: Retirar una cuenta.
 * `PATCH /api/admin/campaigns/[id]/settings`: Modificar la duración activa de los posts.
 
-## 30. Funcionalidad pendiente para las Fases 3 y 4
-Aún no están implementados:
-* Filtered Stream (Las cuentas NO están siendo monitorizadas automáticamente aún).
-* Resolución automática de `x_user_id`.
-* Ingestión automática de nuevos posts.
-* Catch-up (búsqueda inicial).
-* Expiración programada.
-* Generación automática al recibir posts.
-
-*(La migración a base de datos de la Fase 2 todavía no se ha ejecutado).*
+## 30. Implementación de Campañas Perpetuas
+- **Monitorización casi en tiempo real**: Implementada mediante polling regular de la API v2 de X aprovechando el cron de un minuto, sin usar Filtered Stream de larga duración en entorno serverless.
+- **Resolución y estado**: Resuelve automáticamente `x_user_id` desde el username. Mantiene un cursor `last_seen_post_id` para importar publicaciones de forma idempotente y evitar saltos o duplicados.
+- **Posts admitidos**: Solo se importan posts nuevos (no retweets, no respuestas a terceros). No existe backfill histórico ni importación de contenido previo al inicio de la monitorización (`monitoring_started_at`).
+- **Seguridad y ciclos individuales**: Cada post descubierto se somete al preflight de seguridad de forma individual. En caso de ser admitido, se crea de forma inmediata un ciclo de generación (`generation_cycles`) de 50 comentarios exclusivos para ese `campaign_post_id`.
+- **Inventario específico por post**: En campañas perpetuas, el inventario se repone individualmente cuando las sugerencias disponibles de un post caen por debajo del umbral, sin bloquearse mutuamente por el inventario de posts antiguos.
+- **Priorización de generación**: El worker procesa los jobs dando prioridad absoluta a los posts más recientes y a los que todavía no tienen sugerencias disponibles.
+- **Priorización de entrega**: Los visitantes reciben siempre el post vigente más reciente que todavía no hayan visto, seguido de un orden secundario histórico.
+- **Expiración y cancelación**: Los posts superan su `expires_at` se marcan como `retired_at` de forma automática. Sus `generation_jobs` y `generation_cycles` se marcan como `cancelled` para no seguir consumiendo OpenAI de forma innecesaria.
+- **Tolerancia a fallos**: Integrado de forma segura en `processPerpetualCampaigns`. Un fallo de red, rate limit de X o en la cuenta no bloquea el procesamiento del resto del polling ni altera silenciosamente la funcionalidad.
+- **Prompt (Mención de GenieOrb)**: Se ha levantado la prohibición estricta de mencionar a GenieOrb por defecto, permitiendo que la dirección administrativa instruya específicamente nombrarlo (o nombrar otros proyectos) cuando sea natural y tenga relación con el contenido del post. No existe automatización encubierta ni obligatoria para esta mención.
 
 ## 31. Terceros, Licencias Pendientes y Atribuciones
 - Next.js (MIT)

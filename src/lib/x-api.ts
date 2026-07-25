@@ -14,10 +14,51 @@ export interface FetchedXPost {
   authorName: string;
   authorUsername: string;
   textContent: string;
-  language: string | null;
-  conversationId: string | null;
-  postedAt: string | null;
+  language?: string;
+  conversationId?: string;
+  postedAt?: string;
   accessibleContext: Record<string, unknown>;
+}
+
+export interface XUser { id: string; name: string; username: string; }
+export interface XMedia { media_key: string; type: string; alt_text?: string; }
+export interface XReferencedTweet { type: string; id: string; }
+export interface XTweetApiItem {
+  id?: string;
+  text?: string;
+  author_id?: string;
+  created_at?: string;
+  conversation_id?: string;
+  in_reply_to_user_id?: string;
+  lang?: string;
+  possibly_sensitive?: boolean;
+  referenced_tweets?: XReferencedTweet[];
+  attachments?: {
+    media_keys?: string[];
+  };
+}
+
+export interface XTweet {
+  id: string;
+  text: string;
+  author_id?: string;
+  created_at?: string;
+  conversation_id?: string;
+  in_reply_to_user_id?: string;
+  lang?: string;
+  possibly_sensitive?: boolean;
+  referenced_tweets?: XReferencedTweet[];
+  attachments?: {
+    media_keys?: string[];
+  };
+}
+export interface XApiResponse {
+  data?: XTweetApiItem[];
+  includes?: {
+    users?: XUser[];
+    media?: XMedia[];
+    tweets?: XTweetApiItem[];
+  };
 }
 
 const ALLOWED_X_HOSTS = new Set([
@@ -118,7 +159,14 @@ export async function fetchXPosts(extractedUrls: ExtractedXUrl[]): Promise<Fetch
   const userFields = 'name,username';
   const mediaFields = 'type,alt_text';
 
-  const apiUrl = `https://api.x.com/2/tweets?ids=${idsQuery}&tweet.fields=${tweetFields}&expansions=${expansions}&user.fields=${userFields}&media.fields=${mediaFields}`;
+  const url = new URL('https://api.x.com/2/tweets');
+  url.searchParams.set('ids', idsQuery);
+  url.searchParams.set('tweet.fields', tweetFields);
+  url.searchParams.set('expansions', expansions);
+  url.searchParams.set('user.fields', userFields);
+  url.searchParams.set('media.fields', mediaFields);
+
+  const apiUrl = url.toString();
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
@@ -149,26 +197,26 @@ export async function fetchXPosts(extractedUrls: ExtractedXUrl[]): Promise<Fetch
     throw new Error(`La API de X devolvió el estado HTTP ${response.status}: ${errText.slice(0, 200)}`);
   }
 
-  const data = await response.json();
-  interface XUser { id: string; name: string; username: string; }
-  interface XMedia { media_key: string; type: string; alt_text?: string; }
-  interface XReferencedTweet { id: string; type: string; }
-  interface XTweet {
-    id: string;
-    text?: string;
-    author_id?: string;
-    created_at?: string;
-    lang?: string;
-    conversation_id?: string;
-    attachments?: { media_keys?: string[] };
-    referenced_tweets?: XReferencedTweet[];
-    possibly_sensitive?: boolean;
+  const data = (await response.json()) as XApiResponse;
+
+  const rawTweets = data.data || [];
+  const tweetsData: XTweet[] = [];
+  for (const item of rawTweets) {
+    if (item.id && typeof item.text === 'string') {
+      tweetsData.push(item as XTweet);
+    }
   }
 
-  const tweetsData: XTweet[] = data.data || [];
   const usersData: XUser[] = data.includes?.users || [];
   const mediaData: XMedia[] = data.includes?.media || [];
-  const referencedTweetsData: XTweet[] = data.includes?.tweets || [];
+  const rawIncludesTweets = data.includes?.tweets || [];
+
+  const referencedTweetsData: XTweet[] = [];
+  for (const item of rawIncludesTweets) {
+    if (item.id && typeof item.text === 'string') {
+      referencedTweetsData.push(item as XTweet);
+    }
+  }
 
   const userMap = new Map<string, { name: string; username: string }>();
   for (const u of usersData) {
@@ -193,59 +241,253 @@ export async function fetchXPosts(extractedUrls: ExtractedXUrl[]): Promise<Fetch
       throw new Error(`El post de X con URL "${extUrl.inputUrl}" no existe, es privado, o fue eliminado.`);
     }
 
-    const author = (tweet.author_id && userMap.get(tweet.author_id)) || { name: 'Desconocido', username: 'unknown' };
-    const textContent = tweet.text || '';
-
-    if (!textContent.trim()) {
+    const post = transformXTweet(tweet, extUrl.inputUrl, extUrl.canonicalUrl, userMap, mediaMap, refTweetMap);
+    if (!post) {
       throw new Error(`El post de X con URL "${extUrl.inputUrl}" no contiene texto utilizable para generar comentarios.`);
     }
-
-    // Process referenced tweets (quoted or parent) up to 5 immediate parents max
-    const parentContext: Array<{ id: string; text: string; type: string }> = [];
-    if (tweet.referenced_tweets && Array.isArray(tweet.referenced_tweets)) {
-      for (const ref of tweet.referenced_tweets.slice(0, 5)) {
-        const refTweet = refTweetMap.get(ref.id);
-        if (refTweet) {
-          parentContext.push({
-            id: ref.id,
-            type: ref.type,
-            text: refTweet.text || '',
-          });
-        }
-      }
-    }
-
-    // Process media alt texts if available
-    const attachedMedia: Array<{ type: string; alt_text?: string }> = [];
-    if (tweet.attachments?.media_keys && Array.isArray(tweet.attachments.media_keys)) {
-      for (const key of tweet.attachments.media_keys) {
-        const m = mediaMap.get(key);
-        if (m) {
-          attachedMedia.push(m);
-        }
-      }
-    }
-
-    const accessibleContext = {
-      author_id: tweet.author_id,
-      possibly_sensitive: !!tweet.possibly_sensitive,
-      parent_context: parentContext,
-      media: attachedMedia,
-    };
-
-    fetchedPosts.push({
-      postId: extUrl.postId,
-      inputUrl: extUrl.inputUrl,
-      canonicalUrl: extUrl.canonicalUrl,
-      authorName: author.name,
-      authorUsername: author.username,
-      textContent,
-      language: tweet.lang || null,
-      conversationId: tweet.conversation_id || null,
-      postedAt: tweet.created_at || null,
-      accessibleContext,
-    });
+    fetchedPosts.push(post);
   }
 
   return fetchedPosts;
+}
+
+function transformXTweet(
+  tweet: XTweet,
+  inputUrl: string,
+  canonicalUrl: string,
+  userMap: Map<string, { name: string; username: string }>,
+  mediaMap: Map<string, { type: string; alt_text?: string }>,
+  refTweetMap: Map<string, XTweet>
+): FetchedXPost | null {
+  const mappedAuthor = typeof tweet.author_id === 'string' ? userMap.get(tweet.author_id) : undefined;
+  const author = mappedAuthor ?? { name: 'Desconocido', username: 'unknown' };
+  const textContent = tweet.text || '';
+
+  if (!textContent.trim()) {
+    return null;
+  }
+
+  const parentContext: Array<{ id: string; text: string; type: string }> = [];
+  if (tweet.referenced_tweets && Array.isArray(tweet.referenced_tweets)) {
+    for (const ref of tweet.referenced_tweets.slice(0, 5)) {
+      const refTweet = refTweetMap.get(ref.id);
+      if (refTweet) {
+        parentContext.push({
+          id: ref.id,
+          type: ref.type,
+          text: refTweet.text || '',
+        });
+      }
+    }
+  }
+
+  const attachedMedia: Array<{ type: string; alt_text?: string }> = [];
+  if (tweet.attachments?.media_keys && Array.isArray(tweet.attachments.media_keys)) {
+    for (const key of tweet.attachments.media_keys) {
+      const m = mediaMap.get(key);
+      if (m) {
+        attachedMedia.push(m);
+      }
+    }
+  }
+
+  const accessibleContext = {
+    author_id: tweet.author_id,
+    possibly_sensitive: !!tweet.possibly_sensitive,
+    parent_context: parentContext,
+    media: attachedMedia,
+  };
+
+  return {
+    postId: tweet.id,
+    inputUrl,
+    canonicalUrl,
+    authorName: author.name,
+    authorUsername: author.username,
+    textContent,
+    language: tweet.lang ?? undefined,
+    conversationId: tweet.conversation_id ?? undefined,
+    postedAt: tweet.created_at ?? undefined,
+    accessibleContext,
+  };
+}
+
+export async function resolveXUsername(username: string): Promise<string> {
+  const config = getConfig();
+  if (!config.xBearerToken) {
+    throw new Error('X_BEARER_TOKEN no está configurado en el servidor.');
+  }
+
+  const cleanUsername = username.replace(/^@/, '').trim();
+  const apiUrl = `https://api.x.com/2/users/by/username/${cleanUsername}`;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+  let response: Response;
+  try {
+    response = await fetch(apiUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${config.xBearerToken}`,
+        'Content-Type': 'application/json',
+      },
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+  } catch {
+    clearTimeout(timeoutId);
+    throw new Error('Error de conexión al resolver usuario en X.');
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    throw new Error(`La API de X devolvió el estado HTTP ${response.status} al resolver el usuario.`);
+  }
+
+  const data = (await response.json()) as { data?: { id: string } };
+  if (!data.data || !data.data.id) {
+    throw new Error(`El usuario ${username} no existe o está suspendido.`);
+  }
+
+  return data.data.id;
+}
+
+export async function fetchNewXPostsForAccount(
+  xUserId: string,
+  sincePostId: string | null,
+  monitoringStartedAt: Date
+): Promise<FetchedXPost[]> {
+  const config = getConfig();
+  if (!config.xBearerToken) {
+    throw new Error('X_BEARER_TOKEN no está configurado en el servidor.');
+  }
+
+  const tweetFields = 'created_at,text,author_id,conversation_id,in_reply_to_user_id,referenced_tweets,lang,possibly_sensitive';
+  const expansions = 'author_id,referenced_tweets.id,attachments.media_keys';
+  const userFields = 'name,username';
+  const mediaFields = 'type,alt_text';
+  const url = new URL(`https://api.x.com/2/users/${xUserId}/tweets`);
+  url.searchParams.set('max_results', '20');
+  url.searchParams.set('exclude', 'replies,retweets');
+  url.searchParams.set('tweet.fields', tweetFields);
+  url.searchParams.set('expansions', expansions);
+  url.searchParams.set('user.fields', userFields);
+  url.searchParams.set('media.fields', mediaFields);
+
+  if (sincePostId) {
+    url.searchParams.set('since_id', sincePostId);
+  } else {
+    // Si no hay cursor, podemos acotar el tiempo para no traer demasiados históricos (y luego filtrar en código)
+    // Usamos start_time solo si podemos asegurar el formato ISO 8601
+    try {
+      url.searchParams.set('start_time', monitoringStartedAt.toISOString());
+    } catch {}
+  }
+
+  const apiUrl = url.toString();
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+  let response: Response;
+  try {
+    response = await fetch(apiUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${config.xBearerToken}`,
+        'Content-Type': 'application/json',
+      },
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+  } catch {
+    clearTimeout(timeoutId);
+    throw new Error('Error de red al consultar posts.');
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    throw new Error(`La API de X devolvió HTTP ${response.status}`);
+  }
+
+  const data = (await response.json()) as XApiResponse;
+  if (!data.data || data.data.length === 0) {
+    return [];
+  }
+
+  const rawTweets = data.data || [];
+  const tweetsData: XTweet[] = [];
+  for (const item of rawTweets) {
+    if (item.id && typeof item.text === 'string') {
+      tweetsData.push(item as XTweet);
+    }
+  }
+
+  const usersData: XUser[] = data.includes?.users || [];
+  const mediaData: XMedia[] = data.includes?.media || [];
+  const rawIncludesTweets = data.includes?.tweets || [];
+
+  const referencedTweetsData: XTweet[] = [];
+  for (const item of rawIncludesTweets) {
+    if (item.id && typeof item.text === 'string') {
+      referencedTweetsData.push(item as XTweet);
+    }
+  }
+
+  const userMap = new Map<string, { name: string; username: string }>();
+  for (const u of usersData) {
+    userMap.set(u.id, { name: u.name, username: u.username });
+  }
+
+  const mediaMap = new Map<string, { type: string; alt_text?: string }>();
+  for (const m of mediaData) {
+    mediaMap.set(m.media_key, { type: m.type, alt_text: m.alt_text });
+  }
+
+  const refTweetMap = new Map<string, XTweet>();
+  for (const rt of referencedTweetsData) {
+    refTweetMap.set(rt.id, rt);
+  }
+
+  const validPosts: FetchedXPost[] = [];
+
+  for (const tweet of tweetsData) {
+    // Filtrar retweets (referenced_tweets con type="retweeted")
+    const isRetweet = tweet.referenced_tweets?.some((rt) => rt.type === 'retweeted');
+    // Filtrar respuestas a otros (in_reply_to_user_id distinto de sí mismo)
+    const isReplyToOther = tweet.in_reply_to_user_id && tweet.in_reply_to_user_id !== xUserId;
+
+    if (isRetweet || isReplyToOther) {
+      continue;
+    }
+
+    // Filtrar publicaciones anteriores al monitoringStartedAt (doble check)
+    if (tweet.created_at) {
+      const postDate = new Date(tweet.created_at);
+      if (postDate < monitoringStartedAt) {
+        continue;
+      }
+    }
+
+    const postId = tweet.id;
+    const mappedAuthor = typeof tweet.author_id === 'string' ? userMap.get(tweet.author_id) : undefined;
+    const authorInfo = mappedAuthor ?? { name: 'Desconocido', username: 'unknown' };
+    const canonicalUrl = `https://x.com/${authorInfo.username}/status/${postId}`;
+
+    const transformed = transformXTweet(tweet, canonicalUrl, canonicalUrl, userMap, mediaMap, refTweetMap);
+    if (transformed) {
+      validPosts.push(transformed);
+    }
+  }
+
+  // Ordenar de más antiguo a más nuevo para su importación
+  validPosts.sort((a, b) => {
+    if (!a.postedAt || !b.postedAt) return 0;
+    return new Date(a.postedAt).getTime() - new Date(b.postedAt).getTime();
+  });
+
+  return validPosts;
 }
