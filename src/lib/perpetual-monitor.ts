@@ -3,6 +3,8 @@ import { queryDb, withTransaction } from './db';
 import { checkCampaignSafety } from './openai';
 import { resolveXUsername, fetchNewXPostsForAccount } from './x-api';
 import { randomUUID } from 'crypto';
+import { generateDeterministicSlotPlans } from './planner';
+import { getAiModel } from './ai/models';
 
 interface PerpetualMonitorSummary {
   accountsProcessed: number;
@@ -23,6 +25,7 @@ interface AccountRow {
   last_seen_post_id: string | null;
   direction: string | null;
   post_active_lifetime_hours: number | null;
+  model_key: string;
 }
 
 export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): Promise<PerpetualMonitorSummary> {
@@ -68,10 +71,10 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
           WHERE status IN ('pending', 'processing') AND campaign_post_id = ANY($1)
         `, [retiredPostIds]);
 
-        // Marcar ciclos activos como completados
+        // Expiration is terminal cancellation, never successful completion.
         await client.query(`
           UPDATE generation_cycles
-          SET status = 'completed', finished_at = NOW()
+          SET status = 'cancelled', finished_at = NOW()
           WHERE status IN ('pending', 'processing') AND campaign_post_id = ANY($1)
         `, [retiredPostIds]);
       }
@@ -83,7 +86,7 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
 
   // 2. Seleccionar cuentas activas para hacer polling.
   const accountsRows = await queryDb<AccountRow>(`
-    SELECT ca.id, ca.campaign_id, ca.username, ca.x_user_id, ca.monitoring_started_at, ca.last_seen_post_id, c.direction, c.post_active_lifetime_hours
+    SELECT ca.id, ca.campaign_id, ca.username, ca.x_user_id, ca.monitoring_started_at, ca.last_seen_post_id, c.direction, c.post_active_lifetime_hours, c.model_key
     FROM campaign_accounts ca
     JOIN campaigns c ON ca.campaign_id = c.id
     WHERE ca.removed_at IS NULL AND c.is_active = true AND c.campaign_type = 'perpetual'
@@ -105,7 +108,9 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
         await queryDb('UPDATE campaign_accounts SET x_user_id = $1 WHERE id = $2', [xUserId, account.id]);
       }
 
-      const newPosts = await fetchNewXPostsForAccount(xUserId, account.last_seen_post_id, account.monitoring_started_at);
+      const fetchedPosts = await fetchNewXPostsForAccount(xUserId, account.last_seen_post_id, account.monitoring_started_at);
+      // Initial recovery deliberately imports only the most recent eligible post.
+      const newPosts = !account.last_seen_post_id && fetchedPosts.length > 1 ? [fetchedPosts.reduce((latest, post) => BigInt(post.postId) > BigInt(latest.postId) ? post : latest)] : fetchedPosts;
 
       if (newPosts.length > 0) {
         summary.postsDetected += newPosts.length;
@@ -141,8 +146,9 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
             const existingPost = await client.query<{ id: string }>('SELECT id FROM campaign_posts WHERE campaign_account_id = $1 AND x_post_id = $2', [account.id, post.postId]);
 
             if (existingPost.rowCount === 0) {
+              const publishedAt = post.postedAt ? new Date(post.postedAt) : new Date();
               const expiresAt = account.post_active_lifetime_hours
-                ? new Date(Date.now() + account.post_active_lifetime_hours * 3600 * 1000)
+                ? new Date(publishedAt.getTime() + account.post_active_lifetime_hours * 3600 * 1000)
                 : null;
 
               const insertRes = await client.query<{ id: string }>(`
@@ -156,18 +162,23 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
               `, [
                 account.campaign_id, account.id, post.postId, post.inputUrl, post.canonicalUrl,
                 post.authorName, post.authorUsername, post.textContent, post.language, post.conversationId,
-                post.postedAt ? new Date(post.postedAt) : new Date(), post.accessibleContext, expiresAt
+                publishedAt, post.accessibleContext, expiresAt
               ]);
 
               if ((insertRes.rowCount || 0) > 0) {
                 const newCampaignPostId = insertRes.rows[0].id;
                 summary.postsImported++;
+                const model = getAiModel(account.model_key);
+                if (!model) throw new Error('La campaÃ±a no tiene un modelo vÃ¡lido para generar el snapshot.');
 
                 const cycleId = randomUUID();
                 await client.query(`
-                  INSERT INTO generation_cycles (id, campaign_id, campaign_post_id, cycle_type, target_count, status)
-                  VALUES ($1, $2, $3, 'initial', 50, 'pending')
-                `, [cycleId, account.campaign_id, newCampaignPostId]);
+                  INSERT INTO generation_cycles (id, campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name)
+                  VALUES ($1, $2, $3, 'initial', 30, 'pending', $4, $5)
+                `, [cycleId, account.campaign_id, newCampaignPostId, model.key, model.apiModel]);
+                for (const plan of generateDeterministicSlotPlans([newCampaignPostId], 30)) {
+                  await client.query(`INSERT INTO generation_jobs (cycle_id,campaign_id,campaign_post_id,slot_index,slot_plan,length_mode,emoji_policy,rhetorical_form,texture,status,model_name,prompt_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,1)`, [cycleId, account.campaign_id, newCampaignPostId, plan.slotIndex, JSON.stringify(plan), plan.lengthMode, plan.emojiPolicy, plan.rhetoricalForm, plan.texture, model.apiModel]);
+                }
                 summary.cyclesCreated++;
               }
             }

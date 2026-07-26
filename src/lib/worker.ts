@@ -4,12 +4,12 @@ import { randomUUID } from 'node:crypto';
 import { queryDb, withTransaction } from './db';
 import { SlotPlan } from './planner';
 import { generateSingleComment } from './openai';
+import { getConfiguredFallbackModel } from './ai/models';
 import {
   computeNormalizedHash,
   normalizeCommentText,
   validateCommentLocally,
 } from './validator';
-import { getConfig } from './config';
 
 export interface ClaimedJob {
   jobId: string;
@@ -24,6 +24,13 @@ export interface ClaimedJob {
   authorUsername: string;
   accessibleContext: Record<string, unknown>;
   campaignDirection?: string;
+  modelKey: string;
+  provider: string;
+  apiModel: string;
+  inputPricePerMillion: number;
+  cachedInputPricePerMillion?: number;
+  outputPricePerMillion: number;
+  pricingCurrency: string;
 }
 
 export async function processBackgroundQueue(
@@ -100,6 +107,13 @@ async function claimNextJob(workerId: string): Promise<ClaimedJob | null> {
       author_username: string;
       accessible_context: unknown;
       direction: string | null;
+      model_key: string;
+      provider: string;
+      api_model: string;
+      input_price_per_million: number;
+      cached_input_price_per_million: number | null;
+      output_price_per_million: number;
+      pricing_currency: string;
     }>(
       `SELECT 
          j.id as job_id,
@@ -114,6 +128,7 @@ async function claimNextJob(workerId: string): Promise<ClaimedJob | null> {
          p.author_username,
          p.accessible_context,
          c.direction
+         ,j.model_key, j.provider, j.api_model, j.input_price_per_million, j.cached_input_price_per_million, j.output_price_per_million, j.pricing_currency
        FROM generation_jobs j
        JOIN campaign_posts p ON j.campaign_post_id = p.id
        JOIN campaigns c ON j.campaign_id = c.id
@@ -170,6 +185,9 @@ async function claimNextJob(workerId: string): Promise<ClaimedJob | null> {
       authorUsername: row.author_username || 'unknown',
       accessibleContext: (row.accessible_context as Record<string, unknown>) || ({} as Record<string, unknown>),
       campaignDirection: row.direction || undefined,
+      modelKey: row.model_key, provider: row.provider, apiModel: row.api_model,
+      inputPricePerMillion: row.input_price_per_million, cachedInputPricePerMillion: row.cached_input_price_per_million ?? undefined,
+      outputPricePerMillion: row.output_price_per_million, pricingCurrency: row.pricing_currency,
     };
   });
 }
@@ -189,6 +207,14 @@ async function executeJobTask(
 
   let rawComment = '';
   let validationReason = '';
+  let finalProvider = job.provider;
+  let finalModelKey = job.modelKey;
+  let finalApiModel = job.apiModel;
+  let finalInputPrice = job.inputPricePerMillion;
+  let finalCachedInputPrice = job.cachedInputPricePerMillion;
+  let finalOutputPrice = job.outputPricePerMillion;
+  let usage: { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number } | undefined;
+  let regenerations = 0;
 
   // Check if post is retired or expired before calling OpenAI
   const preCheckRows = await queryDb<{ id: string }>(
@@ -204,16 +230,36 @@ async function executeJobTask(
   }
 
   try {
-    // Call OpenAI generation
-    rawComment = await generateSingleComment({
+    const generate = async (provider: 'openai' | 'deepseek' | 'qwen', apiModel: string, rewriteFeedback?: string) => generateSingleComment({
+      apiModel,
+      provider,
       postText: job.postText,
       authorName: job.authorName,
       authorUsername: job.authorUsername,
       accessibleContext: job.accessibleContext,
       direction: job.campaignDirection,
       plan: job.slotPlan,
-      recentComments,
+      recentComments, rewriteFeedback,
     });
+    try {
+      const generated = await generate(job.provider as 'openai' | 'deepseek' | 'qwen', job.apiModel);
+      rawComment = generated.comment;
+      usage = generated.usage;
+    } catch (primaryError) {
+      // Fallback belongs exclusively to queued production generation. Preview
+      // generation calls generateSingleComment directly and has no fallback.
+      const fallback = getConfiguredFallbackModel(job.modelKey);
+      if (!fallback) throw primaryError;
+      const generated = await generate(fallback.provider, fallback.apiModel);
+      rawComment = generated.comment;
+      usage = generated.usage;
+      finalProvider = fallback.provider;
+      finalModelKey = fallback.key;
+      finalApiModel = fallback.apiModel;
+      finalInputPrice = fallback.inputPricePerMillion;
+      finalCachedInputPrice = fallback.cachedInputPricePerMillion;
+      finalOutputPrice = fallback.outputPricePerMillion;
+    }
 
     // Local Validation Check
     const valResult = validateCommentLocally(rawComment, job.slotPlan, recentComments, job.campaignDirection);
@@ -221,16 +267,10 @@ async function executeJobTask(
     if (!valResult.valid) {
       validationReason = valResult.reason || 'Failed local validation checks.';
       // Perform 1 corrective rewrite attempt within this execution
-      rawComment = await generateSingleComment({
-        postText: job.postText,
-        authorName: job.authorName,
-        authorUsername: job.authorUsername,
-        accessibleContext: job.accessibleContext,
-        direction: job.campaignDirection,
-        plan: job.slotPlan,
-        recentComments,
-        rewriteFeedback: validationReason,
-      });
+      regenerations += 1;
+      const rewritten = await generate(finalProvider as 'openai' | 'deepseek' | 'qwen', finalApiModel, validationReason);
+      rawComment = rewritten.comment;
+      usage = rewritten.usage;
 
       const rewriteValResult = validateCommentLocally(rawComment, job.slotPlan, recentComments, job.campaignDirection);
       if (!rewriteValResult.valid) {
@@ -258,12 +298,12 @@ async function executeJobTask(
       const sugRes = await client.query<{ id: string }>(
         `INSERT INTO suggestions (
            campaign_id, campaign_post_id, cycle_id, job_id, content_type,
-           comment_text, normalized_hash, slot_plan, model_name, prompt_version,
+           comment_text, normalized_hash, slot_plan, model_name, prompt_version, requested_provider, requested_model_key, final_provider, final_model_key, fallback_used,
            status, delivery_order
          ) VALUES (
            $1, $2, $3, $4, 'text',
-           $5, $6, $7, $8, 1,
-           'available', $9
+            $5, $6, $7, $8, 1, $9, $10, $11, $12, $13,
+            'available', $14
          ) RETURNING id`,
         [
           job.campaignId,
@@ -273,7 +313,12 @@ async function executeJobTask(
           rawComment,
           normHash,
           JSON.stringify(job.slotPlan),
-          getConfig().openaiModel,
+          finalApiModel,
+          job.provider,
+          job.modelKey,
+          finalProvider,
+          finalModelKey,
+          finalModelKey !== job.modelKey,
           job.slotPlan.deliveryOrder,
         ]
       );
@@ -291,6 +336,12 @@ async function executeJobTask(
              updated_at = NOW()
          WHERE id = $2`,
         [suggestionId, job.jobId]
+      );
+
+      await client.query(
+        `INSERT INTO generation_usage_metrics (campaign_id,campaign_post_id,cycle_id,job_id,requested_provider,requested_model_key,final_provider,final_model_key,input_tokens,cached_input_tokens,output_tokens,comments_requested,comments_received,comments_valid,comments_rejected,regenerations,attempts,fallback_used,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency,estimated_cost)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,1,1,0,$12,$13,$14,$15,$16,$17,$18,CASE WHEN $9 IS NULL AND $10 IS NULL AND $11 IS NULL THEN NULL ELSE (COALESCE($9,0) - COALESCE($10,0))*$15/1000000 + COALESCE($10,0)*COALESCE($16,0)/1000000 + COALESCE($11,0)*$17/1000000 END)`,
+        [job.campaignId,job.campaignPostId,job.cycleId,job.jobId,job.provider,job.modelKey,finalProvider,finalModelKey,usage?.inputTokens ?? null,usage?.cachedInputTokens ?? null,usage?.outputTokens ?? null,regenerations,job.attemptsCount + 1,finalModelKey !== job.modelKey,finalInputPrice,finalCachedInputPrice ?? null,finalOutputPrice,job.pricingCurrency]
       );
 
       // Update cycle counts

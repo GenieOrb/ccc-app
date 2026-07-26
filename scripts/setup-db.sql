@@ -16,9 +16,9 @@ CREATE TABLE IF NOT EXISTS campaigns (
     safety_allowed BOOLEAN NOT NULL DEFAULT true,
     safety_category TEXT,
     safety_reason TEXT,
-    initial_size INT NOT NULL DEFAULT 50,
-    replenishment_threshold INT NOT NULL DEFAULT 20,
-    replenishment_size INT NOT NULL DEFAULT 50,
+    initial_size INT NOT NULL DEFAULT 30,
+    replenishment_threshold INT NOT NULL DEFAULT 5,
+    replenishment_size INT NOT NULL DEFAULT 10,
     prompt_version INT NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -415,5 +415,113 @@ BEGIN
         FOREIGN KEY (campaign_post_id, campaign_id) REFERENCES campaign_posts (id, campaign_id) ON DELETE RESTRICT;
     END IF;
 END $$;
+
+-- Multi-provider campaign configuration and immutable generation snapshots.
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS display_name TEXT;
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS model_key TEXT;
+ALTER TABLE campaigns ALTER COLUMN initial_size SET DEFAULT 30;
+ALTER TABLE campaigns ALTER COLUMN replenishment_threshold SET DEFAULT 5;
+ALTER TABLE campaigns ALTER COLUMN replenishment_size SET DEFAULT 10;
+UPDATE campaigns SET initial_size = 30 WHERE initial_size = 50;
+UPDATE campaigns SET replenishment_threshold = 5 WHERE replenishment_threshold = 20;
+UPDATE campaigns SET replenishment_size = 10 WHERE replenishment_size = 50;
+UPDATE campaigns SET model_key = 'gpt-5.4' WHERE model_key IS NULL;
+ALTER TABLE campaigns ALTER COLUMN model_key SET DEFAULT 'deepseek-v4-flash';
+ALTER TABLE campaigns ALTER COLUMN model_key SET NOT NULL;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_campaign_display_name_length' AND conrelid = 'campaigns'::regclass) THEN
+    ALTER TABLE campaigns ADD CONSTRAINT chk_campaign_display_name_length CHECK (display_name IS NULL OR char_length(btrim(display_name)) BETWEEN 1 AND 120);
+  END IF;
+END $$;
+
+ALTER TABLE generation_cycles ADD COLUMN IF NOT EXISTS model_key TEXT;
+ALTER TABLE generation_cycles ADD COLUMN IF NOT EXISTS provider TEXT;
+ALTER TABLE generation_cycles ADD COLUMN IF NOT EXISTS api_model TEXT;
+ALTER TABLE generation_cycles ADD COLUMN IF NOT EXISTS input_price_per_million NUMERIC(12,6);
+ALTER TABLE generation_cycles ADD COLUMN IF NOT EXISTS cached_input_price_per_million NUMERIC(12,6);
+ALTER TABLE generation_cycles ADD COLUMN IF NOT EXISTS output_price_per_million NUMERIC(12,6);
+ALTER TABLE generation_cycles ADD COLUMN IF NOT EXISTS pricing_currency TEXT;
+ALTER TABLE generation_cycles ADD COLUMN IF NOT EXISTS pricing_effective_at DATE;
+UPDATE generation_cycles SET model_key = COALESCE(model_key, 'gpt-5.4'), provider = COALESCE(provider, 'openai'), api_model = COALESCE(api_model, 'gpt-5.4'), input_price_per_million = COALESCE(input_price_per_million, 2.5), cached_input_price_per_million = COALESCE(cached_input_price_per_million, .25), output_price_per_million = COALESCE(output_price_per_million, 15), pricing_currency = COALESCE(pricing_currency, 'USD'), pricing_effective_at = COALESCE(pricing_effective_at, DATE '2026-07-26');
+
+ALTER TABLE generation_jobs ADD COLUMN IF NOT EXISTS model_key TEXT;
+ALTER TABLE generation_jobs ADD COLUMN IF NOT EXISTS provider TEXT;
+ALTER TABLE generation_jobs ADD COLUMN IF NOT EXISTS api_model TEXT;
+ALTER TABLE generation_jobs ADD COLUMN IF NOT EXISTS input_price_per_million NUMERIC(12,6);
+ALTER TABLE generation_jobs ADD COLUMN IF NOT EXISTS cached_input_price_per_million NUMERIC(12,6);
+ALTER TABLE generation_jobs ADD COLUMN IF NOT EXISTS output_price_per_million NUMERIC(12,6);
+ALTER TABLE generation_jobs ADD COLUMN IF NOT EXISTS pricing_currency TEXT;
+ALTER TABLE generation_jobs ADD COLUMN IF NOT EXISTS pricing_effective_at DATE;
+UPDATE generation_jobs j SET model_key = COALESCE(j.model_key, c.model_key), provider = COALESCE(j.provider, c.provider), api_model = COALESCE(j.api_model, c.api_model), input_price_per_million = COALESCE(j.input_price_per_million, c.input_price_per_million), cached_input_price_per_million = COALESCE(j.cached_input_price_per_million, c.cached_input_price_per_million), output_price_per_million = COALESCE(j.output_price_per_million, c.output_price_per_million), pricing_currency = COALESCE(j.pricing_currency, c.pricing_currency), pricing_effective_at = COALESCE(j.pricing_effective_at, c.pricing_effective_at) FROM generation_cycles c WHERE c.id = j.cycle_id;
+
+ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS requested_provider TEXT;
+ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS requested_model_key TEXT;
+ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS final_provider TEXT;
+ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS final_model_key TEXT;
+ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS fallback_used BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS estimated_cost NUMERIC(16,8);
+UPDATE suggestions SET requested_provider = COALESCE(requested_provider, 'openai'), requested_model_key = COALESCE(requested_model_key, 'gpt-5.4'), final_provider = COALESCE(final_provider, 'openai'), final_model_key = COALESCE(final_model_key, 'gpt-5.4');
+
+CREATE TABLE IF NOT EXISTS generation_usage_metrics (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(), campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE RESTRICT,
+  campaign_post_id UUID REFERENCES campaign_posts(id) ON DELETE RESTRICT, cycle_id UUID REFERENCES generation_cycles(id) ON DELETE RESTRICT,
+  job_id UUID REFERENCES generation_jobs(id) ON DELETE RESTRICT, requested_provider TEXT NOT NULL, requested_model_key TEXT NOT NULL,
+  final_provider TEXT, final_model_key TEXT, input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER,
+  comments_requested INTEGER NOT NULL, comments_received INTEGER NOT NULL, comments_valid INTEGER NOT NULL, comments_rejected INTEGER NOT NULL,
+  regenerations INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, fallback_used BOOLEAN NOT NULL DEFAULT false,
+  reason TEXT, input_price_per_million NUMERIC(12,6), cached_input_price_per_million NUMERIC(12,6), output_price_per_million NUMERIC(12,6),
+  currency TEXT, estimated_cost NUMERIC(16,8), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS generation_usage_metrics_model_idx ON generation_usage_metrics (requested_model_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS generation_usage_metrics_campaign_idx ON generation_usage_metrics (campaign_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS campaign_previews (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(), campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE RESTRICT,
+  campaign_post_id UUID NOT NULL REFERENCES campaign_posts(id) ON DELETE RESTRICT, model_key TEXT NOT NULL, provider TEXT NOT NULL, api_model TEXT NOT NULL,
+  comments JSONB, input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER, estimated_cost NUMERIC(16,8), error_message TEXT,
+  input_price_per_million NUMERIC(12,6), cached_input_price_per_million NUMERIC(12,6), output_price_per_million NUMERIC(12,6), currency TEXT, pricing_effective_at DATE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS campaign_previews_campaign_idx ON campaign_previews (campaign_id, created_at DESC);
+
+-- Snapshot is populated at enqueue time from the campaign, so legacy enqueue paths
+-- cannot silently fall back to OPENAI_MODEL. Application code may supply the same
+-- values explicitly; this trigger is an integrity guard for the existing queue.
+CREATE OR REPLACE FUNCTION fill_generation_model_snapshot()
+RETURNS TRIGGER AS $$
+DECLARE selected_key TEXT;
+BEGIN
+  -- Jobs inherit the immutable cycle snapshot. This prevents a later campaign
+  -- model edit from changing already-enqueued work.
+  IF TG_TABLE_NAME = 'generation_jobs' AND NEW.cycle_id IS NOT NULL THEN
+    SELECT model_key, provider, api_model, input_price_per_million,
+           cached_input_price_per_million, output_price_per_million,
+           pricing_currency, pricing_effective_at
+      INTO NEW.model_key, NEW.provider, NEW.api_model,
+           NEW.input_price_per_million, NEW.cached_input_price_per_million,
+           NEW.output_price_per_million, NEW.pricing_currency,
+           NEW.pricing_effective_at
+      FROM generation_cycles WHERE id = NEW.cycle_id;
+    NEW.model_name := COALESCE(NEW.api_model, NEW.model_name, 'gpt-5.4');
+    RETURN NEW;
+  END IF;
+  SELECT model_key INTO selected_key FROM campaigns WHERE id = NEW.campaign_id;
+  selected_key := COALESCE(NEW.model_key, selected_key, 'gpt-5.4');
+  NEW.model_key := selected_key;
+  CASE selected_key
+    WHEN 'deepseek-v4-flash' THEN NEW.provider := COALESCE(NEW.provider, 'deepseek'); NEW.api_model := COALESCE(NEW.api_model, 'deepseek-v4-flash'); NEW.input_price_per_million := COALESCE(NEW.input_price_per_million, .14); NEW.cached_input_price_per_million := COALESCE(NEW.cached_input_price_per_million, .0028); NEW.output_price_per_million := COALESCE(NEW.output_price_per_million, .28);
+    WHEN 'deepseek-v4-pro' THEN NEW.provider := COALESCE(NEW.provider, 'deepseek'); NEW.api_model := COALESCE(NEW.api_model, 'deepseek-v4-pro'); NEW.input_price_per_million := COALESCE(NEW.input_price_per_million, .435); NEW.cached_input_price_per_million := COALESCE(NEW.cached_input_price_per_million, .003625); NEW.output_price_per_million := COALESCE(NEW.output_price_per_million, .87);
+    WHEN 'gpt-5.4-mini' THEN NEW.provider := COALESCE(NEW.provider, 'openai'); NEW.api_model := COALESCE(NEW.api_model, 'gpt-5.4-mini'); NEW.input_price_per_million := COALESCE(NEW.input_price_per_million, .75); NEW.cached_input_price_per_million := COALESCE(NEW.cached_input_price_per_million, .075); NEW.output_price_per_million := COALESCE(NEW.output_price_per_million, 4.5);
+    WHEN 'qwen3.7-plus' THEN NEW.provider := COALESCE(NEW.provider, 'qwen'); NEW.api_model := COALESCE(NEW.api_model, 'qwen3.7-plus'); NEW.input_price_per_million := COALESCE(NEW.input_price_per_million, .276); NEW.output_price_per_million := COALESCE(NEW.output_price_per_million, 1.101);
+    ELSE NEW.model_key := 'gpt-5.4'; NEW.provider := COALESCE(NEW.provider, 'openai'); NEW.api_model := COALESCE(NEW.api_model, 'gpt-5.4'); NEW.input_price_per_million := COALESCE(NEW.input_price_per_million, 2.5); NEW.cached_input_price_per_million := COALESCE(NEW.cached_input_price_per_million, .25); NEW.output_price_per_million := COALESCE(NEW.output_price_per_million, 15);
+  END CASE;
+  NEW.model_name := NEW.api_model;
+  NEW.pricing_currency := COALESCE(NEW.pricing_currency, 'USD'); NEW.pricing_effective_at := COALESCE(NEW.pricing_effective_at, DATE '2026-07-26');
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS trigger_generation_cycle_snapshot ON generation_cycles;
+CREATE TRIGGER trigger_generation_cycle_snapshot BEFORE INSERT ON generation_cycles FOR EACH ROW EXECUTE FUNCTION fill_generation_model_snapshot();
+DROP TRIGGER IF EXISTS trigger_generation_job_snapshot ON generation_jobs;
+CREATE TRIGGER trigger_generation_job_snapshot BEFORE INSERT ON generation_jobs FOR EACH ROW EXECUTE FUNCTION fill_generation_model_snapshot();
 
 COMMIT;

@@ -370,3 +370,6 @@ body {
   font-size: 0.9rem;
   font-weight: 600;
 }
+.public-banner { max-width: 640px; margin: 0 auto 12px; padding: 10px 14px; text-align: center; border-radius: 8px; background: #eef3ff; color: #243b6b; }
+.spinner { display: inline-block; width: 14px; height: 14px; margin-right: 8px; border: 2px solid #bbb; border-top-color: #333; border-radius: 50%; animation: public-spin .8s linear infinite; vertical-align: -2px; }
+@keyframes public-spin { to { transform: rotate(360deg); } }

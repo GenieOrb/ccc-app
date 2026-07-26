@@ -276,6 +276,17 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 - Inmutabilidad estricta a nivel de trigger de base de datos para la tabla de asignaciones.
 
 ## 33. Historial de Cambios Documentados
+
+## 34. Modelos y generación
+* Registro único: `src/lib/ai/models.ts`. Nuevas campañas usan DeepSeek V4 Flash; históricas se migran a GPT-5.4.
+* Modelos: DeepSeek V4 Flash/Pro, GPT-5.4 mini/GPT-5.4 y Qwen 3.7 Plus Frankfurt. Cada ciclo/job conserva proveedor, API model y tarifa snapshot.
+* `DEEPSEEK_API_KEY` habilita ambos DeepSeek; `DASHSCOPE_API_KEY` es canónico para Qwen (alias heredado `QWEN_API_KEY`), y `QWEN_BASE_URL` es el endpoint compatible-mode completo de Frankfurt.
+* Preflight conserva OpenAI/`OPENAI_MODEL`; la generación de comentarios usa el modelo snapshot de campaña.
+* Inventario: 30 iniciales por post, umbral 5 y reposición 10. Previews persistentes son siete comentarios en 5+2, sin fallback.
+* El polling de X sigue sin webhooks. Expiración se calcula desde `posted_at`; la cuenta se inicializa asíncronamente y el monitor evita resoluciones recurrentes.
+* El público muestra `Wait please...` y después `This should only take a moment.` cuando hay trabajo vigente.
+
+- `v1.4.0`: registro multi-proveedor, snapshots históricos, previews, métricas iniciales, inventario 30/10/5, estado de espera y monitorización de posts vigente.
 - `v1.0.0`: Implementación completa inicial del MVP de Comment App.
 - `v1.1.0`: Añadida edición de posts vigentes (`retired_at`), moderación de sugerencias (`withdrawn_at`), protección global del Referrer (`no-referrer`) y rutas administrativas anidadas (`/api/admin/campaigns/[id]/posts` y `/api/admin/campaigns/[id]/suggestions`).
 - `Fixes`: Corregido bug de activación que impedía reactivar campañas con inventario disponible si había comentarios retirados o asignados (`src/lib/services.ts`). Corregido leak de la dirección administrativa hacia el output final modificando el system prompt y añadiendo validación local anti-copia literal (`src/lib/openai.ts`, `src/lib/validator.ts`, `src/lib/worker.ts`).

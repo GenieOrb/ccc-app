@@ -1,12 +1,20 @@
 import 'server-only';
 import { queryDb, withTransaction } from './db';
-import { parseMultipleXUrls, fetchXPosts, resolveXUsername } from './x-api';
+import { parseMultipleXUrls, fetchXPosts } from './x-api';
 import { normalizeXAccounts } from './x-accounts';
 import { checkCampaignSafety } from './openai';
 import { generateSecureSlug } from './crypto';
 import { generateDeterministicSlotPlans } from './planner';
 import { processBackgroundQueue } from './worker';
-import { getConfig } from './config';
+import { DEFAULT_MODEL_KEY, getAiModel, isProviderConfigured } from './ai/models';
+import { generateSingleComment } from './openai';
+
+function resolveCampaignModel(modelKey?: string) {
+  const model = getAiModel(modelKey || DEFAULT_MODEL_KEY);
+  if (!model || !model.enabled) throw new Error('Modelo no configurado.');
+  if (!isProviderConfigured(model.provider)) throw new Error('El proveedor del modelo seleccionado no está configurado.');
+  return model;
+}
 
 export interface CampaignSummary {
   id: string;
@@ -15,6 +23,8 @@ export interface CampaignSummary {
   slug: string;
   publicUrl: string;
   direction?: string;
+  displayName?: string;
+  modelKey: string;
   isActive: boolean;
   safetyAllowed: boolean;
   safetyCategory?: string;
@@ -41,7 +51,26 @@ export interface CampaignSummary {
   createdAt: string;
 }
 
-export async function getAllCampaigns(appBaseUrl: string): Promise<CampaignSummary[]> {
+export interface CampaignsPage {
+  items: CampaignSummary[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+}
+
+export async function getCampaignsPage(
+  appBaseUrl: string,
+  page: number,
+  pageSize: number
+): Promise<CampaignsPage> {
+  const safePageSize = Math.max(1, Math.floor(pageSize));
+  const [{ total }] = await queryDb<{ total: string }>(`SELECT COUNT(*) AS total FROM campaigns`);
+  const campaignTotal = Number.parseInt(total, 10) || 0;
+  const totalPages = Math.max(1, Math.ceil(campaignTotal / safePageSize));
+  const safePage = Math.min(totalPages, Math.max(1, Math.floor(page)));
+  const offset = (safePage - 1) * safePageSize;
+
   const campaigns = await queryDb<{
     id: string;
     internal_number: number;
@@ -49,12 +78,20 @@ export async function getAllCampaigns(appBaseUrl: string): Promise<CampaignSumma
     campaign_type: 'manual' | 'perpetual';
     post_active_lifetime_hours: number | null;
     direction: string | null;
+    display_name: string | null;
+    model_key: string;
     is_active: boolean;
     safety_allowed: boolean;
     safety_category: string | null;
     safety_reason: string | null;
     created_at: Date;
-  }>(`SELECT id, internal_number, slug, campaign_type, post_active_lifetime_hours, direction, is_active, safety_allowed, safety_category, safety_reason, created_at FROM campaigns ORDER BY internal_number DESC`);
+  }>(
+    `SELECT id, internal_number, slug, campaign_type, post_active_lifetime_hours, direction, display_name, model_key, is_active, safety_allowed, safety_category, safety_reason, created_at
+     FROM campaigns
+     ORDER BY internal_number DESC
+     LIMIT $1 OFFSET $2`,
+    [safePageSize, offset]
+  );
 
   const results: CampaignSummary[] = [];
 
@@ -130,6 +167,8 @@ export async function getAllCampaigns(appBaseUrl: string): Promise<CampaignSumma
       postActiveLifetimeHours: c.post_active_lifetime_hours ?? undefined,
       publicUrl,
       direction: c.direction || undefined,
+      displayName: c.display_name || undefined,
+      modelKey: c.model_key,
       isActive: c.is_active,
       safetyAllowed: c.safety_allowed,
       safetyCategory: c.safety_category || undefined,
@@ -155,15 +194,27 @@ export async function getAllCampaigns(appBaseUrl: string): Promise<CampaignSumma
     });
   }
 
-  return results;
+  return { items: results, page: safePage, pageSize: safePageSize, total: campaignTotal, totalPages };
+}
+
+export async function getAllCampaigns(appBaseUrl: string): Promise<CampaignSummary[]> {
+  const [{ total }] = await queryDb<{ total: string }>(`SELECT COUNT(*) AS total FROM campaigns`);
+  const totalCount = Number.parseInt(total, 10) || 0;
+  const result = await getCampaignsPage(appBaseUrl, 1, Math.max(1, totalCount));
+  return result.items;
 }
 
 export async function createCampaign(params: {
   urlsInput: string;
   direction?: string;
+  displayName?: string;
+  modelKey?: string;
 }): Promise<{ id: string; slug: string }> {
   // 1. Validate & deduplicate X URLs
   const extractedUrls = parseMultipleXUrls(params.urlsInput);
+  const model = resolveCampaignModel(params.modelKey);
+  const displayName = params.displayName?.trim() || null;
+  if (displayName && displayName.length > 120) throw new Error('El nombre no puede superar 120 caracteres.');
 
   // 2. Fetch posts from X API
   const fetchedPosts = await fetchXPosts(extractedUrls);
@@ -187,11 +238,11 @@ export async function createCampaign(params: {
     const campRes = await client.query<{ id: string }>(
       `INSERT INTO campaigns (
          slug, campaign_type, direction, post_active_lifetime_hours, is_active, safety_allowed, safety_category, safety_reason,
-         initial_size, replenishment_threshold, replenishment_size
+         initial_size, replenishment_threshold, replenishment_size, display_name, model_key
        ) VALUES (
-         $1, 'manual', $2, NULL, false, true, $3, $4, 50, 20, 50
+         $1, 'manual', $2, NULL, false, true, $3, $4, 30, 5, 10, $5, $6
        ) RETURNING id`,
-      [slug, params.direction || null, safetyResult.category, safetyResult.reason]
+      [slug, params.direction || null, safetyResult.category, safetyResult.reason, displayName, model.key]
     );
     const campaignId = campRes.rows[0].id;
 
@@ -223,16 +274,16 @@ export async function createCampaign(params: {
     }
 
     // Generate 50 slot plans balanced across posts
-    const slotPlans = generateDeterministicSlotPlans(campaignPostIds, 50);
+    const slotPlans = generateDeterministicSlotPlans(campaignPostIds, 30);
 
     // Create Initial Generation Cycle
     const cycleRes = await client.query<{ id: string }>(
       `INSERT INTO generation_cycles (
-         campaign_id, cycle_type, target_count, status, model_name, prompt_version
+          campaign_id, cycle_type, target_count, status, model_key, model_name, prompt_version
        ) VALUES (
-         $1, 'initial', 50, 'pending', $2, 1
+          $1, 'initial', 30, 'pending', $2, $3, 1
        ) RETURNING id`,
-      [campaignId, getConfig().openaiModel]
+       [campaignId, model.key, model.apiModel]
     );
     const cycleId = cycleRes.rows[0].id;
 
@@ -256,7 +307,7 @@ export async function createCampaign(params: {
           plan.emojiPolicy,
           plan.rhetoricalForm,
           plan.texture,
-          getConfig().openaiModel,
+           model.apiModel,
         ]
       );
     }
@@ -396,14 +447,15 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
 
 export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<void> {
   // Determine campaign type first outside transaction for fast paths
-  const campTypeRes = await queryDb<{ campaign_type: string, replenishment_threshold: number, replenishment_size: number }>(
-    `SELECT campaign_type, replenishment_threshold, replenishment_size FROM campaigns WHERE id = $1`,
+  const campTypeRes = await queryDb<{ campaign_type: string, replenishment_threshold: number, replenishment_size: number, model_key: string }>(
+    `SELECT campaign_type, replenishment_threshold, replenishment_size, model_key FROM campaigns WHERE id = $1`,
     [campaignId]
   );
   if (campTypeRes.length === 0) return;
   const campaignInfo = campTypeRes[0];
   const threshold = campaignInfo.replenishment_threshold;
   const repSize = campaignInfo.replenishment_size;
+  const model = resolveCampaignModel(campaignInfo.model_key);
 
   if (campaignInfo.campaign_type === 'manual') {
     const availRows = await queryDb<{ count: string }>(
@@ -450,11 +502,11 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
 
         const cycleRes = await client.query<{ id: string }>(
           `INSERT INTO generation_cycles (
-           campaign_id, cycle_type, target_count, status, model_name, prompt_version
+            campaign_id, cycle_type, target_count, status, model_key, model_name, prompt_version
          ) VALUES (
-           $1, 'replenishment', 50, 'pending', $2, 1
+            $1, 'replenishment', $2, 'pending', $3, $4, 1
          ) RETURNING id`,
-        [campaignId, getConfig().openaiModel]
+         [campaignId, repSize, model.key, model.apiModel]
       );
       const cycleId = cycleRes.rows[0].id;
 
@@ -477,7 +529,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
             plan.emojiPolicy,
             plan.rhetoricalForm,
             plan.texture,
-            getConfig().openaiModel,
+             model.apiModel,
           ]
         );
       }
@@ -523,11 +575,11 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
 
         const cycleRes = await client.query<{ id: string }>(
           `INSERT INTO generation_cycles (
-             campaign_id, campaign_post_id, cycle_type, target_count, status, model_name, prompt_version
+              campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name, prompt_version
            ) VALUES (
-             $1, $2, 'replenishment', 50, 'pending', $3, 1
+              $1, $2, 'replenishment', $3, 'pending', $4, $5, 1
            ) RETURNING id`,
-          [campaignId, postId, getConfig().openaiModel]
+           [campaignId, postId, repSize, model.key, model.apiModel]
         );
         const cycleId = cycleRes.rows[0].id;
 
@@ -550,7 +602,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
               plan.emojiPolicy,
               plan.rhetoricalForm,
               plan.texture,
-              getConfig().openaiModel,
+               model.apiModel,
             ]
           );
         }
@@ -570,6 +622,7 @@ export type AssignmentResponse =
   | { status: 'success'; assignmentId: string; comment: string; postUrl: string }
   | { status: 'expired' }
   | { status: 'unavailable' }
+  | { status: 'generating'; retryAfterMs: number }
   | { status: 'no_inventory' }
   | { status: 'rate_limited' };
 
@@ -656,6 +709,7 @@ export async function assignCommentToVisitor(
        FROM campaign_posts cp
        WHERE cp.campaign_id = $1 
          AND cp.retired_at IS NULL
+         AND (cp.expires_at IS NULL OR cp.expires_at > NOW())
          AND NOT EXISTS (
            SELECT 1 FROM assignments a 
            WHERE a.campaign_id = cp.campaign_id 
@@ -670,15 +724,8 @@ export async function assignCommentToVisitor(
       return { status: 'unavailable' };
     }
 
-    // 6. Apply rate limit ONLY for new assignments
-    if (checkRateLimit) {
-      const allowed = await checkRateLimit();
-      if (!allowed) {
-        return { status: 'rate_limited' };
-      }
-    }
-
-    // 7. Select available suggestion FOR UPDATE SKIP LOCKED
+    // 6. Select available suggestion FOR UPDATE SKIP LOCKED. Polling with no
+    // inventory must not consume the assignment rate-limit budget.
     const suggestionRes = await client.query<{
       suggestion_id: string;
       campaign_post_id: string;
@@ -689,6 +736,7 @@ export async function assignCommentToVisitor(
        FROM suggestions s
        JOIN campaign_posts p ON s.campaign_post_id = p.id
        WHERE s.campaign_id = $1 AND s.status = 'available' AND p.retired_at IS NULL
+       AND (p.expires_at IS NULL OR p.expires_at > NOW())
        AND NOT EXISTS (
            SELECT 1 FROM assignments a 
            WHERE a.campaign_id = s.campaign_id 
@@ -704,6 +752,9 @@ export async function assignCommentToVisitor(
     if (suggestionRes.rows.length === 0) {
       return { status: 'no_inventory', campaignId };
     }
+
+    // 7. Apply the assignment limit only after an actual comment is available.
+    if (checkRateLimit && !(await checkRateLimit())) return { status: 'rate_limited' };
 
     const claimedSuggestion = suggestionRes.rows[0];
 
@@ -770,6 +821,8 @@ export async function assignCommentToVisitor(
   }
   
   if (txResult.status === 'no_inventory') {
+    const queued = await queryDb<{ count: string }>(`SELECT COUNT(*) AS count FROM generation_jobs j JOIN campaign_posts p ON p.id=j.campaign_post_id WHERE j.campaign_id = $1 AND j.status IN ('pending','processing') AND p.retired_at IS NULL AND (p.expires_at IS NULL OR p.expires_at > NOW())`, [txResult.campaignId]);
+    if (Number(queued[0]?.count || 0) > 0) return { status: 'generating', retryAfterMs: 2500 };
     return { status: 'no_inventory' };
   }
 
@@ -780,8 +833,13 @@ export async function createPerpetualCampaign(params: {
   accountsInput: string;
   direction?: string;
   postActiveLifetimeHours: number;
+  displayName?: string;
+  modelKey?: string;
 }): Promise<{ id: string; slug: string }> {
   const normalizedAccounts = normalizeXAccounts(params.accountsInput);
+  const model = resolveCampaignModel(params.modelKey);
+  const displayName = params.displayName?.trim() || null;
+  if (displayName && displayName.length > 120) throw new Error('El nombre no puede superar 120 caracteres.');
 
   if (params.postActiveLifetimeHours < 1 || params.postActiveLifetimeHours > 720 || !Number.isInteger(params.postActiveLifetimeHours)) {
     throw new Error('La duración de los posts debe ser un número entero entre 1 y 720 horas.');
@@ -794,11 +852,11 @@ export async function createPerpetualCampaign(params: {
     const campRes = await client.query<{ id: string }>(
       `INSERT INTO campaigns (
          slug, campaign_type, direction, post_active_lifetime_hours, is_active, safety_allowed,
-         initial_size, replenishment_threshold, replenishment_size
+         initial_size, replenishment_threshold, replenishment_size, display_name, model_key
        ) VALUES (
-         $1, 'perpetual', $2, $3, false, true, 50, 20, 50
+         $1, 'perpetual', $2, $3, false, true, 30, 5, 10, $4, $5
        ) RETURNING id`,
-      [slug, params.direction || null, params.postActiveLifetimeHours]
+      [slug, params.direction || null, params.postActiveLifetimeHours, displayName, model.key]
     );
     const campaignId = campRes.rows[0].id;
 
@@ -813,6 +871,33 @@ export async function createPerpetualCampaign(params: {
 
     return { id: campaignId, slug };
   });
+}
+
+export async function generateCampaignPreview(campaignId: string) {
+  const rows = await queryDb<{ model_key: string; direction: string | null; post_id: string; text_content: string; author_name: string | null; author_username: string | null; accessible_context: unknown }>(
+    `SELECT c.model_key,c.direction,p.id post_id,p.text_content,p.author_name,p.author_username,p.accessible_context
+     FROM campaigns c JOIN campaign_posts p ON p.campaign_id=c.id
+     WHERE c.id=$1 AND p.retired_at IS NULL AND (p.expires_at IS NULL OR p.expires_at>NOW())
+     ORDER BY p.posted_at DESC NULLS LAST,p.created_at DESC LIMIT 1`, [campaignId]);
+  if (!rows[0]) throw new Error('No hay ningún post vigente para generar la preview.');
+  const row = rows[0]; const model = resolveCampaignModel(row.model_key);
+  const plans = generateDeterministicSlotPlans([row.post_id], 7);
+  const comments: string[] = []; let errorMessage: string | null = null;
+  try {
+    // Preview follows the same 5+2 batch boundary as production while never
+    // falling back to a different model.
+    for (const batch of [plans.slice(0, 5), plans.slice(5)]) {
+      const generated = await Promise.all(batch.map((plan) => generateSingleComment({ apiModel: model.apiModel, provider: model.provider, postText: row.text_content, authorName: row.author_name || '', authorUsername: row.author_username || '', accessibleContext: (row.accessible_context as Record<string, unknown>) || {}, direction: row.direction || undefined, plan, recentComments: comments })));
+      comments.push(...generated.map((item) => item.comment));
+    }
+  } catch { errorMessage = `La preview con ${model.displayName} no pudo generarse.`; }
+  await queryDb(`INSERT INTO campaign_previews (campaign_id,campaign_post_id,model_key,provider,api_model,comments,error_message,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency,pricing_effective_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, [campaignId,row.post_id,model.key,model.provider,model.apiModel,JSON.stringify(comments),errorMessage,model.inputPricePerMillion,model.cachedInputPricePerMillion ?? null,model.outputPricePerMillion,model.currency,model.pricingEffectiveAt]);
+  if (errorMessage) throw new Error(errorMessage);
+  return { postId: row.post_id, modelKey: model.key, provider: model.provider, comments };
+}
+
+export async function listCampaignPreviews(campaignId: string) {
+  return queryDb(`SELECT id,campaign_post_id,model_key,provider,api_model,comments,error_message,created_at FROM campaign_previews WHERE campaign_id=$1 ORDER BY created_at DESC LIMIT 30`, [campaignId]);
 }
 
 export async function addAccountsToCampaign(campaignId: string, accountsInput: string) {
@@ -843,20 +928,11 @@ export async function addAccountsToCampaign(campaignId: string, accountsInput: s
       );
 
       if (existingRes.rows.length === 0) {
-        // Resolve X user ID before inserting
-        let xUserId: string | null = null;
-        try {
-          xUserId = await resolveXUsername(acc.username);
-        } catch (error: unknown) {
-          const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-          throw new Error(`Error al resolver el usuario @${acc.username}: ${errorMsg}`);
-        }
-
         const insertRes = await client.query<{ id: string; username: string; username_normalized: string; created_at: Date; removed_at: Date | null }>(
           `INSERT INTO campaign_accounts (campaign_id, username, username_normalized, x_user_id, monitoring_started_at)
            VALUES ($1, $2, $3, $4, NOW())
            RETURNING id, username, username_normalized, created_at, removed_at`,
-          [campaignId, acc.username, acc.username_normalized, xUserId]
+          [campaignId, acc.username, acc.username_normalized, null]
         );
         addedAccounts.push({
           id: insertRes.rows[0].id,
@@ -937,12 +1013,18 @@ export async function updateCampaignDuration(campaignId: string, postActiveLifet
     );
 
     // Retirar instantáneamente los que quedaron expirados
-    await client.query(
+    const retired = await client.query<{ id: string }>(
       `UPDATE campaign_posts 
        SET retired_at = NOW() 
        WHERE campaign_id = $1 AND retired_at IS NULL AND expires_at <= NOW()`,
       [campaignId]
     );
+    if (retired.rows.length) {
+      const ids = retired.rows.map((post) => post.id);
+      await client.query(`UPDATE suggestions SET status='withdrawn', withdrawn_at=NOW() WHERE campaign_post_id=ANY($1) AND status='available'`, [ids]);
+      await client.query(`UPDATE generation_jobs SET status='cancelled', lease_owner=NULL, lease_expires_at=NULL, updated_at=NOW() WHERE campaign_post_id=ANY($1) AND status IN ('pending','processing')`, [ids]);
+      await client.query(`UPDATE generation_cycles SET status='cancelled', finished_at=NOW() WHERE campaign_post_id=ANY($1) AND status IN ('pending','processing')`, [ids]);
+    }
 
     return { success: true };
   });

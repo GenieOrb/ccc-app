@@ -55,6 +55,9 @@ export async function POST(
         { status: 503, headers: { 'Cache-Control': 'no-store' } }
       );
     }
+    if (result.status === 'generating') {
+      return NextResponse.json({ status: 'generating', retryAfterMs: result.retryAfterMs }, { status: 200, headers: { 'Cache-Control': 'no-store' } });
+    }
 
     if (result.status === 'rate_limited') {
       return NextResponse.json(

@@ -1,13 +1,15 @@
 import { NextResponse } from 'next/server';
 import { isAdminAuthenticated, validateSameOrigin } from '@/lib/auth';
-import { getAllCampaigns, createCampaign, createPerpetualCampaign } from '@/lib/services';
+import { getCampaignsPage, createCampaign, createPerpetualCampaign } from '@/lib/services';
 import { getConfig } from '@/lib/config';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
-export async function GET() {
+const CAMPAIGNS_PAGE_SIZE = 12;
+
+export async function GET(req: Request) {
   const isAuth = await isAdminAuthenticated();
   if (!isAuth) {
     return NextResponse.json(
@@ -18,9 +20,17 @@ export async function GET() {
 
   try {
     const config = getConfig();
-    const campaigns = await getAllCampaigns(config.appBaseUrl);
+    const rawPage = new URL(req.url).searchParams.get('page');
+    const page = rawPage === null ? 1 : Number(rawPage);
+    if (!Number.isInteger(page) || page < 1) {
+      return NextResponse.json(
+        { error: 'El parámetro page debe ser un entero positivo.' },
+        { status: 400, headers: { 'Cache-Control': 'no-store' } }
+      );
+    }
+    const campaigns = await getCampaignsPage(config.appBaseUrl, page, CAMPAIGNS_PAGE_SIZE);
     return NextResponse.json(
-      { campaigns },
+      campaigns,
       { headers: { 'Cache-Control': 'no-store' } }
     );
   } catch (error: unknown) {
@@ -67,7 +77,7 @@ export async function POST(req: Request) {
         );
       }
 
-      const { urlsInput, direction } = body;
+      const { urlsInput, direction, displayName, modelKey } = body;
       
       if (!urlsInput || typeof urlsInput !== 'string') {
         return NextResponse.json(
@@ -83,7 +93,9 @@ export async function POST(req: Request) {
         );
       }
 
-      const created = await createCampaign({ urlsInput, direction });
+      if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length > 120)) return NextResponse.json({ error: 'Nombre de campaña no válido.' }, { status: 400 });
+      if (modelKey !== undefined && typeof modelKey !== 'string') return NextResponse.json({ error: 'Modelo no válido.' }, { status: 400 });
+      const created = await createCampaign({ urlsInput, direction, displayName, modelKey });
 
       return NextResponse.json(
         { success: true, campaign: { ...created, campaignType: 'manual' } },
@@ -97,7 +109,7 @@ export async function POST(req: Request) {
         );
       }
 
-      const { accountsInput, direction, postActiveLifetimeHours } = body;
+      const { accountsInput, direction, postActiveLifetimeHours, displayName, modelKey } = body;
       
       if (!accountsInput || typeof accountsInput !== 'string') {
         return NextResponse.json(
@@ -120,7 +132,9 @@ export async function POST(req: Request) {
         );
       }
 
-      const created = await createPerpetualCampaign({ accountsInput, direction, postActiveLifetimeHours });
+      if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length > 120)) return NextResponse.json({ error: 'Nombre de campaña no válido.' }, { status: 400 });
+      if (modelKey !== undefined && typeof modelKey !== 'string') return NextResponse.json({ error: 'Modelo no válido.' }, { status: 400 });
+      const created = await createPerpetualCampaign({ accountsInput, direction, postActiveLifetimeHours, displayName, modelKey });
 
       return NextResponse.json(
         { success: true, campaign: { ...created, campaignType: 'perpetual' } },

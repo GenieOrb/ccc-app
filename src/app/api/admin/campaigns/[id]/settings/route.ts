@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
 import { isAdminAuthenticated, validateSameOrigin } from '@/lib/auth';
 import { updateCampaignDuration } from '@/lib/services';
+import { getAiModel, isProviderConfigured } from '@/lib/ai/models';
+import { queryDb } from '@/lib/db';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -33,7 +35,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     }
 
     const keys = Object.keys(body);
-    if (keys.length !== 1 || keys[0] !== 'postActiveLifetimeHours') {
+    if (keys.length !== 1 || !['postActiveLifetimeHours','displayName','modelKey'].includes(keys[0])) {
       return NextResponse.json(
         { error: 'El cuerpo solo puede contener el campo postActiveLifetimeHours.' },
         { status: 400, headers: { 'Cache-Control': 'no-store' } }
@@ -41,6 +43,8 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     }
 
     const { postActiveLifetimeHours } = body;
+    if (keys[0] === 'displayName') { if (typeof body.displayName !== 'string' || body.displayName.trim().length > 120) throw new Error('Nombre no válido.'); await queryDb(`UPDATE campaigns SET display_name=$1,updated_at=NOW() WHERE id=$2`, [body.displayName.trim() || null,id]); return NextResponse.json({ success:true }); }
+    if (keys[0] === 'modelKey') { const model=getAiModel(body.modelKey); if (!model || !model.enabled || !isProviderConfigured(model.provider)) throw new Error('Modelo no configurado.'); await queryDb(`UPDATE campaigns SET model_key=$1,updated_at=NOW() WHERE id=$2`, [model.key,id]); return NextResponse.json({ success:true }); }
 
     if (postActiveLifetimeHours === undefined || typeof postActiveLifetimeHours !== 'number' || postActiveLifetimeHours < 1 || postActiveLifetimeHours > 720 || !Number.isInteger(postActiveLifetimeHours)) {
       return NextResponse.json(

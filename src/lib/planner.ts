@@ -56,18 +56,18 @@ export function generateDeterministicSlotPlans(
     throw new Error('At least one campaign post ID is required for slot planning.');
   }
 
-  // 1. Build length + emoji distribution
-  // 6 ultra_short + 1 emoji
-  // 29 ultra_short + 0 emoji
-  // 15 normal + 0 emoji
+  // Build an arbitrarily sized, balanced plan. The former fixed 50-entry
+  // bags made previews and five-comment batches index undefined entries.
   const lengthEmojiPairs: Array<{ lengthMode: LengthMode; emojiPolicy: EmojiPolicy }> = [];
-  for (let i = 0; i < 6; i++) {
+  const emojiCount = Math.max(0, Math.round(totalSlots * 0.12));
+  const normalCount = Math.max(1, Math.round(totalSlots * 0.30));
+  for (let i = 0; i < emojiCount; i++) {
     lengthEmojiPairs.push({ lengthMode: 'ultra_short', emojiPolicy: 'one_emoji' });
   }
-  for (let i = 0; i < 29; i++) {
+  for (let i = emojiCount; i < totalSlots - normalCount; i++) {
     lengthEmojiPairs.push({ lengthMode: 'ultra_short', emojiPolicy: 'no_emoji' });
   }
-  for (let i = 0; i < 15; i++) {
+  for (let i = 0; i < normalCount; i++) {
     lengthEmojiPairs.push({ lengthMode: 'normal', emojiPolicy: 'no_emoji' });
   }
 
@@ -85,20 +85,12 @@ export function generateDeterministicSlotPlans(
     'future_implication',
   ];
   const formsBag: RhetoricalForm[] = [];
-  for (const form of formsList) {
-    for (let i = 0; i < 5; i++) {
-      formsBag.push(form);
-    }
-  }
+  for (let i = 0; i < totalSlots; i++) formsBag.push(formsList[i % formsList.length]);
 
   // 3. Build textures distribution (5 textures x 10 slots = 50)
   const texturesList: Textures[] = ['plain', 'warm', 'firm', 'energetic', 'reflective'];
   const texturesBag: Textures[] = [];
-  for (const tex of texturesList) {
-    for (let i = 0; i < 10; i++) {
-      texturesBag.push(tex);
-    }
-  }
+  for (let i = 0; i < totalSlots; i++) texturesBag.push(texturesList[i % texturesList.length]);
 
   // 4. Shuffle each dimension independently with crypto
   const shuffledPairs = cryptoShuffle(lengthEmojiPairs);

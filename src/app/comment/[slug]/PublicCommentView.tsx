@@ -8,7 +8,8 @@ interface Props {
 
 export default function PublicCommentView({ slug }: Props) {
   const [loading, setLoading] = useState(true);
-  const [status, setStatus] = useState<'success' | 'expired' | 'unavailable' | 'error'>('success');
+  const [status, setStatus] = useState<'success' | 'expired' | 'unavailable' | 'generating' | 'error'>('success');
+  const [waitLong, setWaitLong] = useState(false);
   const [assignmentId, setAssignmentId] = useState('');
   const [comment, setComment] = useState('');
   const [hasCopied, setHasCopied] = useState(false);
@@ -20,6 +21,7 @@ export default function PublicCommentView({ slug }: Props) {
   useEffect(() => {
     let isMounted = true;
 
+    let timer: ReturnType<typeof setTimeout> | undefined;
     async function fetchAssignment() {
       try {
         const res = await fetch(`/api/public/comment/${slug}/assignment`, {
@@ -38,6 +40,9 @@ export default function PublicCommentView({ slug }: Props) {
           setStatus('expired');
         } else if (data.status === 'unavailable') {
           setStatus('unavailable');
+        } else if (data.status === 'generating') {
+          setStatus('generating');
+          timer = setTimeout(fetchAssignment, data.retryAfterMs || 2500);
         } else {
           setStatus('error');
         }
@@ -52,8 +57,11 @@ export default function PublicCommentView({ slug }: Props) {
 
     return () => {
       isMounted = false;
+      if (timer) clearTimeout(timer);
     };
   }, [slug]);
+
+  useEffect(() => { if (status !== 'generating') return; const timer = setTimeout(() => setWaitLong(true), 10000); return () => clearTimeout(timer); }, [status]);
 
   function handleCopy() {
     if (!comment) return;
@@ -171,6 +179,8 @@ export default function PublicCommentView({ slug }: Props) {
     );
   }
 
+  if (status === 'generating') return <div className="public-container"><div className="public-card"><div className="status-message"><span className="spinner" />{waitLong ? 'This should only take a moment.' : 'Wait please...'}</div></div></div>;
+
   if (status === 'error' || !comment) {
     return (
       <div className="public-container">
@@ -183,6 +193,7 @@ export default function PublicCommentView({ slug }: Props) {
 
   return (
     <div className="public-container">
+      <div className="public-banner">Promocionate con nuestra APP, mas info aqui.</div>
       <div className="public-card">
         {/* Instructions in English */}
         <ol className="instructions-list">

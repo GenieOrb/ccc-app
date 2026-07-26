@@ -10,6 +10,8 @@ export interface CampaignSummary {
   slug: string;
   publicUrl: string;
   direction?: string;
+  displayName?: string;
+  modelKey: string;
   isActive: boolean;
   safetyAllowed: boolean;
   safetyCategory?: string;
@@ -49,13 +51,25 @@ export interface Suggestion {
   postIsRetired: boolean;
 }
 
+interface CampaignPreview {
+  id: string;
+  campaign_post_id: string;
+  model_key: string;
+  provider: string;
+  api_model: string;
+  comments: string[] | string;
+  error_message: string | null;
+  created_at: string;
+}
+
 function CampaignCardItem({
   c,
   fetchCampaigns,
   handleToggleStatus,
   handleRetryGeneration,
   handleCopyUrl,
-  copiedId
+  copiedId,
+  models
 }: {
   c: CampaignSummary;
   fetchCampaigns: () => Promise<void>;
@@ -63,6 +77,7 @@ function CampaignCardItem({
   handleRetryGeneration: (id: string) => Promise<void>;
   handleCopyUrl: (url: string, id: string) => void;
   copiedId: string | null;
+  models: Array<{key:string;displayName:string;configured:boolean;enabled:boolean}>;
 }) {
   const [showComments, setShowComments] = useState(false);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
@@ -74,6 +89,58 @@ function CampaignCardItem({
   const [addingAccount, setAddingAccount] = useState(false);
   const [durationInput, setDurationInput] = useState(c.postActiveLifetimeHours?.toString() || '24');
   const [changingDuration, setChangingDuration] = useState(false);
+  const [displayNameInput, setDisplayNameInput] = useState(c.displayName || '');
+  const [modelKeyInput, setModelKeyInput] = useState(c.modelKey);
+  const [savingIdentity, setSavingIdentity] = useState(false);
+  const [previews, setPreviews] = useState<CampaignPreview[]>([]);
+  const [loadingPreviews, setLoadingPreviews] = useState(true);
+  const [generatingPreview, setGeneratingPreview] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+
+  const loadPreviews = useCallback(async () => {
+    setLoadingPreviews(true);
+    try {
+      const res = await fetch(`/api/admin/campaigns/${c.id}/preview`, { cache: 'no-store' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Error al cargar el historial de previews.');
+      setPreviews(Array.isArray(data.previews) ? data.previews : []);
+    } catch (e: unknown) {
+      setPreviewError(e instanceof Error ? e.message : 'Error al cargar el historial de previews.');
+    } finally {
+      setLoadingPreviews(false);
+    }
+  }, [c.id]);
+
+  useEffect(() => {
+    void loadPreviews();
+  }, [loadPreviews]);
+
+  const handleGeneratePreview = async () => {
+    setGeneratingPreview(true);
+    setPreviewError(null);
+    try {
+      const res = await fetch(`/api/admin/campaigns/${c.id}/preview`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Error al generar preview.');
+      await loadPreviews();
+    } catch (e: unknown) {
+      setPreviewError(e instanceof Error ? e.message : 'Error al generar preview.');
+      await loadPreviews();
+    } finally {
+      setGeneratingPreview(false);
+    }
+  };
+
+  const saveSetting = async (setting: Record<string, string>) => {
+    setSavingIdentity(true);
+    try {
+      const res = await fetch(`/api/admin/campaigns/${c.id}/settings`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(setting) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'No se pudo guardar la configuraciÃ³n');
+      await fetchCampaigns();
+    } catch (e: unknown) { alert(e instanceof Error ? e.message : String(e)); }
+    finally { setSavingIdentity(false); }
+  };
 
   const loadComments = async (cursor?: string | null) => {
     setLoadingComments(true);
@@ -220,6 +287,27 @@ function CampaignCardItem({
           {c.isActive ? 'Activa' : 'Desactivada'}
         </span>
       </div>
+
+      <div style={{ marginTop: '8px', display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'baseline' }}>
+        <strong>{c.displayName || c.internalId}</strong>
+        <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Modelo: {c.modelKey}</span>
+      </div>
+      <form onSubmit={(e) => { e.preventDefault(); void saveSetting({ displayName: displayNameInput }); }} style={{ marginTop: '10px' }}>
+        <label htmlFor={`campaign-name-${c.id}`} className="form-label">Nombre de campaÃ±a</label>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <input id={`campaign-name-${c.id}`} className="form-textarea" value={displayNameInput} maxLength={120} onChange={(e) => setDisplayNameInput(e.target.value)} disabled={savingIdentity} />
+          <button className="btn-admin btn-secondary" type="submit" disabled={savingIdentity}>Guardar</button>
+        </div>
+      </form>
+      <form onSubmit={(e) => { e.preventDefault(); void saveSetting({ modelKey: modelKeyInput }); }} style={{ marginTop: '8px' }}>
+        <label htmlFor={`campaign-model-${c.id}`} className="form-label">Modelo de generaciÃ³n</label>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <select id={`campaign-model-${c.id}`} className="form-textarea" value={modelKeyInput} onChange={(e) => setModelKeyInput(e.target.value)} disabled={savingIdentity}>
+            {models.map((model) => <option key={model.key} value={model.key} disabled={!model.enabled || !model.configured}>{model.displayName}{!model.configured ? ' (no configurado)' : ''}</option>)}
+          </select>
+          <button className="btn-admin btn-secondary" type="submit" disabled={savingIdentity || modelKeyInput === c.modelKey}>Guardar</button>
+        </div>
+      </form>
 
       {c.direction && (
         <p style={{ fontSize: '0.9rem', fontStyle: 'italic', color: '#475569' }}>
@@ -409,6 +497,53 @@ function CampaignCardItem({
         )}
       </div>
 
+      <section style={{ borderTop: '1px solid var(--border-color)', paddingTop: '16px', marginBottom: '16px' }} aria-label="Previews de comentarios">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', marginBottom: '10px' }}>
+          <strong>Preview de comentarios</strong>
+          <button
+            type="button"
+            onClick={() => void handleGeneratePreview()}
+            className="btn-admin btn-secondary"
+            disabled={generatingPreview}
+          >
+            {generatingPreview ? 'Generando preview...' : 'Generar preview'}
+          </button>
+        </div>
+
+        {previewError && <p role="alert" style={{ color: 'var(--peach-accent)', margin: '0 0 10px' }}>{previewError}</p>}
+        {loadingPreviews ? (
+          <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: 0 }}>Cargando historial de previews...</p>
+        ) : previews.length === 0 ? (
+          <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: 0 }}>Aún no hay previews para esta campaña.</p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {previews.map((preview) => {
+              let comments: string[] = [];
+              try {
+                comments = Array.isArray(preview.comments) ? preview.comments : JSON.parse(preview.comments);
+              } catch {
+                comments = [];
+              }
+
+              return (
+                <article key={preview.id} style={{ padding: '10px', border: '1px solid var(--border-color)', borderRadius: '6px', fontSize: '0.85rem' }}>
+                  <div style={{ color: 'var(--text-muted)', marginBottom: '8px' }}>
+                    <time dateTime={preview.created_at}>{new Date(preview.created_at).toLocaleString()}</time>
+                    {' · '}Modelo: {preview.model_key} ({preview.api_model})
+                    {' · '}Proveedor: {preview.provider}
+                    {' · '}Post: {preview.campaign_post_id}
+                  </div>
+                  {preview.error_message && <p role="alert" style={{ color: 'var(--peach-accent)', margin: '0 0 8px' }}>{preview.error_message}</p>}
+                  <ol style={{ margin: 0, paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                    {Array.from({ length: 7 }, (_, index) => <li key={index}>{comments[index] || 'No generado.'}</li>)}
+                  </ol>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
       {/* Comments Section */}
       <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
         <button type="button" onClick={toggleComments} className="btn-admin btn-secondary" style={{ width: '100%' }}>
@@ -462,11 +597,18 @@ function CampaignCardItem({
 
 export default function AdminDashboardPage() {
   const [campaigns, setCampaigns] = useState<CampaignSummary[]>([]);
+  const [campaignPage, setCampaignPage] = useState(1);
+  const [totalCampaigns, setTotalCampaigns] = useState(0);
+  const [totalCampaignPages, setTotalCampaignPages] = useState(1);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   // Form states
   const [campaignTypeToCreate, setCampaignTypeToCreate] = useState<'manual' | 'perpetual'>('manual');
+  const [displayName, setDisplayName] = useState('');
+  const [modelKey, setModelKey] = useState('deepseek-v4-flash');
+  const [models, setModels] = useState<Array<{key:string;displayName:string;inputPricePerMillion:number;outputPricePerMillion:number;configured:boolean;enabled:boolean}>>([]);
+  useEffect(() => { fetch('/api/admin/models').then(r => r.ok ? r.json() : null).then(data => { if (data?.models) setModels(data.models); }).catch(() => {}); }, []);
   const [urlsInput, setUrlsInput] = useState('');
   const [accountsInput, setAccountsInput] = useState('');
   const [postActiveLifetimeHours, setPostActiveLifetimeHours] = useState('24');
@@ -476,16 +618,19 @@ export default function AdminDashboardPage() {
 
   const router = useRouter();
 
-  const fetchCampaigns = useCallback(async () => {
+  const fetchCampaigns = useCallback(async (requestedPage = campaignPage) => {
     try {
-      const res = await fetch('/api/admin/campaigns');
+      const res = await fetch(`/api/admin/campaigns?page=${requestedPage}`);
       if (res.status === 401) {
         router.push('/admin/login');
         return;
       }
       const data = await res.json();
       if (res.ok) {
-        setCampaigns(data.campaigns || []);
+        setCampaigns(data.items || []);
+        setCampaignPage(data.page || requestedPage);
+        setTotalCampaigns(data.total || 0);
+        setTotalCampaignPages(data.totalPages || 1);
       } else {
         setError(data.error || 'Error al cargar campañas.');
       }
@@ -494,7 +639,7 @@ export default function AdminDashboardPage() {
     } finally {
       setLoading(false);
     }
-  }, [router]);
+  }, [campaignPage, router]);
 
   useEffect(() => {
     fetchCampaigns();
@@ -537,7 +682,7 @@ export default function AdminDashboardPage() {
     setCreating(true);
 
     try {
-      const payload: Record<string, string | number> = { campaignType: campaignTypeToCreate, direction };
+      const payload: Record<string, string | number> = { campaignType: campaignTypeToCreate, direction, displayName, modelKey };
       if (campaignTypeToCreate === 'manual') {
         payload.urlsInput = urlsInput;
       } else {
@@ -562,7 +707,7 @@ export default function AdminDashboardPage() {
       setUrlsInput('');
       setAccountsInput('');
       setDirection('');
-      await fetchCampaigns();
+      await fetchCampaigns(1);
     } catch {
       setError('Error al enviar la petición de creación.');
     } finally {
@@ -641,6 +786,8 @@ export default function AdminDashboardPage() {
         <section className="admin-card">
           <h2 className="admin-card-header">Crear Nueva Campaña</h2>
           <form onSubmit={handleCreateCampaign}>
+            <div className="form-group"><label className="form-label">Nombre de campaña</label><input className="form-textarea" value={displayName} maxLength={120} onChange={(e) => setDisplayName(e.target.value)} /></div>
+            <div className="form-group"><label className="form-label">Modelo</label><select className="form-textarea" value={modelKey} onChange={(e) => setModelKey(e.target.value)}>{models.map(model => <option key={model.key} value={model.key} disabled={!model.enabled || !model.configured}>{model.displayName} — Entrada ${model.inputPricePerMillion} · salida ${model.outputPricePerMillion} / 1M tokens{!model.configured ? ' · No configurado' : ''}</option>)}</select></div>
             <div className="form-group">
               <label htmlFor="campaign-type" className="form-label">
                 Tipo de campaña
@@ -743,7 +890,7 @@ export default function AdminDashboardPage() {
         {/* Campaigns List */}
         <section className="admin-card">
           <h2 className="admin-card-header">
-            Campañas ({campaigns.length})
+            Campañas ({totalCampaigns})
           </h2>
 
           {loading ? (
@@ -763,8 +910,23 @@ export default function AdminDashboardPage() {
                   handleRetryGeneration={handleRetryGeneration}
                   handleCopyUrl={handleCopyUrl}
                   copiedId={copiedId}
+                  models={models}
                 />
               ))}
+            </div>
+          )}
+
+          {!loading && totalCampaignPages > 1 && (
+            <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '12px', marginTop: '20px' }}>
+              <button type="button" className="btn-admin btn-secondary" disabled={campaignPage === 1} onClick={() => fetchCampaigns(campaignPage - 1)}>
+                Anterior
+              </button>
+              <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                Página {campaignPage} de {totalCampaignPages}
+              </span>
+              <button type="button" className="btn-admin btn-secondary" disabled={campaignPage >= totalCampaignPages} onClick={() => fetchCampaigns(campaignPage + 1)}>
+                Siguiente
+              </button>
             </div>
           )}
         </section>
