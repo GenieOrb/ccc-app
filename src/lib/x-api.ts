@@ -102,11 +102,17 @@ export function parseAndValidateXUrl(rawUrl: string): ExtractedXUrl {
 
   // Path format: /username/status/1234567890 or /status/1234567890 or /i/web/status/1234567890
   const pathname = parsed.pathname;
-  const statusMatch = pathname.match(/\/status\/(\d+)/i);
+  const statusMatch = pathname.match(/\/status\/([^/?#]+)/i);
   if (!statusMatch || !statusMatch[1]) {
+    if (pathname.split('/').filter(Boolean).length === 1) {
+      throw new Error('Estas en campaña manual, debes poner posts, no cuentas.');
+    }
     throw new Error(`No se encontró un ID numérico de post de X en la URL "${trimmed}".`);
   }
 
+  if (!/^\d+$/.test(statusMatch[1])) {
+    throw new Error(`No se encontró un ID numérico de post de X en la URL "${trimmed}".`);
+  }
   const postId = statusMatch[1];
   const canonicalUrl = `https://x.com/i/status/${postId}`;
 
@@ -119,7 +125,7 @@ export function parseAndValidateXUrl(rawUrl: string): ExtractedXUrl {
 
 export function parseMultipleXUrls(input: string): ExtractedXUrl[] {
   const lines = input
-    .split(/[\r\n]+/)
+    .split(/[\r\n,]+/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
 
@@ -356,8 +362,7 @@ export async function resolveXUsername(username: string): Promise<string> {
 
 export async function fetchNewXPostsForAccount(
   xUserId: string,
-  sincePostId: string | null,
-  monitoringStartedAt: Date
+  sincePostId: string | null
 ): Promise<FetchedXPost[]> {
   const config = getConfig();
   if (!config.xBearerToken) {
@@ -378,12 +383,6 @@ export async function fetchNewXPostsForAccount(
 
   if (sincePostId) {
     url.searchParams.set('since_id', sincePostId);
-  } else {
-    // Si no hay cursor, podemos acotar el tiempo para no traer demasiados históricos (y luego filtrar en código)
-    // Usamos start_time solo si podemos asegurar el formato ISO 8601
-    try {
-      url.searchParams.set('start_time', monitoringStartedAt.toISOString());
-    } catch {}
   }
 
   const apiUrl = url.toString();
@@ -464,13 +463,8 @@ export async function fetchNewXPostsForAccount(
       continue;
     }
 
-    // Filtrar publicaciones anteriores al monitoringStartedAt (doble check)
-    if (tweet.created_at) {
-      const postDate = new Date(tweet.created_at);
-      if (postDate < monitoringStartedAt) {
-        continue;
-      }
-    }
+    // With no cursor this is initial/re-activation recovery. Expiry is checked
+    // by the monitor using the campaign lifetime, not monitoring_started_at.
 
     const postId = tweet.id;
     const mappedAuthor = typeof tweet.author_id === 'string' ? userMap.get(tweet.author_id) : undefined;

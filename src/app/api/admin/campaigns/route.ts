@@ -7,7 +7,7 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
-const CAMPAIGNS_PAGE_SIZE = 12;
+const CAMPAIGNS_PAGE_SIZE = 10;
 
 export async function GET(req: Request) {
   const isAuth = await isAdminAuthenticated();

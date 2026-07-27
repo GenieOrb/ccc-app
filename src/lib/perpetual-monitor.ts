@@ -108,7 +108,7 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
         await queryDb('UPDATE campaign_accounts SET x_user_id = $1 WHERE id = $2', [xUserId, account.id]);
       }
 
-      const fetchedPosts = await fetchNewXPostsForAccount(xUserId, account.last_seen_post_id, account.monitoring_started_at);
+      const fetchedPosts = await fetchNewXPostsForAccount(xUserId, account.last_seen_post_id);
       // Initial recovery deliberately imports only the most recent eligible post.
       const newPosts = !account.last_seen_post_id && fetchedPosts.length > 1 ? [fetchedPosts.reduce((latest, post) => BigInt(post.postId) > BigInt(latest.postId) ? post : latest)] : fetchedPosts;
 
@@ -150,6 +150,17 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
               const expiresAt = account.post_active_lifetime_hours
                 ? new Date(publishedAt.getTime() + account.post_active_lifetime_hours * 3600 * 1000)
                 : null;
+
+              // Recovery deliberately reaches backwards for the latest eligible
+              // post, but an expired post must never create inventory or jobs.
+              if (expiresAt && expiresAt <= new Date()) {
+                highestPostId = post.postId;
+                await client.query(
+                  'UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))',
+                  [highestPostId, account.id]
+                );
+                return;
+              }
 
               const insertRes = await client.query<{ id: string }>(`
                 INSERT INTO campaign_posts (

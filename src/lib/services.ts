@@ -240,7 +240,7 @@ export async function createCampaign(params: {
          slug, campaign_type, direction, post_active_lifetime_hours, is_active, safety_allowed, safety_category, safety_reason,
          initial_size, replenishment_threshold, replenishment_size, display_name, model_key
        ) VALUES (
-         $1, 'manual', $2, NULL, false, true, $3, $4, 30, 5, 10, $5, $6
+         $1, 'manual', $2, NULL, true, true, $3, $4, 30, 5, 10, $5, $6
        ) RETURNING id`,
       [slug, params.direction || null, safetyResult.category, safetyResult.reason, displayName, model.key]
     );
@@ -324,7 +324,7 @@ export async function createCampaign(params: {
 }
 
 export async function toggleCampaignStatus(campaignId: string): Promise<boolean> {
-  return await withTransaction(async (client) => {
+  const created = await withTransaction(async (client) => {
     const campRes = await client.query<{ is_active: boolean; campaign_type: 'manual' | 'perpetual' }>(
       `SELECT is_active, campaign_type FROM campaigns WHERE id = $1 FOR UPDATE`,
       [campaignId]
@@ -390,6 +390,7 @@ export async function toggleCampaignStatus(campaignId: string): Promise<boolean>
       return false;
     }
   });
+  return created;
 }
 
 export async function retryFailedCampaignJobs(campaignId: string): Promise<void> {
@@ -847,14 +848,14 @@ export async function createPerpetualCampaign(params: {
 
   const slug = generateSecureSlug(16);
 
-  return await withTransaction(async (client) => {
+  const created = await withTransaction(async (client) => {
     // Insert Campaign
     const campRes = await client.query<{ id: string }>(
       `INSERT INTO campaigns (
          slug, campaign_type, direction, post_active_lifetime_hours, is_active, safety_allowed,
          initial_size, replenishment_threshold, replenishment_size, display_name, model_key
        ) VALUES (
-         $1, 'perpetual', $2, $3, false, true, 30, 5, 10, $4, $5
+         $1, 'perpetual', $2, $3, true, true, 30, 5, 10, $4, $5
        ) RETURNING id`,
       [slug, params.direction || null, params.postActiveLifetimeHours, displayName, model.key]
     );
@@ -871,6 +872,8 @@ export async function createPerpetualCampaign(params: {
 
     return { id: campaignId, slug };
   });
+  import('./perpetual-monitor').then(({ processPerpetualCampaigns }) => processPerpetualCampaigns()).catch(() => undefined);
+  return created;
 }
 
 export async function generateCampaignPreview(campaignId: string) {

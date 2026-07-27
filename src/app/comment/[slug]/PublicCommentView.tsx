@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import type { ReactNode } from 'react';
 
 interface Props {
   slug: string;
@@ -146,54 +147,55 @@ export default function PublicCommentView({ slug }: Props) {
     }
   }
 
+  const shell = (content: ReactNode) => <div className="public-container"><div className="public-banner">Promocionate con nuestra APP, mas info aqui.</div>{content}</div>;
+
   if (loading) {
     return (
-      <div className="public-container">
+      shell(<>
         <div className="public-card">
           <div className="skeleton-line" style={{ width: '60%' }} />
           <div className="skeleton-line" style={{ width: '80%' }} />
           <div className="skeleton-line" style={{ width: '70%' }} />
           <div className="skeleton-line" style={{ height: '80px', marginTop: '20px' }} />
         </div>
-      </div>
+      </>)
     );
   }
 
   if (status === 'expired') {
     return (
-      <div className="public-container">
+      shell(<>
         <div className="public-card">
           <div className="status-message">Link expired</div>
         </div>
-      </div>
+      </>)
     );
   }
 
   if (status === 'unavailable') {
     return (
-      <div className="public-container">
+      shell(<>
         <div className="public-card">
           <div className="status-message">This link is currently unavailable. Please try again later.</div>
         </div>
-      </div>
+      </>)
     );
   }
 
-  if (status === 'generating') return <div className="public-container"><div className="public-card"><div className="status-message"><span className="spinner" />{waitLong ? 'This should only take a moment.' : 'Wait please...'}</div></div></div>;
+  if (status === 'generating') return shell(<div className="public-card"><div className="status-message"><span className="spinner" />{waitLong ? 'This should only take a moment.' : 'Wait please...'}</div></div>);
 
   if (status === 'error' || !comment) {
     return (
-      <div className="public-container">
+      shell(<>
         <div className="public-card">
           <div className="status-message">Please try again</div>
         </div>
-      </div>
+      </>)
     );
   }
 
   return (
-    <div className="public-container">
-      <div className="public-banner">Promocionate con nuestra APP, mas info aqui.</div>
+    shell(<>
       <div className="public-card">
         {/* Instructions in English */}
         <ol className="instructions-list">
@@ -231,6 +233,6 @@ export default function PublicCommentView({ slug }: Props) {
           </button>
         </div>
       </div>
-    </div>
+    </>)
   );
 }
