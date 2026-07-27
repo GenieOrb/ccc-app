@@ -58,6 +58,10 @@ interface CampaignPreview {
   provider: string;
   api_model: string;
   comments: string[] | string;
+  input_tokens: number | null;
+  cached_input_tokens: number | null;
+  output_tokens: number | null;
+  estimated_cost: string | number | null;
   error_message: string | null;
   created_at: string;
 }
@@ -73,12 +77,14 @@ function CampaignCardItem({
 }: {
   c: CampaignSummary;
   fetchCampaigns: () => Promise<void>;
-  handleToggleStatus: (id: string) => Promise<void>;
+  handleToggleStatus: (id: string) => Promise<boolean>;
   handleRetryGeneration: (id: string) => Promise<void>;
   handleCopyUrl: (url: string, id: string) => void;
   copiedId: string | null;
   models: Array<{key:string;displayName:string;configured:boolean;enabled:boolean}>;
 }) {
+  const [expanded, setExpanded] = useState(false);
+  const [togglingStatus, setTogglingStatus] = useState(false);
   const [showComments, setShowComments] = useState(false);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
@@ -112,8 +118,8 @@ function CampaignCardItem({
   }, [c.id]);
 
   useEffect(() => {
-    void loadPreviews();
-  }, [loadPreviews]);
+    if (expanded) void loadPreviews();
+  }, [expanded, loadPreviews]);
 
   const handleGeneratePreview = async () => {
     setGeneratingPreview(true);
@@ -128,6 +134,16 @@ function CampaignCardItem({
       await loadPreviews();
     } finally {
       setGeneratingPreview(false);
+    }
+  };
+
+  const handleStatusToggle = async () => {
+    if (togglingStatus) return;
+    setTogglingStatus(true);
+    try {
+      await handleToggleStatus(c.id);
+    } finally {
+      setTogglingStatus(false);
     }
   };
 
@@ -279,19 +295,28 @@ function CampaignCardItem({
             {c.campaignType === 'manual' ? 'Manual' : 'Perpetua'}
           </span>
         </div>
-        <span
-          className={`status-badge ${
-            c.isActive ? 'status-active' : 'status-inactive'
-          }`}
-        >
-          {c.isActive ? 'Activa' : 'Desactivada'}
-        </span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span className={`status-badge ${c.isActive ? 'status-active' : 'status-inactive'}`}>
+            {c.isActive ? 'Activa' : 'Desactivada'}
+          </span>
+          <button
+            type="button"
+            className="campaign-expand-button"
+            aria-label={`${expanded ? 'Contraer' : 'Expandir'} campaña ${c.displayName || c.internalId}`}
+            aria-expanded={expanded}
+            aria-controls={`campaign-details-${c.id}`}
+            onClick={() => setExpanded((value) => !value)}
+          >
+            <span aria-hidden="true">{expanded ? '⌃' : '⌄'}</span>
+          </button>
+        </div>
       </div>
 
       <div style={{ marginTop: '8px', display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'baseline' }}>
         <strong>{c.displayName || c.internalId}</strong>
         <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Modelo: {c.modelKey}</span>
       </div>
+      <div id={`campaign-details-${c.id}`} hidden={!expanded}>
       <form onSubmit={(e) => { e.preventDefault(); void saveSetting({ displayName: displayNameInput }); }} style={{ marginTop: '10px' }}>
         <label htmlFor={`campaign-name-${c.id}`} className="form-label">Nombre de campaÃ±a</label>
         <div style={{ display: 'flex', gap: '8px' }}>
@@ -480,10 +505,11 @@ function CampaignCardItem({
       <div style={{ display: 'flex', gap: '12px', alignItems: 'center', marginBottom: '16px' }}>
         <button
           type="button"
-          onClick={() => handleToggleStatus(c.id)}
+          onClick={() => void handleStatusToggle()}
           className={`btn-admin ${c.isActive ? 'btn-danger' : 'btn-success'}`}
+          disabled={togglingStatus}
         >
-          {c.isActive ? 'Desactivar' : 'Activar'}
+          {togglingStatus ? 'Guardando...' : c.isActive ? 'Desactivar' : 'Activar'}
         </button>
 
         {(c.failedJobsCount > 0 || c.hasUnresolvedFailedCycle) && (
@@ -532,6 +558,7 @@ function CampaignCardItem({
                     {' · '}Modelo: {preview.model_key} ({preview.api_model})
                     {' · '}Proveedor: {preview.provider}
                     {' · '}Post: {preview.campaign_post_id}
+                    {preview.estimated_cost !== null && <> {' · '}Coste: ${Number(preview.estimated_cost).toFixed(8)}</>}
                   </div>
                   {preview.error_message && <p role="alert" style={{ color: 'var(--peach-accent)', margin: '0 0 8px' }}>{preview.error_message}</p>}
                   <ol style={{ margin: 0, paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
@@ -590,6 +617,7 @@ function CampaignCardItem({
             )}
           </div>
         )}
+      </div>
       </div>
     </div>
   );
@@ -725,12 +753,19 @@ export default function AdminDashboardPage() {
 
       if (!res.ok) {
         setError(data.error || 'No se pudo cambiar el estado de la campaña.');
-        return;
+        return false;
       }
 
+      if (typeof data.isActive !== 'boolean') {
+        setError('El servidor devolvió un estado de campaña inválido.');
+        return false;
+      }
+      setCampaigns((current) => current.map((campaign) => campaign.id === campaignId ? { ...campaign, isActive: data.isActive } : campaign));
       await fetchCampaigns();
+      return true;
     } catch {
       setError('Error de red al actualizar estado.');
+      return false;
     }
   }
 

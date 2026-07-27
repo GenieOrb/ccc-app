@@ -9,6 +9,8 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:db": "node scripts/test-db.mjs",
     "db:setup": "node scripts/setup-db.mjs",
     "admin:hash-password": "node scripts/hash-admin-password.mjs"
   },
@@ -24,13 +26,20 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
     "@types/node": "^22.13.4",
+    "@types/pg": "^8.20.0",
     "@types/react": "^19.0.10",
     "@types/react-dom": "^19.0.4",
     "@types/ws": "^8.5.14",
+    "@vitejs/plugin-react": "^6.0.4",
     "eslint": "^9.20.1",
     "eslint-config-next": "^15.1.7",
-    "typescript": "^5.7.3"
+    "jsdom": "^30.0.0",
+    "pg": "^8.22.0",
+    "typescript": "^5.7.3",
+    "vitest": "^4.1.10"
   },
   "overrides": {
     "postcss": "^8.5.22",

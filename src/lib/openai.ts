@@ -1,8 +1,10 @@
 import 'server-only';
+import { randomUUID } from 'node:crypto';
 import OpenAI from 'openai';
 import { z } from 'zod';
 import { zodTextFormat } from 'openai/helpers/zod';
 import { getConfig } from './config';
+import { queryDb } from './db';
 import { SlotPlan, ALLOWED_EMOJIS } from './planner';
 
 const cachedClients = new Map<string, OpenAI>();
@@ -32,6 +34,7 @@ export const SafetyPreflightSchema = z.object({
 });
 
 export type SafetyPreflightResult = z.infer<typeof SafetyPreflightSchema>;
+export interface PreflightLedgerAttribution { campaignId?: string; campaignPostId?: string; campaignAccountId?: string; }
 
 function locallySanitizeCampaignSafety(postsText: string[], direction?: string): SafetyPreflightResult {
   // Used only when the independent OpenAI reviewer is unavailable. Input is
@@ -46,11 +49,21 @@ function locallySanitizeCampaignSafety(postsText: string[], direction?: string):
 
 export async function checkCampaignSafety(
   postsText: string[],
-  direction?: string
+  direction?: string,
+  attribution?: PreflightLedgerAttribution,
 ): Promise<SafetyPreflightResult> {
   if (!getConfig().openaiApiKey) return locallySanitizeCampaignSafety(postsText, direction);
   const openai = getOpenAIClient();
   const config = getConfig();
+  // Preflight can run before a campaign exists, therefore campaign_id is
+  // intentionally nullable in the ledger.  Only provider-reported usage is
+  // stored; no price or cost is inferred for OPENAI_MODEL here.
+  const callKey = `preflight:${randomUUID()}`;
+  await queryDb(
+    `INSERT INTO generation_api_calls (call_key,campaign_id,campaign_post_id,campaign_account_id,purpose,provider,model_key,api_model,status)
+     VALUES ($1,$2,$3,$4,'preflight','openai','openai-preflight',$5,'started')`,
+    [callKey, attribution?.campaignId ?? null, attribution?.campaignPostId ?? null, attribution?.campaignAccountId ?? null, config.openaiModel],
+  );
 
   const combinedPosts = postsText
     .map((txt, i) => `--- TARGET POST ${i + 1} ---\n${txt}`)
@@ -97,8 +110,15 @@ Output JSON matching the schema: allowed (boolean), category (short string), rea
     });
 
     if (response.output_parsed) {
+      const usage = response.usage;
+      await queryDb(
+        `UPDATE generation_api_calls SET status=$2,input_tokens=$3,cached_input_tokens=$4,output_tokens=$5,finished_at=NOW() WHERE call_key=$1`,
+        [callKey, usage ? 'succeeded' : 'usage_unknown', usage?.input_tokens ?? null, usage?.input_tokens_details?.cached_tokens ?? null, usage?.output_tokens ?? null],
+      );
       return response.output_parsed;
     }
+
+    await queryDb(`UPDATE generation_api_calls SET status='failed',failure_kind='invalid_response',finished_at=NOW() WHERE call_key=$1`, [callKey]);
 
     return {
       allowed: false,
@@ -106,6 +126,7 @@ Output JSON matching the schema: allowed (boolean), category (short string), rea
       reason: 'Failed to parse safety check response from OpenAI.',
     };
   } catch (error: unknown) {
+    await queryDb(`UPDATE generation_api_calls SET status='failed',failure_kind='provider_error',finished_at=NOW() WHERE call_key=$1`, [callKey]);
     throw new Error(`OpenAI Safety Preflight error: ${error instanceof Error ? error.message : 'Unknown API error'}`);
   }
 }

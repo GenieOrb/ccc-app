@@ -9,7 +9,20 @@ neonConfig.webSocketConstructor = ws;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+function loadLocalDatabaseUrl() {
+  if (process.env.DATABASE_URL) return;
+  const envPath = path.join(__dirname, '..', '.env.local');
+  if (!fs.existsSync(envPath)) return;
+  const match = fs.readFileSync(envPath, 'utf8').match(/^\s*DATABASE_URL\s*=\s*(.+?)\s*$/m);
+  if (!match) return;
+  const raw = match[1].trim();
+  process.env.DATABASE_URL = (raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))
+    ? raw.slice(1, -1)
+    : raw;
+}
+
 async function setupDatabase() {
+  loadLocalDatabaseUrl();
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
     console.error('ERROR: DATABASE_URL environment variable is missing.');

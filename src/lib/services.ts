@@ -1,11 +1,11 @@
 import 'server-only';
+import { randomUUID } from 'node:crypto';
 import { queryDb, withTransaction } from './db';
 import { parseMultipleXUrls, fetchXPosts } from './x-api';
 import { normalizeXAccounts } from './x-accounts';
 import { checkCampaignSafety } from './openai';
 import { generateSecureSlug } from './crypto';
 import { generateDeterministicSlotPlans } from './planner';
-import { processBackgroundQueue } from './worker';
 import { DEFAULT_MODEL_KEY, getAiModel, isProviderConfigured } from './ai/models';
 import { generateSingleComment } from './openai';
 
@@ -84,9 +84,10 @@ export async function getCampaignsPage(
     safety_allowed: boolean;
     safety_category: string | null;
     safety_reason: string | null;
+    initial_size: number;
     created_at: Date;
   }>(
-    `SELECT id, internal_number, slug, campaign_type, post_active_lifetime_hours, direction, display_name, model_key, is_active, safety_allowed, safety_category, safety_reason, created_at
+    `SELECT id, internal_number, slug, campaign_type, post_active_lifetime_hours, direction, display_name, model_key, is_active, safety_allowed, safety_category, safety_reason, initial_size, created_at
      FROM campaigns
      ORDER BY internal_number DESC
      LIMIT $1 OFFSET $2`,
@@ -141,8 +142,7 @@ export async function getCampaignsPage(
     const internalId = `Campaña ${String(c.internal_number).padStart(3, '0')}`;
     const publicUrl = `${appBaseUrl.replace(/\/+$/, '')}/comment/${c.slug}`;
 
-    // Progress percentage based on 50 initial target
-    const progress = Math.min(100, Math.round((validGen / 50) * 100));
+    const progress = Math.min(100, Math.round((validGen / Math.max(1, c.initial_size)) * 100));
 
     const accounts = await queryDb<{
       id: string;
@@ -315,11 +315,6 @@ export async function createCampaign(params: {
     return { id: campaignId, slug };
   });
 
-  // Background trigger worker execution
-  processBackgroundQueue().catch((err) => {
-    console.error('Background worker trigger error after campaign creation:', err);
-  });
-
   return created;
 }
 
@@ -377,6 +372,17 @@ export async function toggleCampaignStatus(campaignId: string): Promise<boolean>
         if (activeAccountsCount < 1) {
           throw new Error('No se puede activar: debe tener al menos una cuenta de X activa.');
         }
+        await client.query(
+          `UPDATE campaign_accounts ca
+           SET last_seen_post_id = NULL, initial_sync_pending = true, last_polled_at = NULL
+           WHERE ca.campaign_id = $1 AND ca.removed_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM campaign_posts p
+               WHERE p.campaign_account_id = ca.id AND p.retired_at IS NULL
+                 AND (p.expires_at IS NULL OR p.expires_at > NOW())
+             )`,
+          [campaignId]
+        );
       }
 
       await client.query(`UPDATE campaigns SET is_active = true, updated_at = NOW() WHERE id = $1`, [
@@ -440,16 +446,12 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
     );
   });
 
-  // Trigger worker
-  processBackgroundQueue().catch((err) => {
-    console.error('Background worker error after retrying jobs:', err);
-  });
 }
 
 export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<void> {
   // Determine campaign type first outside transaction for fast paths
   const campTypeRes = await queryDb<{ campaign_type: string, replenishment_threshold: number, replenishment_size: number, model_key: string }>(
-    `SELECT campaign_type, replenishment_threshold, replenishment_size, model_key FROM campaigns WHERE id = $1`,
+    `SELECT campaign_type, replenishment_threshold, replenishment_size, model_key FROM campaigns WHERE id = $1 AND is_active = true`,
     [campaignId]
   );
   if (campTypeRes.length === 0) return;
@@ -478,7 +480,8 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
 
     try {
       await withTransaction(async (client) => {
-        await client.query(`SELECT 1 FROM campaigns WHERE id = $1 FOR UPDATE`, [campaignId]);
+        const campaignLock = await client.query(`SELECT 1 FROM campaigns WHERE id = $1 AND is_active = true FOR UPDATE`, [campaignId]);
+        if (campaignLock.rows.length === 0) return;
 
         const availRowsLock = await client.query<{ count: string }>(
           `SELECT COUNT(*) as count FROM suggestions WHERE campaign_id = $1 AND status = 'available'`,
@@ -493,7 +496,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
         if (checkRes.rows.length > 0) return;
 
         const postRows = await client.query<{ id: string }>(
-          `SELECT id FROM campaign_posts WHERE campaign_id = $1 AND retired_at IS NULL ORDER BY created_at ASC`,
+          `SELECT id FROM campaign_posts WHERE campaign_id = $1 AND retired_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at ASC`,
           [campaignId]
         );
         const campaignPostIds = postRows.rows.map((p) => p.id);
@@ -536,9 +539,6 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
       }
     });
 
-    processBackgroundQueue().catch((err) => {
-      console.error('Background worker error after triggering replenishment:', err);
-    });
   } catch {
     // Ignore duplicate cycle creation conflicts gracefully
   }
@@ -546,9 +546,11 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
   // Perpetual campaigns replenishment logic (per-post)
   try {
     await withTransaction(async (client) => {
-      // Get all non-retired posts for this campaign
+      const campaignLock = await client.query(`SELECT 1 FROM campaigns WHERE id = $1 AND is_active = true FOR UPDATE`, [campaignId]);
+      if (campaignLock.rows.length === 0) return;
+      // Get all current non-retired posts for this campaign
       const postRows = await client.query<{ id: string }>(
-        `SELECT id FROM campaign_posts WHERE campaign_id = $1 AND retired_at IS NULL`,
+        `SELECT id FROM campaign_posts WHERE campaign_id = $1 AND retired_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())`,
         [campaignId]
       );
       if (postRows.rows.length === 0) return;
@@ -610,9 +612,6 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
       }
     });
 
-    processBackgroundQueue().catch((err) => {
-      console.error('Background worker error after triggering replenishment:', err);
-    });
   } catch {
     // Ignore concurrency conflicts
   }
@@ -872,8 +871,25 @@ export async function createPerpetualCampaign(params: {
 
     return { id: campaignId, slug };
   });
-  import('./perpetual-monitor').then(({ processPerpetualCampaigns }) => processPerpetualCampaigns()).catch(() => undefined);
   return created;
+}
+
+/** Durable cron-side reconciler. Request paths may nudge replenishment, but
+ * this scan guarantees it does not depend on serverless background work. */
+export async function reconcileCampaignReplenishment(limit = 50): Promise<{ checked: number; errors: string[] }> {
+  const campaigns = await queryDb<{ id: string }>(
+    `SELECT id FROM campaigns WHERE is_active = true ORDER BY updated_at ASC LIMIT $1`,
+    [Math.max(1, Math.min(limit, 200))],
+  );
+  const errors: string[] = [];
+  for (const campaign of campaigns) {
+    try {
+      await triggerReplenishmentIfNeeded(campaign.id);
+    } catch {
+      errors.push(campaign.id);
+    }
+  }
+  return { checked: campaigns.length, errors };
 }
 
 export async function generateCampaignPreview(campaignId: string) {
@@ -886,21 +902,63 @@ export async function generateCampaignPreview(campaignId: string) {
   const row = rows[0]; const model = resolveCampaignModel(row.model_key);
   const plans = generateDeterministicSlotPlans([row.post_id], 7);
   const comments: string[] = []; let errorMessage: string | null = null;
+  let inputTokens: number | null = 0;
+  let cachedInputTokens: number | null = 0;
+  let outputTokens: number | null = 0;
+  const previewExecutionId = randomUUID();
   try {
     // Preview follows the same 5+2 batch boundary as production while never
     // falling back to a different model.
     for (const batch of [plans.slice(0, 5), plans.slice(5)]) {
-      const generated = await Promise.all(batch.map((plan) => generateSingleComment({ apiModel: model.apiModel, provider: model.provider, postText: row.text_content, authorName: row.author_name || '', authorUsername: row.author_username || '', accessibleContext: (row.accessible_context as Record<string, unknown>) || {}, direction: row.direction || undefined, plan, recentComments: comments })));
+      const generated = await Promise.all(batch.map(async (plan) => {
+        const callKey = `preview:${previewExecutionId}:${plan.slotIndex}`;
+        const acquired = await queryDb<{ call_key: string }>(
+          `INSERT INTO generation_api_calls (call_key,campaign_id,campaign_post_id,purpose,provider,model_key,api_model,status,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency)
+           VALUES ($1,$2,$3,'preview',$4,$5,$6,'started',$7,$8,$9,$10)
+           ON CONFLICT (call_key) DO NOTHING
+           RETURNING call_key`,
+          [callKey, campaignId, row.post_id, model.provider, model.key, model.apiModel, model.inputPricePerMillion, model.cachedInputPricePerMillion ?? null, model.outputPricePerMillion, model.currency],
+        );
+        if (Array.isArray(acquired) && acquired.length === 0) {
+          throw new Error('AI preview call acquisition conflict; no durable result is available.');
+        }
+        try {
+          const generatedComment = await generateSingleComment({ apiModel: model.apiModel, provider: model.provider, postText: row.text_content, authorName: row.author_name || '', authorUsername: row.author_username || '', accessibleContext: (row.accessible_context as Record<string, unknown>) || {}, direction: row.direction || undefined, plan, recentComments: [...comments] });
+          const callUsage = generatedComment.usage;
+          const callCost = callUsage
+            ? ((callUsage.inputTokens ?? 0) - (callUsage.cachedInputTokens ?? 0)) * model.inputPricePerMillion / 1_000_000 + (callUsage.cachedInputTokens ?? 0) * (model.cachedInputPricePerMillion ?? model.inputPricePerMillion) / 1_000_000 + (callUsage.outputTokens ?? 0) * model.outputPricePerMillion / 1_000_000
+            : null;
+          await queryDb(`UPDATE generation_api_calls SET status = $2,input_tokens = $3,cached_input_tokens = $4,output_tokens = $5,estimated_cost = $6,finished_at = NOW() WHERE call_key = $1`, [callKey, callUsage ? 'succeeded' : 'usage_unknown', callUsage?.inputTokens ?? null, callUsage?.cachedInputTokens ?? null, callUsage?.outputTokens ?? null, callCost]);
+          return generatedComment;
+        } catch (error) {
+          await queryDb(`UPDATE generation_api_calls SET status = 'failed',failure_kind = 'provider_error',finished_at = NOW() WHERE call_key = $1`, [callKey]);
+          throw error;
+        }
+      }));
       comments.push(...generated.map((item) => item.comment));
+      for (const item of generated) {
+        if (!item.usage) {
+          inputTokens = null;
+          cachedInputTokens = null;
+          outputTokens = null;
+          continue;
+        }
+        if (inputTokens !== null) inputTokens += item.usage.inputTokens ?? 0;
+        if (cachedInputTokens !== null) cachedInputTokens += item.usage.cachedInputTokens ?? 0;
+        if (outputTokens !== null) outputTokens += item.usage.outputTokens ?? 0;
+      }
     }
   } catch { errorMessage = `La preview con ${model.displayName} no pudo generarse.`; }
-  await queryDb(`INSERT INTO campaign_previews (campaign_id,campaign_post_id,model_key,provider,api_model,comments,error_message,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency,pricing_effective_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, [campaignId,row.post_id,model.key,model.provider,model.apiModel,JSON.stringify(comments),errorMessage,model.inputPricePerMillion,model.cachedInputPricePerMillion ?? null,model.outputPricePerMillion,model.currency,model.pricingEffectiveAt]);
+  const estimatedCost = inputTokens === null || cachedInputTokens === null || outputTokens === null
+    ? null
+    : ((inputTokens - cachedInputTokens) * model.inputPricePerMillion + cachedInputTokens * (model.cachedInputPricePerMillion ?? model.inputPricePerMillion) + outputTokens * model.outputPricePerMillion) / 1_000_000;
+  await queryDb(`INSERT INTO campaign_previews (campaign_id,campaign_post_id,model_key,provider,api_model,comments,input_tokens,cached_input_tokens,output_tokens,estimated_cost,error_message,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency,pricing_effective_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, [campaignId,row.post_id,model.key,model.provider,model.apiModel,JSON.stringify(comments),inputTokens,cachedInputTokens,outputTokens,estimatedCost,errorMessage,model.inputPricePerMillion,model.cachedInputPricePerMillion ?? null,model.outputPricePerMillion,model.currency,model.pricingEffectiveAt]);
   if (errorMessage) throw new Error(errorMessage);
   return { postId: row.post_id, modelKey: model.key, provider: model.provider, comments };
 }
 
 export async function listCampaignPreviews(campaignId: string) {
-  return queryDb(`SELECT id,campaign_post_id,model_key,provider,api_model,comments,error_message,created_at FROM campaign_previews WHERE campaign_id=$1 ORDER BY created_at DESC LIMIT 30`, [campaignId]);
+  return queryDb(`SELECT id,campaign_post_id,model_key,provider,api_model,comments,input_tokens,cached_input_tokens,output_tokens,estimated_cost,error_message,created_at FROM campaign_previews WHERE campaign_id=$1 ORDER BY created_at DESC LIMIT 30`, [campaignId]);
 }
 
 export async function addAccountsToCampaign(campaignId: string, accountsInput: string) {

@@ -88,11 +88,15 @@ export async function POST(
         );
       }
 
-      const fetchedPosts = await fetchXPosts(newUrls);
+      const fetchedPosts = await fetchXPosts(newUrls, { campaignId: campaign.id });
 
       // Check safety
       const postsTexts = fetchedPosts.map((fp) => fp.textContent);
-      const safetyResult = await checkCampaignSafety(postsTexts, campaign.direction || undefined);
+      const safetyResult = await checkCampaignSafety(
+        postsTexts,
+        campaign.direction || undefined,
+        { campaignId: campaign.id },
+      );
 
       if (!safetyResult.allowed) {
         return NextResponse.json(

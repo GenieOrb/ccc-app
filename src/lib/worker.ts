@@ -68,9 +68,12 @@ export async function processBackgroundQueue(
     }
 
     // 2. Process claimed jobs in parallel
-    const results = await Promise.all(
-      claimedJobs.map((job) => executeJobTask(job))
+    const settled = await Promise.allSettled(
+      claimedJobs.map((job) => executeJobTask(job, workerId))
     );
+    const results = settled.map((result) => result.status === 'fulfilled'
+      ? result.value
+      : ({ success: false, error: 'Unhandled worker task failure' }));
 
     for (const res of results) {
       totalProcessed++;
@@ -137,6 +140,8 @@ async function claimNextJob(workerId: string): Promise<ClaimedJob | null> {
          (j.status = 'pending' AND j.next_attempt_at <= NOW())
          OR (j.status = 'processing' AND j.lease_expires_at < NOW())
        )
+       AND c.is_active = true
+       AND p.retired_at IS NULL
        AND cy.status IN ('pending', 'processing')
        ORDER BY
          (NOT EXISTS (SELECT 1 FROM suggestions s WHERE s.campaign_post_id = p.id AND s.status = 'available')) DESC,
@@ -193,18 +198,10 @@ async function claimNextJob(workerId: string): Promise<ClaimedJob | null> {
 }
 
 async function executeJobTask(
-  job: ClaimedJob
+  job: ClaimedJob,
+  workerId: string,
 ): Promise<{ success: boolean; error?: string }> {
-  // 1. Load up to 20 recent comments for diversity context (same post first, then same campaign)
-  const recentRows = await queryDb<{ comment_text: string }>(
-    `SELECT comment_text FROM suggestions 
-     WHERE campaign_id = $1 
-     ORDER BY (campaign_post_id = $2) DESC, created_at DESC 
-     LIMIT 20`,
-    [job.campaignId, job.campaignPostId]
-  );
-  const recentComments = recentRows.map((r) => r.comment_text);
-
+  let recentComments: string[] = [];
   let rawComment = '';
   let validationReason = '';
   let finalProvider = job.provider;
@@ -215,32 +212,61 @@ async function executeJobTask(
   let finalOutputPrice = job.outputPricePerMillion;
   let usage: { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number } | undefined;
   let regenerations = 0;
-
-  // Check if post is retired or expired before calling OpenAI
-  const preCheckRows = await queryDb<{ id: string }>(
-    `SELECT id FROM campaign_posts WHERE id = $1 AND retired_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())`,
-    [job.campaignPostId]
-  );
-
-  if (preCheckRows.length === 0) {
-    await withTransaction(async (client) => {
-      await cancelJobAndCheckCycle(client, job.jobId, job.cycleId);
-    });
-    return { success: true };
-  }
+  let apiCallSequence = 0;
 
   try {
-    const generate = async (provider: 'openai' | 'deepseek' | 'qwen', apiModel: string, rewriteFeedback?: string) => generateSingleComment({
-      apiModel,
-      provider,
-      postText: job.postText,
-      authorName: job.authorName,
-      authorUsername: job.authorUsername,
-      accessibleContext: job.accessibleContext,
-      direction: job.campaignDirection,
-      plan: job.slotPlan,
-      recentComments, rewriteFeedback,
-    });
+    const recentRows = await queryDb<{ comment_text: string }>(
+      `SELECT comment_text FROM suggestions WHERE campaign_id = $1
+       ORDER BY (campaign_post_id = $2) DESC, created_at DESC LIMIT 20`,
+      [job.campaignId, job.campaignPostId],
+    );
+    recentComments = recentRows.map((row) => row.comment_text);
+    const preCheckRows = await queryDb<{ id: string }>(
+      `SELECT id FROM campaign_posts WHERE id = $1 AND retired_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())`,
+      [job.campaignPostId],
+    );
+    if (preCheckRows.length === 0) {
+      await withTransaction(async (client) => { await cancelJobAndCheckCycle(client, job.jobId, job.cycleId, workerId); });
+      return { success: true };
+    }
+    const generate = async (
+      provider: 'openai' | 'deepseek' | 'qwen',
+      apiModel: string,
+      rewriteFeedback?: string,
+      modelKey = job.modelKey,
+      prices = { input: job.inputPricePerMillion, cached: job.cachedInputPricePerMillion, output: job.outputPricePerMillion },
+    ) => {
+      const callKey = `${job.jobId}:${job.attemptsCount + 1}:${++apiCallSequence}`;
+      const purpose = rewriteFeedback ? 'rewrite' : provider === job.provider ? 'generation' : 'fallback';
+      const acquired = await queryDb<{ call_key: string }>(
+        `INSERT INTO generation_api_calls (call_key,campaign_id,campaign_post_id,cycle_id,job_id,purpose,provider,model_key,api_model,status,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'started',$10,$11,$12,$13)
+         ON CONFLICT (call_key) DO NOTHING
+         RETURNING call_key`,
+        [callKey, job.campaignId, job.campaignPostId, job.cycleId, job.jobId, purpose, provider, modelKey, apiModel, prices.input, prices.cached ?? null, prices.output, job.pricingCurrency],
+      );
+      // A conflicting key has no durable provider result.  Retrying the HTTP
+      // request here would create an unaccounted duplicate, so leave the job
+      // for its normal durable retry path instead.
+      if (Array.isArray(acquired) && acquired.length === 0) {
+        throw new Error('AI call acquisition conflict; no durable result is available.');
+      }
+      try {
+        const generated = await generateSingleComment({ apiModel, provider, postText: job.postText, authorName: job.authorName, authorUsername: job.authorUsername, accessibleContext: job.accessibleContext, direction: job.campaignDirection, plan: job.slotPlan, recentComments, rewriteFeedback });
+        const callUsage = generated.usage;
+        const estimatedCost = callUsage
+          ? ((callUsage.inputTokens ?? 0) - (callUsage.cachedInputTokens ?? 0)) * prices.input / 1_000_000 + (callUsage.cachedInputTokens ?? 0) * (prices.cached ?? prices.input) / 1_000_000 + (callUsage.outputTokens ?? 0) * prices.output / 1_000_000
+          : null;
+        await queryDb(
+          `UPDATE generation_api_calls SET status = $2, input_tokens = $3, cached_input_tokens = $4, output_tokens = $5, estimated_cost = $6, finished_at = NOW() WHERE call_key = $1`,
+          [callKey, callUsage ? 'succeeded' : 'usage_unknown', callUsage?.inputTokens ?? null, callUsage?.cachedInputTokens ?? null, callUsage?.outputTokens ?? null, estimatedCost],
+        );
+        return generated;
+      } catch (error) {
+        await queryDb(`UPDATE generation_api_calls SET status = 'failed', failure_kind = 'provider_error', finished_at = NOW() WHERE call_key = $1`, [callKey]);
+        throw error;
+      }
+    };
     try {
       const generated = await generate(job.provider as 'openai' | 'deepseek' | 'qwen', job.apiModel);
       rawComment = generated.comment;
@@ -250,7 +276,7 @@ async function executeJobTask(
       // generation calls generateSingleComment directly and has no fallback.
       const fallback = getConfiguredFallbackModel(job.modelKey);
       if (!fallback) throw primaryError;
-      const generated = await generate(fallback.provider, fallback.apiModel);
+      const generated = await generate(fallback.provider, fallback.apiModel, undefined, fallback.key, { input: fallback.inputPricePerMillion, cached: fallback.cachedInputPricePerMillion, output: fallback.outputPricePerMillion });
       rawComment = generated.comment;
       usage = generated.usage;
       finalProvider = fallback.provider;
@@ -268,7 +294,7 @@ async function executeJobTask(
       validationReason = valResult.reason || 'Failed local validation checks.';
       // Perform 1 corrective rewrite attempt within this execution
       regenerations += 1;
-      const rewritten = await generate(finalProvider as 'openai' | 'deepseek' | 'qwen', finalApiModel, validationReason);
+      const rewritten = await generate(finalProvider as 'openai' | 'deepseek' | 'qwen', finalApiModel, validationReason, finalModelKey, { input: finalInputPrice, cached: finalCachedInputPrice, output: finalOutputPrice });
       rawComment = rewritten.comment;
       usage = rewritten.usage;
 
@@ -283,14 +309,28 @@ async function executeJobTask(
     const normHash = computeNormalizedHash(normText);
 
     await withTransaction(async (client) => {
-      // Re-check post status under transaction
+      const leaseRes = await client.query<{ id: string }>(
+        `SELECT id FROM generation_jobs
+         WHERE id = $1 AND status = 'processing' AND lease_owner = $2 AND lease_expires_at > NOW()
+         FOR UPDATE`,
+        [job.jobId, workerId],
+      );
+      if (leaseRes.rows.length === 0) return;
+      // Re-check both publication and campaign status under transaction.  A
+      // job may have been leased just before an administrator deactivated its
+      // campaign, so it must never publish inventory after that transition.
       const postLockRes = await client.query(
-        `SELECT 1 FROM campaign_posts WHERE id = $1 AND retired_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()) FOR SHARE`,
+        `SELECT 1
+         FROM campaign_posts p
+         JOIN campaigns c ON c.id = p.campaign_id
+         WHERE p.id = $1 AND c.is_active = true AND p.retired_at IS NULL
+           AND (p.expires_at IS NULL OR p.expires_at > NOW())
+         FOR SHARE`,
         [job.campaignPostId]
       );
 
       if (postLockRes.rows.length === 0) {
-        await cancelJobAndCheckCycle(client, job.jobId, job.cycleId);
+        await cancelJobAndCheckCycle(client, job.jobId, job.cycleId, workerId);
         return; // Post was retired while OpenAI was working
       }
 
@@ -326,7 +366,7 @@ async function executeJobTask(
       const suggestionId = sugRes.rows[0].id;
 
       // Update job to completed
-      await client.query(
+      const completedRes = await client.query(
         `UPDATE generation_jobs
          SET status = 'completed',
              suggestion_id = $1,
@@ -334,9 +374,11 @@ async function executeJobTask(
              lease_expires_at = NULL,
              error_message = NULL,
              updated_at = NOW()
-         WHERE id = $2`,
-        [suggestionId, job.jobId]
+         WHERE id = $2 AND status = 'processing' AND lease_owner = $3 AND lease_expires_at > NOW()
+         RETURNING id`,
+        [suggestionId, job.jobId, workerId]
       );
+      if (completedRes.rows.length === 0) return;
 
       await client.query(
         `INSERT INTO generation_usage_metrics (campaign_id,campaign_post_id,cycle_id,job_id,requested_provider,requested_model_key,final_provider,final_model_key,input_tokens,cached_input_tokens,output_tokens,comments_requested,comments_received,comments_valid,comments_rejected,regenerations,attempts,fallback_used,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency,estimated_cost)
@@ -379,12 +421,16 @@ async function executeJobTask(
     return { success: true };
   } catch (error: unknown) {
     const errorMsg = (error instanceof Error ? error.message : 'Unknown generation error').slice(0, 300);
-    const newAttemptCount = job.attemptsCount + 1;
+    // A duplicate acquisition is ambiguous: another worker may already have
+    // sent the request.  Do not create a fresh call key on retry, because the
+    // first request has no durable result to safely recover from.
+    const acquisitionConflict = errorMsg.startsWith('AI call acquisition conflict');
+    const newAttemptCount = acquisitionConflict ? 3 : job.attemptsCount + 1;
 
     await withTransaction(async (client) => {
       if (newAttemptCount >= 3) {
         // Mark job permanently failed
-        await client.query(
+        const failedRes = await client.query<{ id: string }>(
           `UPDATE generation_jobs
            SET status = 'failed',
                attempts_count = $1,
@@ -392,9 +438,11 @@ async function executeJobTask(
                lease_owner = NULL,
                lease_expires_at = NULL,
                updated_at = NOW()
-           WHERE id = $3`,
-          [newAttemptCount, errorMsg, job.jobId]
+           WHERE id = $3 AND status = 'processing' AND lease_owner = $4 AND lease_expires_at > NOW()
+           RETURNING id`,
+          [newAttemptCount, errorMsg, job.jobId, workerId]
         );
+        if (failedRes.rows.length === 0) return;
 
         // Update cycle failed jobs count
         await client.query(
@@ -434,8 +482,9 @@ async function executeJobTask(
                lease_owner = NULL,
                lease_expires_at = NULL,
                updated_at = NOW()
-           WHERE id = $3`,
-          [newAttemptCount, errorMsg, job.jobId]
+           WHERE id = $3 AND status = 'processing' AND lease_owner = $4 AND lease_expires_at > NOW()
+           RETURNING id`,
+          [newAttemptCount, errorMsg, job.jobId, workerId]
         );
       }
     });
@@ -444,16 +493,18 @@ async function executeJobTask(
   }
 }
 
-async function cancelJobAndCheckCycle(client: PoolClient, jobId: string, cycleId: string) {
-  await client.query(
+async function cancelJobAndCheckCycle(client: PoolClient, jobId: string, cycleId: string, workerId: string) {
+  const cancelled = await client.query(
     `UPDATE generation_jobs
      SET status = 'cancelled',
          lease_owner = NULL,
          lease_expires_at = NULL,
          updated_at = NOW()
-     WHERE id = $1`,
-    [jobId]
+     WHERE id = $1 AND status = 'processing' AND lease_owner = $2 AND lease_expires_at > NOW()
+     RETURNING id`,
+    [jobId, workerId]
   );
+  if (cancelled.rows.length === 0) return;
 
   // Check if cycle should be cancelled (no active/pending jobs remaining)
   // We only count pending and processing. Completed or failed jobs mean the cycle is mixed.

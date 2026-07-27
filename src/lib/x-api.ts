@@ -1,5 +1,26 @@
 import 'server-only';
+import { randomUUID } from 'node:crypto';
 import { getConfig } from './config';
+import { queryDb } from './db';
+
+export interface XCallAttribution { campaignId?: string; campaignAccountId?: string; }
+
+async function recordXCall(operation: 'tweet_lookup' | 'user_lookup' | 'timeline_lookup', attribution?: XCallAttribution) {
+  const callKey = `x:${operation}:${randomUUID()}`;
+  await queryDb(
+    `INSERT INTO x_api_calls (call_key,operation,campaign_id,campaign_account_id,status)
+     VALUES ($1,$2,$3,$4,'started')`,
+    [callKey, operation, attribution?.campaignId ?? null, attribution?.campaignAccountId ?? null],
+  );
+  return callKey;
+}
+
+async function finishXCall(callKey: string, status: 'succeeded' | 'failed', httpStatus?: number) {
+  await queryDb(
+    `UPDATE x_api_calls SET status=$2,http_status=$3,finished_at=NOW(),failure_kind=CASE WHEN $2='failed' THEN 'provider_error' ELSE NULL END WHERE call_key=$1`,
+    [callKey, status, httpStatus ?? null],
+  );
+}
 
 export interface ExtractedXUrl {
   inputUrl: string;
@@ -151,7 +172,7 @@ export function parseMultipleXUrls(input: string): ExtractedXUrl[] {
   return extractedList;
 }
 
-export async function fetchXPosts(extractedUrls: ExtractedXUrl[]): Promise<FetchedXPost[]> {
+export async function fetchXPosts(extractedUrls: ExtractedXUrl[], attribution?: XCallAttribution): Promise<FetchedXPost[]> {
   const config = getConfig();
   if (!config.xBearerToken) {
     throw new Error('X_BEARER_TOKEN no está configurado en el servidor.');
@@ -177,6 +198,7 @@ export async function fetchXPosts(extractedUrls: ExtractedXUrl[]): Promise<Fetch
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
 
+  const callKey = await recordXCall('tweet_lookup', attribution);
   let response: Response;
   try {
     response = await fetch(apiUrl, {
@@ -190,6 +212,7 @@ export async function fetchXPosts(extractedUrls: ExtractedXUrl[]): Promise<Fetch
     });
   } catch (err: unknown) {
     clearTimeout(timeoutId);
+    await finishXCall(callKey, 'failed');
     if (err instanceof Error && err.name === 'AbortError') {
       throw new Error('La llamada a la API de X superó el tiempo límite de 15 segundos.');
     }
@@ -199,11 +222,13 @@ export async function fetchXPosts(extractedUrls: ExtractedXUrl[]): Promise<Fetch
   }
 
   if (!response.ok) {
+    await finishXCall(callKey, 'failed', response.status);
     const errText = await response.text();
     throw new Error(`La API de X devolvió el estado HTTP ${response.status}: ${errText.slice(0, 200)}`);
   }
 
   const data = (await response.json()) as XApiResponse;
+  await finishXCall(callKey, 'succeeded', response.status);
 
   const rawTweets = data.data || [];
   const tweetsData: XTweet[] = [];
@@ -318,7 +343,7 @@ function transformXTweet(
   };
 }
 
-export async function resolveXUsername(username: string): Promise<string> {
+export async function resolveXUsername(username: string, attribution?: XCallAttribution): Promise<string> {
   const config = getConfig();
   if (!config.xBearerToken) {
     throw new Error('X_BEARER_TOKEN no está configurado en el servidor.');
@@ -330,6 +355,7 @@ export async function resolveXUsername(username: string): Promise<string> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
 
+  const callKey = await recordXCall('user_lookup', attribution);
   let response: Response;
   try {
     response = await fetch(apiUrl, {
@@ -343,16 +369,19 @@ export async function resolveXUsername(username: string): Promise<string> {
     });
   } catch {
     clearTimeout(timeoutId);
+    await finishXCall(callKey, 'failed');
     throw new Error('Error de conexión al resolver usuario en X.');
   } finally {
     clearTimeout(timeoutId);
   }
 
   if (!response.ok) {
+    await finishXCall(callKey, 'failed', response.status);
     throw new Error(`La API de X devolvió el estado HTTP ${response.status} al resolver el usuario.`);
   }
 
   const data = (await response.json()) as { data?: { id: string } };
+  await finishXCall(callKey, 'succeeded', response.status);
   if (!data.data || !data.data.id) {
     throw new Error(`El usuario ${username} no existe o está suspendido.`);
   }
@@ -362,7 +391,8 @@ export async function resolveXUsername(username: string): Promise<string> {
 
 export async function fetchNewXPostsForAccount(
   xUserId: string,
-  sincePostId: string | null
+  sincePostId: string | null,
+  attribution?: XCallAttribution,
 ): Promise<FetchedXPost[]> {
   const config = getConfig();
   if (!config.xBearerToken) {
@@ -390,6 +420,7 @@ export async function fetchNewXPostsForAccount(
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 15000);
 
+  const callKey = await recordXCall('timeline_lookup', attribution);
   let response: Response;
   try {
     response = await fetch(apiUrl, {
@@ -403,16 +434,19 @@ export async function fetchNewXPostsForAccount(
     });
   } catch {
     clearTimeout(timeoutId);
+    await finishXCall(callKey, 'failed');
     throw new Error('Error de red al consultar posts.');
   } finally {
     clearTimeout(timeoutId);
   }
 
   if (!response.ok) {
+    await finishXCall(callKey, 'failed', response.status);
     throw new Error(`La API de X devolvió HTTP ${response.status}`);
   }
 
   const data = (await response.json()) as XApiResponse;
+  await finishXCall(callKey, 'succeeded', response.status);
   if (!data.data || data.data.length === 0) {
     return [];
   }
@@ -456,10 +490,11 @@ export async function fetchNewXPostsForAccount(
   for (const tweet of tweetsData) {
     // Filtrar retweets (referenced_tweets con type="retweeted")
     const isRetweet = tweet.referenced_tweets?.some((rt) => rt.type === 'retweeted');
-    // Filtrar respuestas a otros (in_reply_to_user_id distinto de sí mismo)
-    const isReplyToOther = tweet.in_reply_to_user_id && tweet.in_reply_to_user_id !== xUserId;
+    // The API exclusion is only an optimisation.  Any reply received from an
+    // unexpected/mocked response must still be excluded locally.
+    const isReply = Boolean(tweet.in_reply_to_user_id);
 
-    if (isRetweet || isReplyToOther) {
+    if (isRetweet || isReply) {
       continue;
     }
 

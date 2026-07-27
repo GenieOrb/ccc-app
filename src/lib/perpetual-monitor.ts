@@ -22,6 +22,7 @@ interface AccountRow {
   username: string;
   x_user_id: string | null;
   monitoring_started_at: Date;
+  initial_sync_pending: boolean;
   last_seen_post_id: string | null;
   direction: string | null;
   post_active_lifetime_hours: number | null;
@@ -86,11 +87,11 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
 
   // 2. Seleccionar cuentas activas para hacer polling.
   const accountsRows = await queryDb<AccountRow>(`
-    SELECT ca.id, ca.campaign_id, ca.username, ca.x_user_id, ca.monitoring_started_at, ca.last_seen_post_id, c.direction, c.post_active_lifetime_hours, c.model_key
+    SELECT ca.id, ca.campaign_id, ca.username, ca.x_user_id, ca.monitoring_started_at, ca.initial_sync_pending, ca.last_seen_post_id, c.direction, c.post_active_lifetime_hours, c.model_key
     FROM campaign_accounts ca
     JOIN campaigns c ON ca.campaign_id = c.id
     WHERE ca.removed_at IS NULL AND c.is_active = true AND c.campaign_type = 'perpetual'
-    ORDER BY ca.last_polled_at ASC NULLS FIRST
+    ORDER BY ca.initial_sync_pending DESC, ca.last_polled_at ASC NULLS FIRST
     LIMIT 10
   `);
 
@@ -104,30 +105,83 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
 
       let xUserId = account.x_user_id;
       if (!xUserId) {
-        xUserId = await resolveXUsername(account.username);
+        xUserId = await resolveXUsername(account.username, { campaignId: account.campaign_id, campaignAccountId: account.id });
         await queryDb('UPDATE campaign_accounts SET x_user_id = $1 WHERE id = $2', [xUserId, account.id]);
       }
 
-      const fetchedPosts = await fetchNewXPostsForAccount(xUserId, account.last_seen_post_id);
-      // Initial recovery deliberately imports only the most recent eligible post.
-      const newPosts = !account.last_seen_post_id && fetchedPosts.length > 1 ? [fetchedPosts.reduce((latest, post) => BigInt(post.postId) > BigInt(latest.postId) ? post : latest)] : fetchedPosts;
+      // The durable flag, not the incidental cursor value, defines whether this
+      // account is still performing its one-post initial recovery.  A cursor can
+      // have been advanced by a partial prior attempt, while the flag remains
+      // pending until a whole polling pass succeeds.
+      const isInitialRecovery = account.initial_sync_pending;
+      const fetchedPosts = await fetchNewXPostsForAccount(
+        xUserId,
+        isInitialRecovery ? null : account.last_seen_post_id,
+        { campaignId: account.campaign_id, campaignAccountId: account.id },
+      );
+      // Initial recovery imports at most one post, but eligibility must be
+      // decided before choosing the newest Snowflake: a newer expired post
+      // must not hide an older post that is still within its lifetime.
+      const initialEligiblePosts = isInitialRecovery
+        ? fetchedPosts.filter((post) => {
+            if (!account.post_active_lifetime_hours || !post.postedAt) return true;
+            const postedAt = new Date(post.postedAt);
+            return !Number.isNaN(postedAt.getTime()) && postedAt.getTime() + account.post_active_lifetime_hours * 3600 * 1000 > Date.now();
+          })
+        : fetchedPosts;
+      const newPosts = isInitialRecovery && initialEligiblePosts.length > 1
+        ? [initialEligiblePosts.reduce((latest, post) => BigInt(post.postId) > BigInt(latest.postId) ? post : latest)]
+        : initialEligiblePosts;
+
+      if (isInitialRecovery && newPosts.length === 0) {
+        const highestExpiredPostId = fetchedPosts.length > 0
+          ? fetchedPosts.reduce((latest, post) => BigInt(post.postId) > BigInt(latest.postId) ? post : latest).postId
+          : null;
+        await queryDb(
+          `UPDATE campaign_accounts
+           SET last_seen_post_id = CASE
+                 WHEN $1::TEXT IS NOT NULL
+                  AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+                 THEN $1
+                 ELSE last_seen_post_id
+               END,
+               initial_sync_pending = false
+           WHERE id = $2 AND initial_sync_pending = true`,
+          [highestExpiredPostId, account.id],
+        );
+      }
 
       if (newPosts.length > 0) {
         summary.postsDetected += newPosts.length;
         let highestPostId = account.last_seen_post_id;
 
         for (const post of newPosts) {
-          const safetyResult = await checkCampaignSafety([post.textContent], account.direction || undefined);
+          const safetyResult = await checkCampaignSafety(
+            [post.textContent],
+            account.direction || undefined,
+            { campaignId: account.campaign_id, campaignAccountId: account.id },
+          );
           if (!safetyResult.allowed) {
             summary.postsRejected++;
             highestPostId = post.postId;
-            await queryDb('UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))', [highestPostId, account.id]);
+            await queryDb(
+              isInitialRecovery
+                ? `UPDATE campaign_accounts
+                   SET last_seen_post_id = CASE
+                         WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
+                         ELSE last_seen_post_id
+                       END,
+                       initial_sync_pending = false
+                   WHERE id = $2 AND initial_sync_pending = true`
+                : 'UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))',
+              [highestPostId, account.id],
+            );
             continue;
           }
 
           await withTransaction(async (client) => {
-            const lockRes = await client.query<{ last_seen_post_id: string | null; removed_at: Date | null; is_active: boolean }>(
-              `SELECT ca.last_seen_post_id, ca.removed_at, c.is_active
+            const lockRes = await client.query<{ initial_sync_pending: boolean; last_seen_post_id: string | null; removed_at: Date | null; is_active: boolean }>(
+              `SELECT ca.initial_sync_pending, ca.last_seen_post_id, ca.removed_at, c.is_active
                FROM campaign_accounts ca
                JOIN campaigns c ON ca.campaign_id = c.id
                WHERE ca.id = $1 FOR UPDATE`,
@@ -138,7 +192,11 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
             if (!currentData || currentData.removed_at !== null || !currentData.is_active) {
               return; // Account removed or campaign inactive, skip
             }
-            if (currentData.last_seen_post_id && BigInt(post.postId) <= BigInt(currentData.last_seen_post_id)) {
+            if (isInitialRecovery && !currentData.initial_sync_pending) {
+              return; // Another monitor completed recovery while X was being queried.
+            }
+            const recoveringUnderLock = isInitialRecovery && currentData.initial_sync_pending;
+            if (!recoveringUnderLock && currentData.last_seen_post_id && BigInt(post.postId) <= BigInt(currentData.last_seen_post_id)) {
               return; // Post ya fue procesado o el cursor está por delante
             }
             // lockRes is intentionally used for concurrency control (locking)
@@ -156,7 +214,15 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
               if (expiresAt && expiresAt <= new Date()) {
                 highestPostId = post.postId;
                 await client.query(
-                  'UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))',
+                  recoveringUnderLock
+                    ? `UPDATE campaign_accounts
+                       SET last_seen_post_id = CASE
+                             WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
+                             ELSE last_seen_post_id
+                           END,
+                           initial_sync_pending = false
+                       WHERE id = $2`
+                    : 'UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))',
                   [highestPostId, account.id]
                 );
                 return;
@@ -195,7 +261,18 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
             }
 
             highestPostId = post.postId;
-            await client.query('UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))', [highestPostId, account.id]);
+            await client.query(
+              recoveringUnderLock
+                ? `UPDATE campaign_accounts
+                   SET last_seen_post_id = CASE
+                         WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
+                         ELSE last_seen_post_id
+                       END,
+                       initial_sync_pending = false
+                   WHERE id = $2`
+                : 'UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))',
+              [highestPostId, account.id],
+            );
           });
         }
       }

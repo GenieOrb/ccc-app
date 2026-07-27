@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS campaign_accounts (
     username_normalized TEXT NOT NULL,
     x_user_id TEXT,
     monitoring_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    initial_sync_pending BOOLEAN NOT NULL DEFAULT true,
     last_seen_post_id TEXT,
     last_polled_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -472,8 +473,50 @@ CREATE TABLE IF NOT EXISTS generation_usage_metrics (
   reason TEXT, input_price_per_million NUMERIC(12,6), cached_input_price_per_million NUMERIC(12,6), output_price_per_million NUMERIC(12,6),
   currency TEXT, estimated_cost NUMERIC(16,8), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE campaign_accounts ADD COLUMN IF NOT EXISTS initial_sync_pending BOOLEAN NOT NULL DEFAULT true;
 CREATE INDEX IF NOT EXISTS generation_usage_metrics_model_idx ON generation_usage_metrics (requested_model_key, created_at DESC);
 CREATE INDEX IF NOT EXISTS generation_usage_metrics_campaign_idx ON generation_usage_metrics (campaign_id, created_at DESC);
+
+-- One durable record for each real AI HTTP request.  This is deliberately
+-- separate from aggregated generation_usage_metrics so retries/fallbacks are
+-- never collapsed into a single comment-level metric.
+CREATE TABLE IF NOT EXISTS generation_api_calls (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  call_key TEXT NOT NULL UNIQUE,
+  campaign_id UUID REFERENCES campaigns(id) ON DELETE RESTRICT,
+  campaign_post_id UUID REFERENCES campaign_posts(id) ON DELETE RESTRICT,
+  campaign_account_id UUID REFERENCES campaign_accounts(id) ON DELETE RESTRICT,
+  cycle_id UUID REFERENCES generation_cycles(id) ON DELETE RESTRICT,
+  job_id UUID REFERENCES generation_jobs(id) ON DELETE RESTRICT,
+  purpose TEXT NOT NULL CHECK (purpose IN ('generation','rewrite','fallback','preview','preflight')),
+  provider TEXT NOT NULL,
+  model_key TEXT NOT NULL,
+  api_model TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('started','succeeded','failed','cancelled','usage_unknown')),
+  input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER,
+  input_price_per_million NUMERIC(12,6), cached_input_price_per_million NUMERIC(12,6), output_price_per_million NUMERIC(12,6),
+  currency TEXT NOT NULL DEFAULT 'USD', estimated_cost NUMERIC(16,8),
+  failure_kind TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), finished_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS generation_api_calls_campaign_idx ON generation_api_calls (campaign_id, created_at DESC);
+ALTER TABLE generation_api_calls ALTER COLUMN campaign_id DROP NOT NULL;
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS campaign_account_id UUID REFERENCES campaign_accounts(id) ON DELETE RESTRICT;
+CREATE INDEX IF NOT EXISTS generation_api_calls_campaign_account_idx ON generation_api_calls (campaign_account_id, created_at DESC);
+
+-- X is an independently billed/limited provider.  Its calls must never be
+-- represented as AI USD usage: operation and attribution are recorded alone.
+CREATE TABLE IF NOT EXISTS x_api_calls (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  call_key TEXT NOT NULL UNIQUE,
+  operation TEXT NOT NULL CHECK (operation IN ('tweet_lookup','user_lookup','timeline_lookup')),
+  campaign_id UUID REFERENCES campaigns(id) ON DELETE RESTRICT,
+  campaign_account_id UUID REFERENCES campaign_accounts(id) ON DELETE RESTRICT,
+  status TEXT NOT NULL CHECK (status IN ('started','succeeded','failed')),
+  http_status INTEGER, failure_kind TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), finished_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS x_api_calls_campaign_idx ON x_api_calls (campaign_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS campaign_previews (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(), campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE RESTRICT,
