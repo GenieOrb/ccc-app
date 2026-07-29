@@ -53,4 +53,15 @@ describe('admin campaigns route', () => {
     expect(ambiguous.status).toBe(400);
     expect(createCampaign).toHaveBeenCalledTimes(1);
   });
+
+  it('returns the awaited initial perpetual synchronization result', async () => {
+    createPerpetualCampaign.mockResolvedValue({ id: 'perpetual-1', slug: 'perpetual-slug', initialSync: { accountsProcessed: 1, postsImported: 1, errors: [] } });
+    const response = await POST(new Request('http://localhost/api/admin/campaigns', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ campaignType: 'perpetual', accountsInput: '@author', postActiveLifetimeHours: 24 }),
+    }));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ campaign: { id: 'perpetual-1', campaignType: 'perpetual' }, initialSync: { accountsProcessed: 1, postsImported: 1 } });
+    expect(createPerpetualCampaign).toHaveBeenCalledWith(expect.objectContaining({ accountsInput: '@author', postActiveLifetimeHours: 24 }));
+  });
 });

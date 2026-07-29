@@ -9,6 +9,19 @@ import { SlotPlan, ALLOWED_EMOJIS } from './planner';
 
 const cachedClients = new Map<string, OpenAI>();
 
+function createRequestDeadline(timeoutMs?: number): number | undefined {
+  if (timeoutMs === undefined) return undefined;
+  const timeout = Number.isFinite(timeoutMs) ? Math.max(1, Math.floor(timeoutMs)) : 1;
+  return Date.now() + timeout;
+}
+
+function requestOptionsForDeadline(deadline?: number) {
+  if (deadline === undefined) return undefined;
+  const timeout = Math.floor(deadline - Date.now());
+  if (timeout <= 0) throw new Error('Provider request time budget exhausted.');
+  return { timeout, maxRetries: 0 };
+}
+
 function getOpenAIClient(provider: 'openai' | 'deepseek' | 'qwen' = 'openai'): OpenAI {
   const cached = cachedClients.get(provider);
   if (cached) return cached;
@@ -51,8 +64,10 @@ export async function checkCampaignSafety(
   postsText: string[],
   direction?: string,
   attribution?: PreflightLedgerAttribution,
+  timeoutMs?: number,
 ): Promise<SafetyPreflightResult> {
   if (!getConfig().openaiApiKey) return locallySanitizeCampaignSafety(postsText, direction);
+  const requestDeadline = createRequestDeadline(timeoutMs);
   const openai = getOpenAIClient();
   const config = getConfig();
   // Preflight can run before a campaign exists, therefore campaign_id is
@@ -96,18 +111,21 @@ Output JSON matching the schema: allowed (boolean), category (short string), rea
   const userContent = `ADMIN COMMENT DIRECTION:\n${direction || 'None'}\n\nTARGET POSTS CONTENT:\n${combinedPosts}`;
 
   try {
-    const response = await openai.responses.parse({
-      model: config.openaiModel,
-      store: false,
+    const response = await openai.responses.parse(
+      {
+        model: config.openaiModel,
+        store: false,
 
-      text: {
-        format: zodTextFormat(SafetyPreflightSchema, 'safety_check'),
+        text: {
+          format: zodTextFormat(SafetyPreflightSchema, 'safety_check'),
+        },
+        input: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: userContent },
+        ],
       },
-      input: [
-        { role: 'system', content: systemInstruction },
-        { role: 'user', content: userContent },
-      ],
-    });
+      requestOptionsForDeadline(requestDeadline),
+    );
 
     if (response.output_parsed) {
       const usage = response.usage;
@@ -152,7 +170,9 @@ export async function generateSingleComment(params: {
   plan: SlotPlan;
   recentComments: string[];
   rewriteFeedback?: string;
+  timeoutMs?: number;
 }): Promise<GeneratedComment> {
+  const requestDeadline = createRequestDeadline(params.timeoutMs);
   const openai = getOpenAIClient(params.provider || 'openai');
   const config = getConfig();
 
@@ -225,14 +245,17 @@ Generate one comment obeying all constraints.`;
     // All configured generation providers expose the OpenAI-compatible Chat
     // Completions transport. The safety preflight above intentionally keeps
     // the existing OpenAI Responses API and OPENAI_MODEL contract.
-    const response = await openai.chat.completions.create({
-      model: apiModel || config.openaiModel,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: `${systemPrompt}\nReturn JSON exactly as {"comment":"..."}.` },
-        { role: 'user', content: userPrompt },
-      ],
-    });
+    const response = await openai.chat.completions.create(
+      {
+        model: apiModel || config.openaiModel,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: `${systemPrompt}\nReturn JSON exactly as {"comment":"..."}.` },
+          { role: 'user', content: userPrompt },
+        ],
+      },
+      requestOptionsForDeadline(requestDeadline),
+    );
     const parsed = CommentGenerationSchema.safeParse(JSON.parse(response.choices[0]?.message?.content || '{}'));
     if (parsed.success && parsed.data.comment.trim()) {
       const usage = response.usage;

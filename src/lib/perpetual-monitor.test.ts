@@ -43,8 +43,8 @@ describe('processPerpetualCampaigns', () => {
 
     expect(result.postsImported).toBe(1);
     expect(result.cyclesCreated).toBe(1);
-    expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, { campaignId: 'campaign-1', campaignAccountId: 'account-1' });
-    expect(checkCampaignSafety).toHaveBeenCalledWith(['Fresh post'], undefined, { campaignId: 'campaign-1', campaignAccountId: 'account-1' });
+    expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number));
+    expect(checkCampaignSafety).toHaveBeenCalledWith(['Fresh post'], undefined, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number));
     expect(transactionalSql.filter((sql) => sql.includes('INSERT INTO generation_jobs'))).toHaveLength(30);
     expect(transactionalSql.some((sql) => sql.includes('INSERT INTO generation_cycles'))).toBe(true);
     expect(transactionalSql.some((sql) => sql.includes('initial_sync_pending = false'))).toBe(true);
@@ -79,7 +79,7 @@ describe('processPerpetualCampaigns', () => {
 
     const result = await processPerpetualCampaigns(10_000);
 
-    expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, { campaignId: 'campaign-1', campaignAccountId: 'account-1' });
+    expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number));
     expect(result.postsImported).toBe(1);
     expect(transactionalSql.some((sql) => sql.includes('INSERT INTO campaign_posts'))).toBe(true);
     expect(transactionalSql.some((sql) => sql.includes('initial_sync_pending = false'))).toBe(true);
@@ -106,5 +106,48 @@ describe('processPerpetualCampaigns', () => {
 
     expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('initial_sync_pending = false'))).toBe(false);
     expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('SET last_polled_at = NOW() WHERE id = $1'))).toBe(true);
+  });
+
+  it('does not start account polling after its time budget is exhausted', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1000);
+
+    const result = await processPerpetualCampaigns(0);
+
+    expect(result.accountsProcessed).toBe(0);
+    expect(fetchNewXPostsForAccount).not.toHaveBeenCalled();
+    expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('SELECT ca.id'))).toBe(false);
+    now.mockRestore();
+  });
+
+  it('finishes the atomic durable write after safety completes at the deadline', async () => {
+    let nowValue = 1_000;
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => nowValue);
+    fetchNewXPostsForAccount.mockResolvedValue([freshPost]);
+    checkCampaignSafety.mockImplementation(async () => {
+      nowValue = 2_000; // The 500ms budget elapsed while safety was in flight.
+      return { allowed: true };
+    });
+
+    const result = await processPerpetualCampaigns(500);
+
+    expect(result.postsImported).toBe(1);
+    expect(transactionalSql.some((sql) => sql.includes('INSERT INTO campaign_posts'))).toBe(true);
+    expect(transactionalSql.some((sql) => sql.includes('initial_sync_pending = false'))).toBe(true);
+    now.mockRestore();
+  });
+
+  it('bounds each remote I/O call to the remaining monitor budget', async () => {
+    let nowValue = 1_000;
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => nowValue);
+    fetchNewXPostsForAccount.mockImplementation(async () => {
+      nowValue = 1_300;
+      return [freshPost];
+    });
+
+    await processPerpetualCampaigns(1_000);
+
+    expect(fetchNewXPostsForAccount.mock.calls[0][3]).toBe(900);
+    expect(checkCampaignSafety.mock.calls[0][3]).toBe(600);
+    now.mockRestore();
   });
 });

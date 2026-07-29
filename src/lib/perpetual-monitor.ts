@@ -6,7 +6,7 @@ import { randomUUID } from 'crypto';
 import { generateDeterministicSlotPlans } from './planner';
 import { getAiModel } from './ai/models';
 
-interface PerpetualMonitorSummary {
+export interface PerpetualMonitorSummary {
   accountsProcessed: number;
   postsDetected: number;
   postsImported: number;
@@ -14,6 +14,12 @@ interface PerpetualMonitorSummary {
   postsExpired: number;
   cyclesCreated: number;
   errors: string[];
+}
+
+export interface PerpetualMonitorOptions {
+  timeBudgetMs?: number;
+  campaignId?: string;
+  accountIds?: string[];
 }
 
 interface AccountRow {
@@ -29,7 +35,10 @@ interface AccountRow {
   model_key: string;
 }
 
-export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): Promise<PerpetualMonitorSummary> {
+export async function processPerpetualCampaigns(options: number | PerpetualMonitorOptions = 20000): Promise<PerpetualMonitorSummary> {
+  const { timeBudgetMs = 20000, campaignId, accountIds } = typeof options === 'number'
+    ? { timeBudgetMs: options }
+    : options;
   const summary: PerpetualMonitorSummary = {
     accountsProcessed: 0,
     postsDetected: 0,
@@ -41,6 +50,12 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
   };
 
   const startTime = Date.now();
+  const deadline = startTime + Math.max(0, timeBudgetMs);
+  const durableWriteReserveMs = Math.min(1_000, Math.max(0, Math.floor(timeBudgetMs / 10)));
+  const ioDeadline = deadline - durableWriteReserveMs;
+  const hasTimeRemaining = () => Date.now() < deadline;
+  const hasIoTimeRemaining = () => Date.now() < ioDeadline;
+  const boundedIoTimeoutMs = (maximumMs: number) => Math.max(1, Math.min(maximumMs, Math.floor(ioDeadline - Date.now())));
 
   // 1. Expirar posts antiguos (que ya superaron su expires_at y no están retirados)
   try {
@@ -85,18 +100,24 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
     summary.errors.push(`Error al expirar posts: ${errorMsg}`);
   }
 
+  if (!hasTimeRemaining()) return summary;
+
   // 2. Seleccionar cuentas activas para hacer polling.
+  const scopedAccountIds = accountIds?.filter(Boolean) ?? [];
+  if (accountIds && scopedAccountIds.length === 0) return summary;
   const accountsRows = await queryDb<AccountRow>(`
     SELECT ca.id, ca.campaign_id, ca.username, ca.x_user_id, ca.monitoring_started_at, ca.initial_sync_pending, ca.last_seen_post_id, c.direction, c.post_active_lifetime_hours, c.model_key
     FROM campaign_accounts ca
     JOIN campaigns c ON ca.campaign_id = c.id
     WHERE ca.removed_at IS NULL AND c.is_active = true AND c.campaign_type = 'perpetual'
+      AND ($1::UUID IS NULL OR ca.campaign_id = $1)
+      AND (cardinality($2::UUID[]) = 0 OR ca.id = ANY($2::UUID[]))
     ORDER BY ca.initial_sync_pending DESC, ca.last_polled_at ASC NULLS FIRST
     LIMIT 10
-  `);
+  `, [campaignId ?? null, scopedAccountIds]);
 
   for (const account of accountsRows) {
-    if (Date.now() - startTime >= timeBudgetMs) {
+    if (!hasTimeRemaining()) {
       break;
     }
 
@@ -105,7 +126,12 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
 
       let xUserId = account.x_user_id;
       if (!xUserId) {
-        xUserId = await resolveXUsername(account.username, { campaignId: account.campaign_id, campaignAccountId: account.id });
+        if (!hasIoTimeRemaining()) break;
+        xUserId = await resolveXUsername(
+          account.username,
+          { campaignId: account.campaign_id, campaignAccountId: account.id },
+          boundedIoTimeoutMs(10_000),
+        );
         await queryDb('UPDATE campaign_accounts SET x_user_id = $1 WHERE id = $2', [xUserId, account.id]);
       }
 
@@ -113,11 +139,13 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
       // account is still performing its one-post initial recovery.  A cursor can
       // have been advanced by a partial prior attempt, while the flag remains
       // pending until a whole polling pass succeeds.
+      if (!hasIoTimeRemaining()) break;
       const isInitialRecovery = account.initial_sync_pending;
       const fetchedPosts = await fetchNewXPostsForAccount(
         xUserId,
         isInitialRecovery ? null : account.last_seen_post_id,
         { campaignId: account.campaign_id, campaignAccountId: account.id },
+        boundedIoTimeoutMs(15_000),
       );
       // Initial recovery imports at most one post, but eligibility must be
       // decided before choosing the newest Snowflake: a newer expired post
@@ -156,10 +184,15 @@ export async function processPerpetualCampaigns(timeBudgetMs: number = 20000): P
         let highestPostId = account.last_seen_post_id;
 
         for (const post of newPosts) {
+          if (!hasIoTimeRemaining()) break;
+          // Once safety has completed, this transaction is the durable
+          // consequence of that decision. Do not strand a reviewed post just
+          // because the deadline passed while the safety check was in flight.
           const safetyResult = await checkCampaignSafety(
             [post.textContent],
             account.direction || undefined,
             { campaignId: account.campaign_id, campaignAccountId: account.id },
+            boundedIoTimeoutMs(60_000),
           );
           if (!safetyResult.allowed) {
             summary.postsRejected++;

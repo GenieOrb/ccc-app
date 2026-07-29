@@ -4,6 +4,16 @@ import { getConfig } from './config';
 import { createHmacHash, safeCompareStrings, verifyScryptPassword } from './crypto';
 
 const ADMIN_COOKIE_NAME = '__comment_app_admin_session';
+const ADMIN_SESSION_MAX_AGE_SECONDS = 8 * 60 * 60;
+
+function adminCookieOptions() {
+  return {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict' as const,
+    path: '/',
+  };
+}
 
 export interface AdminSession {
   authenticated: boolean;
@@ -29,7 +39,7 @@ export function verifySessionToken(token: string): AdminSession | null {
   if (isNaN(timestamp)) return null;
 
   // Check 8-hour expiry
-  const maxAgeMs = 8 * 60 * 60 * 1000;
+  const maxAgeMs = ADMIN_SESSION_MAX_AGE_SECONDS * 1000;
   if (Date.now() - timestamp > maxAgeMs) {
     return null;
   }
@@ -46,27 +56,40 @@ export function verifySessionToken(token: string): AdminSession | null {
 export async function setAdminSessionCookie(): Promise<void> {
   const token = createSessionToken();
   const cookieStore = await cookies();
-  const isProd = process.env.NODE_ENV === 'production';
-
   cookieStore.set(ADMIN_COOKIE_NAME, token, {
-    httpOnly: true,
-    secure: isProd,
-    sameSite: 'strict',
-    path: '/',
-    maxAge: 8 * 60 * 60, // 8 hours
+    ...adminCookieOptions(),
+    maxAge: ADMIN_SESSION_MAX_AGE_SECONDS,
   });
 }
 
 export async function clearAdminSessionCookie(): Promise<void> {
   const cookieStore = await cookies();
-  cookieStore.delete(ADMIN_COOKIE_NAME);
+  // Match every attribute used when issuing the cookie. Relying on delete()
+  // defaults can leave a path-scoped session cookie alive in some runtimes.
+  cookieStore.set(ADMIN_COOKIE_NAME, '', {
+    ...adminCookieOptions(),
+    maxAge: 0,
+    expires: new Date(0),
+  });
 }
 
 export async function isAdminAuthenticated(): Promise<boolean> {
   const cookieStore = await cookies();
   const token = cookieStore.get(ADMIN_COOKIE_NAME)?.value;
   if (!token) return false;
-  return verifySessionToken(token) !== null;
+  if (!verifySessionToken(token)) return false;
+
+  // Sliding, persistent session: every authenticated server request refreshes
+  // both the signed timestamp and the browser persistence window.
+  // Server Components expose a read-only cookie store. API handlers can renew
+  // the cookie; rendering an admin page must still be able to authenticate.
+  try {
+    await setAdminSessionCookie();
+  } catch {
+    // The already-verified session remains valid; the next mutable request
+    // will renew it.
+  }
+  return true;
 }
 
 export function validateAdminPassword(password: string): boolean {

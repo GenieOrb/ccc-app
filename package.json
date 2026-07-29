@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:db": "node scripts/test-db.mjs",
+    "test:db:transaction": "node scripts/verify-db-transaction.mjs",
     "db:setup": "node scripts/setup-db.mjs",
     "admin:hash-password": "node scripts/hash-admin-password.mjs"
   },

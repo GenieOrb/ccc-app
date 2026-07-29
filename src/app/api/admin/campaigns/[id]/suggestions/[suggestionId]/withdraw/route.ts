@@ -74,7 +74,9 @@ export async function POST(
     });
 
     if (res.status === 200) {
-      triggerReplenishmentIfNeeded(id).catch(() => {});
+      // Await the post-commit nudge so it cannot be abandoned by serverless.
+      // Cron reconciliation remains responsible for retrying a failed nudge.
+      await triggerReplenishmentIfNeeded(id).catch(() => undefined);
     }
 
     return res;

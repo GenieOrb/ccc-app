@@ -3,7 +3,10 @@ const { queryDb } = vi.hoisted(() => ({ queryDb: vi.fn().mockResolvedValue([]) }
 vi.mock('./db', () => ({ queryDb }));
 import { fetchNewXPostsForAccount, parseAndValidateXUrl, parseMultipleXUrls } from './x-api';
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
 
 describe('manual X URL validation', () => {
   it('accepts x.com and twitter.com status URLs with query strings', () => {
@@ -38,5 +41,29 @@ describe('perpetual X ingestion contract', () => {
     expect(queryDb.mock.calls[0][0]).toContain('INSERT INTO x_api_calls');
     expect(queryDb.mock.calls[0][1][1]).toBe('timeline_lookup');
     expect(String(queryDb.mock.calls.at(-1)?.[0])).toContain('UPDATE x_api_calls');
+  });
+
+  it('aborts timeline I/O at the timeout supplied by the monitor', async () => {
+    process.env.X_BEARER_TOKEN = 'test-token';
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      signal?.addEventListener('abort', () => {
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const pending = fetchNewXPostsForAccount('42', null, undefined, 25);
+    const rejection = expect(pending).rejects.toThrow('Error de red al consultar posts.');
+    await vi.advanceTimersByTimeAsync(25);
+
+    await rejection;
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const requestSignal = fetchMock.mock.calls[0][1]?.signal;
+    expect(requestSignal).toBeInstanceOf(AbortSignal);
+    expect((requestSignal as AbortSignal).aborted).toBe(true);
   });
 });

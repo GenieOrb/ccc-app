@@ -530,24 +530,10 @@ CREATE INDEX IF NOT EXISTS campaign_previews_campaign_idx ON campaign_previews (
 -- Snapshot is populated at enqueue time from the campaign, so legacy enqueue paths
 -- cannot silently fall back to OPENAI_MODEL. Application code may supply the same
 -- values explicitly; this trigger is an integrity guard for the existing queue.
-CREATE OR REPLACE FUNCTION fill_generation_model_snapshot()
+CREATE OR REPLACE FUNCTION fill_generation_cycle_model_snapshot()
 RETURNS TRIGGER AS $$
 DECLARE selected_key TEXT;
 BEGIN
-  -- Jobs inherit the immutable cycle snapshot. This prevents a later campaign
-  -- model edit from changing already-enqueued work.
-  IF TG_TABLE_NAME = 'generation_jobs' AND NEW.cycle_id IS NOT NULL THEN
-    SELECT model_key, provider, api_model, input_price_per_million,
-           cached_input_price_per_million, output_price_per_million,
-           pricing_currency, pricing_effective_at
-      INTO NEW.model_key, NEW.provider, NEW.api_model,
-           NEW.input_price_per_million, NEW.cached_input_price_per_million,
-           NEW.output_price_per_million, NEW.pricing_currency,
-           NEW.pricing_effective_at
-      FROM generation_cycles WHERE id = NEW.cycle_id;
-    NEW.model_name := COALESCE(NEW.api_model, NEW.model_name, 'gpt-5.4');
-    RETURN NEW;
-  END IF;
   SELECT model_key INTO selected_key FROM campaigns WHERE id = NEW.campaign_id;
   selected_key := COALESCE(NEW.model_key, selected_key, 'gpt-5.4');
   NEW.model_key := selected_key;
@@ -562,9 +548,34 @@ BEGIN
   NEW.pricing_currency := COALESCE(NEW.pricing_currency, 'USD'); NEW.pricing_effective_at := COALESCE(NEW.pricing_effective_at, DATE '2026-07-26');
   RETURN NEW;
 END; $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION fill_generation_job_model_snapshot()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.cycle_id IS NULL THEN
+    RAISE EXCEPTION 'generation_jobs.cycle_id is required for model snapshot';
+  END IF;
+
+  SELECT model_key, provider, api_model, input_price_per_million,
+         cached_input_price_per_million, output_price_per_million,
+         pricing_currency, pricing_effective_at
+    INTO NEW.model_key, NEW.provider, NEW.api_model,
+         NEW.input_price_per_million, NEW.cached_input_price_per_million,
+         NEW.output_price_per_million, NEW.pricing_currency,
+         NEW.pricing_effective_at
+    FROM generation_cycles WHERE id = NEW.cycle_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'generation cycle % does not exist for job snapshot', NEW.cycle_id;
+  END IF;
+  NEW.model_name := COALESCE(NEW.api_model, NEW.model_name, 'gpt-5.4');
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS trigger_generation_cycle_snapshot ON generation_cycles;
-CREATE TRIGGER trigger_generation_cycle_snapshot BEFORE INSERT ON generation_cycles FOR EACH ROW EXECUTE FUNCTION fill_generation_model_snapshot();
 DROP TRIGGER IF EXISTS trigger_generation_job_snapshot ON generation_jobs;
-CREATE TRIGGER trigger_generation_job_snapshot BEFORE INSERT ON generation_jobs FOR EACH ROW EXECUTE FUNCTION fill_generation_model_snapshot();
+-- Remove the former polymorphic trigger function after detaching both
+-- triggers, so a repeated setup leaves no obsolete runtime path behind.
+DROP FUNCTION IF EXISTS fill_generation_model_snapshot();
+CREATE TRIGGER trigger_generation_cycle_snapshot BEFORE INSERT ON generation_cycles FOR EACH ROW EXECUTE FUNCTION fill_generation_cycle_model_snapshot();
+CREATE TRIGGER trigger_generation_job_snapshot BEFORE INSERT ON generation_jobs FOR EACH ROW EXECUTE FUNCTION fill_generation_job_model_snapshot();
 
 COMMIT;

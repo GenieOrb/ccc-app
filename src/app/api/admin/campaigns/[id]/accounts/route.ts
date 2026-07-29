@@ -49,10 +49,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       );
     }
 
-    const addedAccounts = await addAccountsToCampaign(id, accountsInput);
+    const { addedAccounts, initialSync } = await addAccountsToCampaign(id, accountsInput);
 
     return NextResponse.json(
-      { success: true, addedAccounts },
+      { success: true, addedAccounts, initialSync },
       { headers: { 'Cache-Control': 'no-store' } }
     );
   } catch (error: unknown) {

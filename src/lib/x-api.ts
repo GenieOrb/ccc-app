@@ -5,6 +5,12 @@ import { queryDb } from './db';
 
 export interface XCallAttribution { campaignId?: string; campaignAccountId?: string; }
 
+function boundedXTimeoutMs(requestedTimeoutMs: number | undefined, defaultTimeoutMs: number): number {
+  if (requestedTimeoutMs === undefined) return defaultTimeoutMs;
+  if (!Number.isFinite(requestedTimeoutMs)) return 1;
+  return Math.max(1, Math.min(defaultTimeoutMs, Math.floor(requestedTimeoutMs)));
+}
+
 async function recordXCall(operation: 'tweet_lookup' | 'user_lookup' | 'timeline_lookup', attribution?: XCallAttribution) {
   const callKey = `x:${operation}:${randomUUID()}`;
   await queryDb(
@@ -343,7 +349,7 @@ function transformXTweet(
   };
 }
 
-export async function resolveXUsername(username: string, attribution?: XCallAttribution): Promise<string> {
+export async function resolveXUsername(username: string, attribution?: XCallAttribution, timeoutMs?: number): Promise<string> {
   const config = getConfig();
   if (!config.xBearerToken) {
     throw new Error('X_BEARER_TOKEN no está configurado en el servidor.');
@@ -353,7 +359,8 @@ export async function resolveXUsername(username: string, attribution?: XCallAttr
   const apiUrl = `https://api.x.com/2/users/by/username/${cleanUsername}`;
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000);
+  const requestTimeoutMs = boundedXTimeoutMs(timeoutMs, 10_000);
+  const timeoutId = setTimeout(() => controller.abort(), requestTimeoutMs);
 
   const callKey = await recordXCall('user_lookup', attribution);
   let response: Response;
@@ -393,6 +400,7 @@ export async function fetchNewXPostsForAccount(
   xUserId: string,
   sincePostId: string | null,
   attribution?: XCallAttribution,
+  timeoutMs?: number,
 ): Promise<FetchedXPost[]> {
   const config = getConfig();
   if (!config.xBearerToken) {
@@ -418,7 +426,8 @@ export async function fetchNewXPostsForAccount(
   const apiUrl = url.toString();
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  const requestTimeoutMs = boundedXTimeoutMs(timeoutMs, 15_000);
+  const timeoutId = setTimeout(() => controller.abort(), requestTimeoutMs);
 
   const callKey = await recordXCall('timeline_lookup', attribution);
   let response: Response;

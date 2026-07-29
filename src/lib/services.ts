@@ -8,6 +8,7 @@ import { generateSecureSlug } from './crypto';
 import { generateDeterministicSlotPlans } from './planner';
 import { DEFAULT_MODEL_KEY, getAiModel, isProviderConfigured } from './ai/models';
 import { generateSingleComment } from './openai';
+import { processPerpetualCampaigns, type PerpetualMonitorSummary } from './perpetual-monitor';
 
 function resolveCampaignModel(modelKey?: string) {
   const model = getAiModel(modelKey || DEFAULT_MODEL_KEY);
@@ -805,8 +806,9 @@ export async function assignCommentToVisitor(
 
   if ((txResult.status === 'success' && txResult.isNewAssignment) || txResult.status === 'no_inventory') {
     if (txResult.campaignId) {
-      // 11. Check replenishment threshold asynchronously AFTER commit
-      triggerReplenishmentIfNeeded(txResult.campaignId).catch(() => {});
+      // This is deliberately awaited: serverless requests may discard detached
+      // promises. A later cron reconciliation remains the durable fallback.
+      await triggerReplenishmentIfNeeded(txResult.campaignId).catch(() => undefined);
     }
   }
 
@@ -835,7 +837,7 @@ export async function createPerpetualCampaign(params: {
   postActiveLifetimeHours: number;
   displayName?: string;
   modelKey?: string;
-}): Promise<{ id: string; slug: string }> {
+}): Promise<{ id: string; slug: string; initialSync: PerpetualMonitorSummary }> {
   const normalizedAccounts = normalizeXAccounts(params.accountsInput);
   const model = resolveCampaignModel(params.modelKey);
   const displayName = params.displayName?.trim() || null;
@@ -860,18 +862,29 @@ export async function createPerpetualCampaign(params: {
     );
     const campaignId = campRes.rows[0].id;
 
+    const accountIds: string[] = [];
     for (const acc of normalizedAccounts) {
-      await client.query(
+      const accountRes = await client.query<{ id: string }>(
         `INSERT INTO campaign_accounts (
            campaign_id, username, username_normalized
-         ) VALUES ($1, $2, $3)`,
+         ) VALUES ($1, $2, $3)
+         RETURNING id`,
         [campaignId, acc.username, acc.username_normalized]
       );
+      accountIds.push(accountRes.rows[0].id);
     }
 
-    return { id: campaignId, slug };
+    return { id: campaignId, slug, accountIds };
   });
-  return created;
+  // This runs only after the campaign/accounts transaction commits. It is
+  // awaited because serverless runtimes may discard detached work; cron keeps
+  // reconciling every perpetual account if this bounded nudge is incomplete.
+  const initialSync = await processPerpetualCampaigns({
+    campaignId: created.id,
+    accountIds: created.accountIds,
+    timeBudgetMs: 12_000,
+  });
+  return { id: created.id, slug: created.slug, initialSync };
 }
 
 /** Durable cron-side reconciler. Request paths may nudge replenishment, but
@@ -961,10 +974,10 @@ export async function listCampaignPreviews(campaignId: string) {
   return queryDb(`SELECT id,campaign_post_id,model_key,provider,api_model,comments,input_tokens,cached_input_tokens,output_tokens,estimated_cost,error_message,created_at FROM campaign_previews WHERE campaign_id=$1 ORDER BY created_at DESC LIMIT 30`, [campaignId]);
 }
 
-export async function addAccountsToCampaign(campaignId: string, accountsInput: string) {
+export async function addAccountsToCampaign(campaignId: string, accountsInput: string): Promise<{ addedAccounts: Array<{ id: string; username: string; usernameNormalized: string; isRemoved: boolean; createdAt: string; removedAt: undefined }>; initialSync: PerpetualMonitorSummary }> {
   const normalizedAccounts = normalizeXAccounts(accountsInput);
 
-  return await withTransaction(async (client) => {
+  const addedAccounts = await withTransaction<Array<{ id: string; username: string; usernameNormalized: string; isRemoved: boolean; createdAt: string; removedAt: undefined }>>(async (client) => {
     const campRes = await client.query<{ campaign_type: string }>(
       `SELECT campaign_type FROM campaigns WHERE id = $1 FOR UPDATE`,
       [campaignId]
@@ -1008,6 +1021,10 @@ export async function addAccountsToCampaign(campaignId: string, accountsInput: s
 
     return addedAccounts;
   });
+  const initialSync = addedAccounts.length > 0
+    ? await processPerpetualCampaigns({ campaignId, accountIds: addedAccounts.map((account) => account.id), timeBudgetMs: 12_000 })
+    : { accountsProcessed: 0, postsDetected: 0, postsImported: 0, postsRejected: 0, postsExpired: 0, cyclesCreated: 0, errors: [] };
+  return { addedAccounts, initialSync };
 }
 
 export async function removeAccountFromCampaign(campaignId: string, accountId: string) {

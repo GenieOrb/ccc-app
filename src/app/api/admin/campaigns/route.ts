@@ -137,7 +137,7 @@ export async function POST(req: Request) {
       const created = await createPerpetualCampaign({ accountsInput, direction, postActiveLifetimeHours, displayName, modelKey });
 
       return NextResponse.json(
-        { success: true, campaign: { ...created, campaignType: 'perpetual' } },
+        { success: true, campaign: { id: created.id, slug: created.slug, campaignType: 'perpetual' }, initialSync: created.initialSync },
         { headers: { 'Cache-Control': 'no-store' } }
       );
     } else {

@@ -31,6 +31,19 @@ try {
   await testClient.query(schema);
   await testClient.query(schema);
 
+  const snapshotTriggers = await testClient.query(`
+    SELECT t.tgname, p.proname
+    FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
+    WHERE t.tgname IN ('trigger_generation_cycle_snapshot', 'trigger_generation_job_snapshot')
+      AND NOT t.tgisinternal
+    ORDER BY t.tgname
+  `);
+  if (snapshotTriggers.rowCount !== 2
+    || snapshotTriggers.rows[0].proname !== 'fill_generation_cycle_model_snapshot'
+    || snapshotTriggers.rows[1].proname !== 'fill_generation_job_model_snapshot') {
+    throw new Error('generation snapshot triggers must use distinct strict functions.');
+  }
+
   const campaign = await testClient.query(`INSERT INTO campaigns (slug, campaign_type, is_active, model_key) VALUES ('db-contract', 'manual', true, 'gpt-5.4') RETURNING id`);
   const campaignId = campaign.rows[0].id;
   const account = await testClient.query(
@@ -52,7 +65,22 @@ try {
   const post = await testClient.query(`INSERT INTO campaign_posts (campaign_id,x_post_id,input_url,canonical_url,text_content) VALUES ($1,'1','https://x.com/a/status/1','https://x.com/a/status/1','db contract post') RETURNING id`, [campaignId]);
   const postId = post.rows[0].id;
   const cycle = await testClient.query(`INSERT INTO generation_cycles (campaign_id,campaign_post_id,cycle_type,target_count,status,model_key,model_name) VALUES ($1,$2,'initial',1,'pending','gpt-5.4','gpt-5.4') RETURNING id`, [campaignId, postId]);
-  await testClient.query(`INSERT INTO generation_jobs (cycle_id,campaign_id,campaign_post_id,slot_index,slot_plan,length_mode,emoji_policy,rhetorical_form,texture,status,model_name,prompt_version) VALUES ($1,$2,$3,0,'{}','ultra_short','no_emoji','statement','plain','pending','gpt-5.4',1)`, [cycle.rows[0].id, campaignId, postId]);
+  const cycleSnapshot = await testClient.query(`SELECT model_key,provider,api_model,input_price_per_million,cached_input_price_per_million,output_price_per_million,pricing_currency FROM generation_cycles WHERE id=$1`, [cycle.rows[0].id]);
+  const expectedSnapshot = { model_key: 'gpt-5.4', provider: 'openai', api_model: 'gpt-5.4', input_price_per_million: '2.500000', cached_input_price_per_million: '0.250000', output_price_per_million: '15.000000', pricing_currency: 'USD' };
+  for (const [field, expected] of Object.entries(expectedSnapshot)) {
+    if (String(cycleSnapshot.rows[0][field]) !== expected) throw new Error(`generation cycle snapshot ${field} must exactly match the campaign model.`);
+  }
+  const job = await testClient.query(`INSERT INTO generation_jobs (cycle_id,campaign_id,campaign_post_id,slot_index,slot_plan,length_mode,emoji_policy,rhetorical_form,texture,status,model_name,prompt_version,model_key,provider,api_model,input_price_per_million,cached_input_price_per_million,output_price_per_million,pricing_currency) VALUES ($1,$2,$3,0,'{}','ultra_short','no_emoji','statement','plain','pending','wrong',1,'wrong','wrong','wrong',999,999,999,'wrong') RETURNING id`, [cycle.rows[0].id, campaignId, postId]);
+  const jobSnapshot = await testClient.query(`SELECT model_key,provider,api_model,input_price_per_million,cached_input_price_per_million,output_price_per_million,pricing_currency FROM generation_jobs WHERE id=$1`, [job.rows[0].id]);
+  for (const [field, expected] of Object.entries(expectedSnapshot)) {
+    if (String(jobSnapshot.rows[0][field]) !== expected) throw new Error(`generation job snapshot ${field} must exactly inherit its cycle snapshot.`);
+  }
+  const untouched = await testClient.query(`SELECT model_key FROM campaigns WHERE id=$1`, [campaignId]);
+  if (untouched.rows[0].model_key !== 'gpt-5.4') throw new Error('Snapshot checks must not mutate existing campaign data.');
+  await testClient.query(`INSERT INTO generation_jobs (cycle_id,campaign_id,campaign_post_id,slot_index,slot_plan,length_mode,emoji_policy,rhetorical_form,texture,status,model_name,prompt_version) VALUES ('00000000-0000-0000-0000-000000000001',$1,$2,1,'{}','ultra_short','no_emoji','statement','plain','pending','gpt-5.4',1)`, [campaignId, postId]).then(
+    () => { throw new Error('generation_jobs must reject a missing cycle snapshot.'); },
+    (error) => { if (!String(error.message).includes('generation cycle')) throw error; },
+  );
   await testClient.query(`INSERT INTO generation_api_calls (call_key,campaign_id,purpose,provider,model_key,api_model,status) VALUES ('db-contract-call',$1,'generation','openai','gpt-5.4','gpt-5.4','started')`, [campaignId]);
   await testClient.query(`INSERT INTO generation_api_calls (call_key,campaign_id,purpose,provider,model_key,api_model,status) VALUES ('db-contract-call',$1,'generation','openai','gpt-5.4','gpt-5.4','started') ON CONFLICT (call_key) DO NOTHING`, [campaignId]);
   const calls = await testClient.query(`SELECT count(*)::int AS count FROM generation_api_calls WHERE call_key='db-contract-call'`);

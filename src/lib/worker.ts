@@ -33,6 +33,11 @@ export interface ClaimedJob {
   pricingCurrency: string;
 }
 
+// A claimed job needs enough time for one bounded provider attempt plus the
+// durable DB transition that completes or releases its lease.
+export const MIN_WORKER_JOB_BUDGET_MS = 15_000;
+const WORKER_DURABLE_WRITE_RESERVE_MS = 5_000;
+
 export async function processBackgroundQueue(
   workerId: string = randomUUID(),
   budgetMs: number = 50000
@@ -42,18 +47,20 @@ export async function processBackgroundQueue(
   failed: number;
 }> {
   const startTime = Date.now();
-  const maxExecutionTimeMs = budgetMs;
+  const deadline = startTime + Math.max(0, budgetMs);
+  const hasSafeJobBudget = () => deadline - Date.now() >= MIN_WORKER_JOB_BUDGET_MS;
   const maxParallelConcurrency = 3;
 
   let totalProcessed = 0;
   let totalCompleted = 0;
   let totalFailed = 0;
 
-  while (Date.now() - startTime < maxExecutionTimeMs) {
+  while (hasSafeJobBudget()) {
     // 1. Claim up to maxParallelConcurrency jobs atomically
     const claimedJobs: ClaimedJob[] = [];
 
     for (let c = 0; c < maxParallelConcurrency; c++) {
+      if (!hasSafeJobBudget()) break;
       const job = await claimNextJob(workerId);
       if (job) {
         claimedJobs.push(job);
@@ -69,7 +76,7 @@ export async function processBackgroundQueue(
 
     // 2. Process claimed jobs in parallel
     const settled = await Promise.allSettled(
-      claimedJobs.map((job) => executeJobTask(job, workerId))
+      claimedJobs.map((job) => executeJobTask(job, workerId, deadline))
     );
     const results = settled.map((result) => result.status === 'fulfilled'
       ? result.value
@@ -200,6 +207,7 @@ async function claimNextJob(workerId: string): Promise<ClaimedJob | null> {
 async function executeJobTask(
   job: ClaimedJob,
   workerId: string,
+  deadline: number,
 ): Promise<{ success: boolean; error?: string }> {
   let recentComments: string[] = [];
   let rawComment = '';
@@ -236,6 +244,9 @@ async function executeJobTask(
       modelKey = job.modelKey,
       prices = { input: job.inputPricePerMillion, cached: job.cachedInputPricePerMillion, output: job.outputPricePerMillion },
     ) => {
+      if (deadline - Date.now() <= WORKER_DURABLE_WRITE_RESERVE_MS) {
+        throw new Error('Worker time budget exhausted before provider request.');
+      }
       const callKey = `${job.jobId}:${job.attemptsCount + 1}:${++apiCallSequence}`;
       const purpose = rewriteFeedback ? 'rewrite' : provider === job.provider ? 'generation' : 'fallback';
       const acquired = await queryDb<{ call_key: string }>(
@@ -252,7 +263,11 @@ async function executeJobTask(
         throw new Error('AI call acquisition conflict; no durable result is available.');
       }
       try {
-        const generated = await generateSingleComment({ apiModel, provider, postText: job.postText, authorName: job.authorName, authorUsername: job.authorUsername, accessibleContext: job.accessibleContext, direction: job.campaignDirection, plan: job.slotPlan, recentComments, rewriteFeedback });
+        const providerTimeoutMs = Math.floor(deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS);
+        if (providerTimeoutMs <= 0) {
+          throw new Error('Worker time budget exhausted before provider request.');
+        }
+        const generated = await generateSingleComment({ apiModel, provider, postText: job.postText, authorName: job.authorName, authorUsername: job.authorUsername, accessibleContext: job.accessibleContext, direction: job.campaignDirection, plan: job.slotPlan, recentComments, rewriteFeedback, timeoutMs: providerTimeoutMs });
         const callUsage = generated.usage;
         const estimatedCost = callUsage
           ? ((callUsage.inputTokens ?? 0) - (callUsage.cachedInputTokens ?? 0)) * prices.input / 1_000_000 + (callUsage.cachedInputTokens ?? 0) * (prices.cached ?? prices.input) / 1_000_000 + (callUsage.outputTokens ?? 0) * prices.output / 1_000_000
