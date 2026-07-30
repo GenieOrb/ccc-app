@@ -108,7 +108,6 @@ function CampaignCardItem({
   const [savingIdentity, setSavingIdentity] = useState(false);
   const [previews, setPreviews] = useState<CampaignPreview[]>([]);
   const [loadingPreviews, setLoadingPreviews] = useState(true);
-  const [generatingPreview, setGeneratingPreview] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
 
   const loadPreviews = useCallback(async () => {
@@ -128,22 +127,6 @@ function CampaignCardItem({
   useEffect(() => {
     if (expanded) void loadPreviews();
   }, [expanded, loadPreviews]);
-
-  const handleGeneratePreview = async () => {
-    setGeneratingPreview(true);
-    setPreviewError(null);
-    try {
-      const res = await fetch(`/api/admin/campaigns/${c.id}/preview`, { method: 'POST' });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Error al generar preview.');
-      await loadPreviews();
-    } catch (e: unknown) {
-      setPreviewError(e instanceof Error ? e.message : 'Error al generar preview.');
-      await loadPreviews();
-    } finally {
-      setGeneratingPreview(false);
-    }
-  };
 
   const handleStatusToggle = async () => {
     if (togglingStatus) return;
@@ -322,7 +305,6 @@ function CampaignCardItem({
 
       <div style={{ marginTop: '8px', display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'baseline' }}>
         <strong>{c.displayName || c.internalId}</strong>
-        <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Modelo: {c.modelKey}</span>
       </div>
       <div id={`campaign-details-${c.id}`} hidden={!expanded}>
       <form onSubmit={(e) => { e.preventDefault(); void saveSetting({ displayName: displayNameInput }); }} style={{ marginTop: '10px' }}>
@@ -545,14 +527,6 @@ function CampaignCardItem({
       <section style={{ borderTop: '1px solid var(--border-color)', paddingTop: '16px', marginBottom: '16px' }} aria-label="Previews de comentarios">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', marginBottom: '10px' }}>
           <strong>Preview de comentarios</strong>
-          <button
-            type="button"
-            onClick={() => void handleGeneratePreview()}
-            className="btn-admin btn-secondary"
-            disabled={generatingPreview}
-          >
-            {generatingPreview ? 'Generando preview...' : 'Generar preview'}
-          </button>
         </div>
 
         {previewError && <p role="alert" style={{ color: 'var(--peach-accent)', margin: '0 0 10px' }}>{previewError}</p>}
@@ -610,8 +584,8 @@ function CampaignCardItem({
                     }}>
                       {s.status.toUpperCase()}
                     </span>
-                    <a href={s.postUrl} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--text-muted)', textDecoration: s.postIsRetired ? 'line-through' : 'none' }}>
-                      @{s.postAuthor}
+                    <a href={s.postUrl} target="_blank" rel="noopener noreferrer" aria-label={`Abrir post de @${s.postAuthor} en una pestaña nueva`} style={{ color: 'var(--text-muted)', textDecoration: s.postIsRetired ? 'line-through' : 'none' }}>
+                      <span aria-hidden="true">↗</span> @{s.postAuthor}
                     </a>
                   </div>
                   {s.status === 'available' && (
@@ -661,6 +635,8 @@ export default function AdminDashboardPage() {
   const [postActiveLifetimeHours, setPostActiveLifetimeHours] = useState('24');
   const [direction, setDirection] = useState('');
   const [creating, setCreating] = useState(false);
+  const [generatingPreview, setGeneratingPreview] = useState(false);
+  const [createdPreview, setCreatedPreview] = useState<string[] | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const router = useRouter();
@@ -718,8 +694,7 @@ export default function AdminDashboardPage() {
     router.refresh();
   }
 
-  async function handleCreateCampaign(e: React.FormEvent) {
-    e.preventDefault();
+  async function createCampaign(generatePreview: boolean) {
     if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
     if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
     const parsedDuration = Number(postActiveLifetimeHours);
@@ -755,11 +730,38 @@ export default function AdminDashboardPage() {
       setAccountsInput('');
       setDirection('');
       await fetchCampaigns(1);
+
+      if (!generatePreview) return;
+
+      const campaignId = data.campaign?.id;
+      if (typeof campaignId !== 'string') {
+        setError('La campaña se creó, pero no se pudo obtener su identificador para generar el preview.');
+        return;
+      }
+
+      setGeneratingPreview(true);
+      try {
+        const previewResponse = await fetch(`/api/admin/campaigns/${campaignId}/preview`, { method: 'POST' });
+        const previewData = await previewResponse.json();
+        if (!previewResponse.ok) throw new Error(previewData.error || 'Error al generar preview.');
+        const comments = previewData.preview?.comments;
+        setCreatedPreview(Array.isArray(comments) ? comments : typeof comments === 'string' ? [comments] : []);
+      } catch (previewError: unknown) {
+        setError(previewError instanceof Error ? previewError.message : 'La campaña se creó, pero no se pudo generar el preview.');
+      } finally {
+        setGeneratingPreview(false);
+        await fetchCampaigns(1);
+      }
     } catch {
       setError('Error al enviar la petición de creación.');
     } finally {
       setCreating(false);
     }
+  }
+
+  function handleCreateCampaign(e: React.FormEvent) {
+    e.preventDefault();
+    void createCampaign(false);
   }
 
   async function handleToggleStatus(campaignId: string) {
@@ -931,13 +933,31 @@ export default function AdminDashboardPage() {
               />
             </div>
 
-            <button
-              type="submit"
-              className="btn-admin btn-primary"
-              disabled={creating || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
-            >
-              {creating ? 'Creando campaña...' : 'Crear Campaña'}
-            </button>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button
+                type="submit"
+                className="btn-admin btn-primary"
+                disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
+              >
+                {creating ? 'Creando campaña...' : 'Crear Campaña'}
+              </button>
+              <button
+                type="button"
+                className="btn-admin btn-secondary"
+                disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
+                onClick={() => void createCampaign(true)}
+              >
+                {generatingPreview ? 'Generando preview...' : 'Generar preview'}
+              </button>
+            </div>
+            {createdPreview && (
+              <section aria-label="Preview recién generado" style={{ marginTop: '16px' }}>
+                <strong>Preview generado</strong>
+                <ol>
+                  {createdPreview.map((comment, index) => <li key={`${index}-${comment}`}>{comment}</li>)}
+                </ol>
+              </section>
+            )}
           </form>
         </section>
 

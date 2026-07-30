@@ -153,4 +153,36 @@ describe('administration campaign cards', () => {
     });
     await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/admin/campaigns?page=1'))).toHaveLength(2));
   });
+
+  it('creates a campaign then generates and displays its seven-comment preview outside campaign cards', async () => {
+    const previewComments = Array.from({ length: 7 }, (_, index) => `Preview ${index + 1}`);
+    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true, campaign: { id: 'new-campaign' } }));
+      if (input === '/api/admin/campaigns/new-campaign/preview' && init?.method === 'POST') return Promise.resolve(json({ success: true, preview: { postId: 'post-1', comments: previewComments } }));
+      if (input.includes('/api/admin/campaigns/campaign-1/suggestions')) return Promise.resolve(json({ suggestions: [{ id: 'suggestion-1', text: 'Comentario existente', status: 'available', postUrl: 'https://x.com/genieorb/status/1', postAuthor: 'genieorb', postIsRetired: false }], nextCursor: null }));
+      if (input.includes('/preview')) return Promise.resolve(json({ previews: [] }));
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+    render(<AdminDashboardPage />);
+
+    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
+    fireEvent.click(screen.getByRole('button', { name: /^generar preview$/i }));
+
+    await waitFor(() => expect(screen.getByText('Preview 7')).toBeTruthy());
+    const mutationCalls = fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'POST');
+    expect(mutationCalls.map(([url]) => String(url))).toEqual(['/api/admin/campaigns', '/api/admin/campaigns/new-campaign/preview']);
+    expect(screen.getAllByText(/^Preview \d$/)).toHaveLength(7);
+    expect(screen.getAllByRole('button', { name: /^generar preview$/i })).toHaveLength(1);
+
+    fireEvent.click(await screen.findByRole('button', { name: /expandir/i }));
+    expect(screen.getAllByRole('button', { name: /^generar preview$/i })).toHaveLength(1);
+    fireEvent.click(await screen.findByRole('button', { name: /ver comentarios/i }));
+    const postLink = await screen.findByRole('link', { name: /abrir post de @genieorb/i });
+    expect(postLink.getAttribute('href')).toBe('https://x.com/genieorb/status/1');
+    expect(postLink.getAttribute('target')).toBe('_blank');
+    expect(postLink.getAttribute('rel')).toBe('noopener noreferrer');
+    expect(screen.queryByText(`Modelo: ${campaign.modelKey}`)).toBeNull();
+  });
 });
