@@ -406,7 +406,7 @@ async function executeJobTask(
 
       await client.query(
         `INSERT INTO generation_usage_metrics (campaign_id,campaign_post_id,cycle_id,job_id,requested_provider,requested_model_key,final_provider,final_model_key,input_tokens,cached_input_tokens,output_tokens,comments_requested,comments_received,comments_valid,comments_rejected,regenerations,attempts,fallback_used,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency,estimated_cost)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,1,1,0,$12,$13,$14,$15,$16,$17,$18,CASE WHEN $9 IS NULL AND $10 IS NULL AND $11 IS NULL THEN NULL ELSE (COALESCE($9,0) - COALESCE($10,0))*$15/1000000 + COALESCE($10,0)*COALESCE($16,0)/1000000 + COALESCE($11,0)*$17/1000000 END)`,
+         VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::text,$6::text,$7::text,$8::text,$9::integer,$10::integer,$11::integer,1,1,1,0,$12::integer,$13::integer,$14::boolean,$15::numeric,$16::numeric,$17::numeric,$18::text,CASE WHEN $9::integer IS NULL AND $10::integer IS NULL AND $11::integer IS NULL THEN NULL ELSE (COALESCE($9::integer,0) - COALESCE($10::integer,0))*$15::numeric/1000000 + COALESCE($10::integer,0)*COALESCE($16::numeric,0)/1000000 + COALESCE($11::integer,0)*$17::numeric/1000000 END)`,
         [job.campaignId,job.campaignPostId,job.cycleId,job.jobId,job.provider,job.modelKey,finalProvider,finalModelKey,usage?.inputTokens ?? null,usage?.cachedInputTokens ?? null,usage?.outputTokens ?? null,regenerations,job.attemptsCount + 1,finalModelKey !== job.modelKey,finalInputPrice,finalCachedInputPrice ?? null,finalOutputPrice,job.pricingCurrency]
       );
 

@@ -60,4 +60,48 @@ describe('manual generation queue gating', () => {
     expect(postLockQuery).toMatch(/JOIN generation_cycles cy ON cy\.id = \$2/);
     expect(postLockQuery).toMatch(/\( c\.is_active = true OR \(c\.campaign_type = 'manual' AND cy\.cycle_type = 'initial'\) \)/);
   });
+
+  it('casts usage-metric parameters explicitly before calculating the cost', async () => {
+    const queries: string[] = [];
+    let jobClaimed = false;
+    queryDb.mockImplementation(async (sql: string) => {
+      if (sql.includes('SELECT comment_text')) return [];
+      if (sql.includes('SELECT id FROM campaign_posts')) return [{ id: 'post-1' }];
+      if (sql.includes('INSERT INTO generation_api_calls')) return [{ call_key: 'job-1:1:1' }];
+      return [];
+    });
+    generateSingleComment.mockResolvedValue({ comment: 'A valid comment', usage: { inputTokens: 10, cachedInputTokens: 2, outputTokens: 4 } });
+    validateCommentLocally.mockReturnValue({ valid: true });
+    normalizeCommentText.mockReturnValue('a valid comment');
+    computeNormalizedHash.mockReturnValue('hash');
+    withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        if (sql.includes('FROM generation_jobs j')) {
+          if (jobClaimed) return { rows: [] };
+          jobClaimed = true;
+          return { rows: [{
+            job_id: 'job-1', cycle_id: 'cycle-1', campaign_id: 'campaign-1', campaign_post_id: 'post-1',
+            slot_index: 0, slot_plan: {}, attempts_count: 0, post_text: 'Post', author_name: 'Author',
+            author_username: 'author', accessible_context: {}, direction: null, model_key: 'model', provider: 'openai',
+            api_model: 'model', input_price_per_million: 1.25, cached_input_price_per_million: 0.5,
+            output_price_per_million: 2.5, pricing_currency: 'USD',
+          }] };
+        }
+        if (sql.includes('SELECT id FROM generation_jobs')) return { rows: [{ id: 'job-1' }] };
+        if (sql.includes('FROM campaign_posts p')) return { rows: [{ '?column?': 1 }] };
+        if (sql.includes('INSERT INTO suggestions')) return { rows: [{ id: 'suggestion-1' }] };
+        if (sql.includes('UPDATE generation_jobs')) return { rows: [{ id: 'job-1' }] };
+        if (sql.includes('UPDATE generation_cycles')) return { rows: [{ target_count: 1, valid_produced_count: 1, completed_jobs_count: 1 }] };
+        return { rows: [] };
+      }),
+    }));
+
+    await processBackgroundQueue('worker-test', MIN_WORKER_JOB_BUDGET_MS);
+
+    const metricInsert = queries.find((sql) => sql.includes('INSERT INTO generation_usage_metrics'))!;
+    expect(metricInsert).toContain('$15::numeric');
+    expect(metricInsert).toContain('$16::numeric');
+    expect(metricInsert).toContain('$17::numeric');
+  });
 });

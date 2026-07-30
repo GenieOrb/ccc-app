@@ -83,8 +83,8 @@ export function validateCommentLocally(
   const sentenceCount = countSentences(trimmed);
 
   if (plan.lengthMode === 'ultra_short') {
-    if (sentenceCount > 1) {
-      return { valid: false, reason: `ultra_short mode allows only 1 sentence, found ${sentenceCount}.` };
+    if (sentenceCount > 2) {
+      return { valid: false, reason: `ultra_short mode allows at most 2 sentences, found ${sentenceCount}.` };
     }
     if (wordCount > 20) {
       return { valid: false, reason: `ultra_short mode exceeds maximum of 20 words (found ${wordCount}).` };
