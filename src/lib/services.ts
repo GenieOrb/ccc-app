@@ -38,6 +38,7 @@ export interface CampaignSummary {
   pendingProcessingJobsCount: number;
   failedJobsCount: number;
   hasUnresolvedFailedCycle: boolean;
+  recordedCost: number;
   campaignType: 'manual' | 'perpetual';
   postActiveLifetimeHours?: number;
   xAccounts: {
@@ -111,6 +112,7 @@ export async function getCampaignsPage(
       pending_processing_jobs: string;
       failed_jobs: string;
       has_failed_cycle: boolean;
+      recorded_cost: string | null;
     }>(
       `SELECT 
          (SELECT COUNT(*) FROM suggestions WHERE campaign_id = $1) as valid_generated,
@@ -119,7 +121,9 @@ export async function getCampaignsPage(
          (SELECT COUNT(*) FROM suggestions WHERE campaign_id = $1 AND status = 'withdrawn') as withdrawn,
          (SELECT COUNT(*) FROM generation_jobs WHERE campaign_id = $1 AND status IN ('pending', 'processing')) as pending_processing_jobs,
          (SELECT COUNT(*) FROM generation_jobs WHERE campaign_id = $1 AND status = 'failed') as failed_jobs,
-         EXISTS (SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND status = 'failed') as has_failed_cycle`,
+         EXISTS (SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND status = 'failed') as has_failed_cycle,
+         COALESCE((SELECT SUM(estimated_cost) FROM generation_usage_metrics WHERE campaign_id = $1 AND estimated_cost IS NOT NULL), 0)
+         + COALESCE((SELECT SUM(estimated_cost) FROM generation_api_calls WHERE campaign_id = $1 AND estimated_cost IS NOT NULL), 0) as recorded_cost`,
       [c.id]
     );
 
@@ -131,6 +135,7 @@ export async function getCampaignsPage(
       pending_processing_jobs: '0',
       failed_jobs: '0',
       has_failed_cycle: false,
+      recorded_cost: '0',
     };
 
     const validGen = parseInt(countData.valid_generated, 10);
@@ -139,6 +144,7 @@ export async function getCampaignsPage(
     const withdrawn = parseInt(countData.withdrawn || '0', 10);
     const pendProcJobs = parseInt(countData.pending_processing_jobs, 10);
     const failJobs = parseInt(countData.failed_jobs, 10);
+    const recordedCost = Number(countData.recorded_cost) || 0;
 
     const internalId = `Campaña ${String(c.internal_number).padStart(3, '0')}`;
     const publicUrl = `${appBaseUrl.replace(/\/+$/, '')}/comment/${c.slug}`;
@@ -190,6 +196,7 @@ export async function getCampaignsPage(
       pendingProcessingJobsCount: pendProcJobs,
       failedJobsCount: failJobs,
       hasUnresolvedFailedCycle: countData.has_failed_cycle,
+      recordedCost,
       withdrawnCount: withdrawn,
       createdAt: new Date(c.created_at).toISOString(),
     });

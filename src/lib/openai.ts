@@ -145,7 +145,7 @@ Output JSON matching the schema: allowed (boolean), category (short string), rea
     };
   } catch (error: unknown) {
     await queryDb(`UPDATE generation_api_calls SET status='failed',failure_kind='provider_error',finished_at=NOW() WHERE call_key=$1`, [callKey]);
-    throw new Error(`OpenAI Safety Preflight error: ${error instanceof Error ? error.message : 'Unknown API error'}`);
+    return locallySanitizeCampaignSafety(postsText, direction);
   }
 }
 

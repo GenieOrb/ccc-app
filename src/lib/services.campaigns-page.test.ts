@@ -27,4 +27,29 @@ describe('getCampaignsPage', () => {
     const campaignQuery = queryDb.mock.calls.find(([sql]) => String(sql).includes('ORDER BY internal_number DESC'));
     expect(campaignQuery?.[1]).toEqual([1, 0]);
   });
+
+  it('includes accumulated recorded costs from usage metrics and API calls', async () => {
+    queryDb.mockImplementation(async (sql: string) => {
+      if (sql.includes('COUNT(*) AS total')) return [{ total: '1' }];
+      if (sql.includes('FROM campaigns')) return [{
+        id: 'campaign-1', internal_number: 1, slug: 'slug', campaign_type: 'manual', post_active_lifetime_hours: null,
+        direction: null, display_name: null, model_key: 'gpt-5.4', is_active: true, safety_allowed: true,
+        safety_category: null, safety_reason: null, initial_size: 1, created_at: new Date('2026-01-01T00:00:00Z'),
+      }];
+      if (sql.includes('FROM campaign_posts')) return [];
+      if (sql.includes('FROM generation_usage_metrics')) return [{
+        valid_generated: '1', available: '1', assigned: '0', withdrawn: '0', pending_processing_jobs: '0', failed_jobs: '0',
+        has_failed_cycle: false, recorded_cost: '0.12500000',
+      }];
+      if (sql.includes('FROM campaign_accounts')) return [];
+      throw new Error(`Unexpected query: ${sql}`);
+    });
+
+    const result = await getCampaignsPage('https://app.example', 1, 10);
+
+    expect(result.items[0].recordedCost).toBe(0.125);
+    const costQuery = queryDb.mock.calls.find(([sql]) => String(sql).includes('generation_usage_metrics'))?.[0] as string;
+    expect(costQuery).toContain('generation_api_calls');
+    expect(costQuery).toContain('estimated_cost IS NOT NULL');
+  });
 });

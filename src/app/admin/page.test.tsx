@@ -10,6 +10,7 @@ const campaign = {
   displayName: 'Campaña de prueba', modelKey: 'gpt-5.4', isActive: true, safetyAllowed: true, xPosts: [], campaignType: 'manual', xAccounts: [],
   generationProgress: 0, validGeneratedCount: 0, availableCount: 0, assignedCount: 0, withdrawnCount: 0,
   pendingProcessingJobsCount: 0, failedJobsCount: 0, hasUnresolvedFailedCycle: false, createdAt: new Date().toISOString(),
+  recordedCost: 0.125,
 };
 
 function json(body: unknown, ok = true) { return { ok, status: ok ? 200 : 400, json: async () => body }; }
@@ -37,6 +38,12 @@ describe('administration campaign cards', () => {
     await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/preview'))).toBe(true));
     fireEvent.click(arrow);
     expect(arrow.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('shows the campaign accumulated recorded cost', async () => {
+    render(<AdminDashboardPage />);
+    expect(await screen.findByText('Coste registrado')).toBeTruthy();
+    expect(screen.getByText('$0.12500000')).toBeTruthy();
   });
 
   it('uses the persisted toggle response and does not change expansion', async () => {

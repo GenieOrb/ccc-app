@@ -45,6 +45,16 @@ describe('bounded provider requests', () => {
     expect(responsesParse.mock.calls[0][1]).toEqual({ timeout: 321, maxRetries: 0 });
   });
 
+  it('records a provider failure and applies local safety screening instead of throwing', async () => {
+    responsesParse.mockRejectedValue(new Error('provider unavailable'));
+
+    await expect(checkCampaignSafety(['A harmless post'], 'be constructive')).resolves.toMatchObject({
+      allowed: true,
+      category: 'local_safety_screen',
+    });
+    expect(queryDb.mock.calls.some(([sql]) => String(sql).includes("status='failed',failure_kind='provider_error'"))).toBe(true);
+  });
+
   it('disables retries and applies the worker generation timeout', async () => {
     chatCreate.mockResolvedValue({
       choices: [{ message: { content: '{"comment":"Useful response"}' } }],

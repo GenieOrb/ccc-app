@@ -35,6 +35,7 @@ export interface CampaignSummary {
   pendingProcessingJobsCount: number;
   failedJobsCount: number;
   hasUnresolvedFailedCycle: boolean;
+  recordedCost: number;
   createdAt: string;
 }
 
@@ -485,6 +486,10 @@ function CampaignCardItem({
           <span className="stat-value" style={{ color: c.failedJobsCount > 0 ? 'var(--peach-accent)' : 'inherit' }}>
             {c.failedJobsCount}
           </span>
+        </div>
+        <div className="stat-item">
+          <span className="stat-label">Coste registrado</span>
+          <span className="stat-value">${c.recordedCost.toFixed(8)}</span>
         </div>
       </div>
 
