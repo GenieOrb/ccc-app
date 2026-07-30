@@ -67,6 +67,162 @@ try {
   );
   const accountId = account.rows[0].id;
   if (account.rows[0].initial_sync_pending !== true) throw new Error('campaign_accounts initial_sync_pending must default to true.');
+  const legacyAmbiguousCursorAdvance = `
+    UPDATE campaign_accounts
+    SET last_seen_post_id = CASE
+      WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
+      ELSE last_seen_post_id
+    END
+    WHERE id = $2
+    RETURNING last_seen_post_id
+  `;
+  const nullableCompletionCursorAdvance = `
+    UPDATE campaign_accounts
+    SET last_seen_post_id = CASE
+      WHEN $1::TEXT IS NOT NULL
+        AND (last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+        THEN $1::TEXT
+      ELSE last_seen_post_id
+    END,
+    initial_sync_pending = false
+    WHERE id = $2
+    RETURNING last_seen_post_id, initial_sync_pending
+  `;
+  const recoveryCursorAdvance = `
+    UPDATE campaign_accounts
+    SET last_seen_post_id = CASE
+      WHEN last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1::TEXT
+      ELSE last_seen_post_id
+    END
+    WHERE id = $2
+    RETURNING last_seen_post_id
+  `;
+  const ongoingCursorAdvance = `
+    UPDATE campaign_accounts
+    SET last_seen_post_id = $1::TEXT
+    WHERE id = $2
+      AND (last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+    RETURNING last_seen_post_id
+  `;
+  await testClient.query('BEGIN');
+  try {
+    await testClient.query(
+      `INSERT INTO campaign_posts (campaign_id,campaign_account_id,x_post_id,input_url,canonical_url,text_content)
+      VALUES ($1,$2,'cursor-contract-rollback','https://x.com/db_author/status/cursor-contract','https://x.com/db_author/status/cursor-contract','cursor transaction contract')`,
+      [campaignId, accountId],
+    );
+    await testClient.query(legacyAmbiguousCursorAdvance, ['1000', accountId]);
+    await testClient.query('ROLLBACK');
+    throw new Error('legacy ambiguous cursor CASE must fail with PostgreSQL 42804.');
+  } catch (error) {
+    await testClient.query('ROLLBACK');
+    if (error.code !== '42804') throw error;
+  }
+  const partialRows = await testClient.query(
+    `SELECT count(*)::int AS count FROM campaign_posts WHERE campaign_account_id=$1 AND x_post_id='cursor-contract-rollback'`,
+    [accountId],
+  );
+  if (partialRows.rows[0].count !== 0) throw new Error('cursor update failure must roll back every partial post insert.');
+  console.log('cursor contract rollback verified: PostgreSQL 42804 and partial rows=0');
+
+  await testClient.query('BEGIN');
+  try {
+    const committedPost = await testClient.query(
+      `INSERT INTO campaign_posts (campaign_id,campaign_account_id,x_post_id,input_url,canonical_url,text_content)
+       VALUES ($1,$2,'cursor-contract-commit','https://x.com/db_author/status/cursor-contract-commit','https://x.com/db_author/status/cursor-contract-commit','cursor commit contract')
+       RETURNING id`,
+      [campaignId, accountId],
+    );
+    const committedCycle = await testClient.query(
+      `INSERT INTO generation_cycles (campaign_id,campaign_post_id,cycle_type,target_count,status,model_key,model_name)
+       VALUES ($1,$2,'initial',1,'pending','gpt-5.4','gpt-5.4')
+       RETURNING id`,
+      [campaignId, committedPost.rows[0].id],
+    );
+    await testClient.query(
+      `INSERT INTO generation_jobs (cycle_id,campaign_id,campaign_post_id,slot_index,slot_plan,length_mode,emoji_policy,rhetorical_form,texture,status,model_name,prompt_version)
+       VALUES ($1,$2,$3,0,'{}','ultra_short','no_emoji','statement','plain','pending','gpt-5.4',1)`,
+      [committedCycle.rows[0].id, campaignId, committedPost.rows[0].id],
+    );
+    const committedCursor = await testClient.query(nullableCompletionCursorAdvance, ['2000', accountId]);
+    if (
+      committedCursor.rowCount !== 1
+      || committedCursor.rows[0].last_seen_post_id !== '2000'
+      || committedCursor.rows[0].initial_sync_pending !== false
+    ) {
+      throw new Error('nullable completion cursor must advance as TEXT inside the durable transaction.');
+    }
+    await testClient.query('COMMIT');
+  } catch (error) {
+    await testClient.query('ROLLBACK');
+    throw error;
+  }
+  const committedChain = await testClient.query(
+    `SELECT
+       (SELECT count(*)::int FROM campaign_posts WHERE campaign_account_id=$1 AND x_post_id='cursor-contract-commit') AS post_count,
+       (SELECT count(*)::int FROM generation_cycles gc
+        JOIN campaign_posts cp ON cp.id=gc.campaign_post_id
+        WHERE cp.campaign_account_id=$1 AND cp.x_post_id='cursor-contract-commit') AS cycle_count,
+       (SELECT count(*)::int FROM generation_jobs gj
+        JOIN campaign_posts cp ON cp.id=gj.campaign_post_id
+        WHERE cp.campaign_account_id=$1 AND cp.x_post_id='cursor-contract-commit') AS job_count,
+       ca.last_seen_post_id,
+       pg_typeof(ca.last_seen_post_id)::text AS cursor_type,
+       ca.initial_sync_pending
+     FROM campaign_accounts ca
+     WHERE ca.id=$1`,
+    [accountId],
+  );
+  const committed = committedChain.rows[0];
+  if (
+    committedChain.rowCount !== 1
+    || committed.post_count !== 1
+    || committed.cycle_count !== 1
+    || committed.job_count !== 1
+    || committed.last_seen_post_id !== '2000'
+    || committed.cursor_type !== 'text'
+    || committed.initial_sync_pending !== false
+  ) {
+    throw new Error('cursor transaction must commit exactly one post, cycle, job, and TEXT cursor.');
+  }
+
+  const nullCompletionCursor = await testClient.query(nullableCompletionCursorAdvance, [null, accountId]);
+  if (
+    nullCompletionCursor.rowCount !== 1
+    || nullCompletionCursor.rows[0].last_seen_post_id !== '2000'
+    || nullCompletionCursor.rows[0].initial_sync_pending !== false
+  ) {
+    throw new Error('nullable completion cursor must retain its durable TEXT cursor for a null candidate.');
+  }
+  const recoveryAdvance = await testClient.query(recoveryCursorAdvance, ['2100', accountId]);
+  if (recoveryAdvance.rowCount !== 1 || recoveryAdvance.rows[0].last_seen_post_id !== '2100') {
+    throw new Error('recovery CASE cursor must advance to the greater TEXT post id.');
+  }
+  const recoveryNonRegression = await testClient.query(recoveryCursorAdvance, ['2050', accountId]);
+  if (recoveryNonRegression.rowCount !== 1 || recoveryNonRegression.rows[0].last_seen_post_id !== '2100') {
+    throw new Error('recovery CASE cursor must return one row without regressing.');
+  }
+  const ongoingAdvance = await testClient.query(ongoingCursorAdvance, ['2200', accountId]);
+  if (ongoingAdvance.rowCount !== 1 || ongoingAdvance.rows[0].last_seen_post_id !== '2200') {
+    throw new Error('ongoing direct cursor must advance to the greater TEXT post id.');
+  }
+  const ongoingNonRegression = await testClient.query(ongoingCursorAdvance, ['2150', accountId]);
+  if (ongoingNonRegression.rowCount !== 0) throw new Error('ongoing direct cursor must update no row for an older post id.');
+  const finalCursor = await testClient.query(
+    `SELECT last_seen_post_id, pg_typeof(last_seen_post_id)::text AS cursor_type FROM campaign_accounts WHERE id=$1`,
+    [accountId],
+  );
+  if (
+    finalCursor.rowCount !== 1
+    || finalCursor.rows[0].last_seen_post_id !== '2200'
+    || finalCursor.rows[0].cursor_type !== 'text'
+  ) {
+    throw new Error('all cursor forms must preserve the exact non-regressing TEXT cursor.');
+  }
+  await testClient.query(
+    `UPDATE campaign_accounts SET initial_sync_pending=true, last_seen_post_id=NULL WHERE id=$1`,
+    [accountId],
+  );
   const perpetualPostInsert = `
     INSERT INTO campaign_posts (campaign_id,campaign_account_id,x_post_id,input_url,canonical_url,text_content)
     VALUES ($1,$2,$3,$4,$4,'perpetual upsert contract')

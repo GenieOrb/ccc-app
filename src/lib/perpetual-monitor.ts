@@ -268,8 +268,8 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
           `UPDATE campaign_accounts
            SET last_seen_post_id = CASE
                  WHEN $1::TEXT IS NOT NULL
-                  AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
-                 THEN $1
+                  AND (last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+                 THEN $1::TEXT
                  ELSE last_seen_post_id
                END,
                initial_sync_pending = false
@@ -310,16 +310,16 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
               isInitialRecovery
                 ? `UPDATE campaign_accounts
                    SET last_seen_post_id = CASE
-                         WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
+                         WHEN last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1::TEXT
                          ELSE last_seen_post_id
                         END
                    WHERE id = $2 AND initial_sync_pending = true
                      AND poll_lease_owner = $3::UUID
                      AND poll_lease_expires_at > NOW()
                    RETURNING id`
-                : `UPDATE campaign_accounts SET last_seen_post_id = $1
+                : `UPDATE campaign_accounts SET last_seen_post_id = $1::TEXT
                    WHERE id = $2
-                     AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+                     AND (last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
                      AND poll_lease_owner = $3::UUID
                      AND poll_lease_expires_at > NOW()
                    RETURNING id`,
@@ -373,16 +373,16 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
                   recoveringUnderLock
                     ? `UPDATE campaign_accounts
                        SET last_seen_post_id = CASE
-                             WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
+                             WHEN last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1::TEXT
                              ELSE last_seen_post_id
                             END
                        WHERE id = $2
                          AND poll_lease_owner = $3::UUID
                          AND poll_lease_expires_at > NOW()
                        RETURNING id`
-                    : `UPDATE campaign_accounts SET last_seen_post_id = $1
+                    : `UPDATE campaign_accounts SET last_seen_post_id = $1::TEXT
                        WHERE id = $2
-                         AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+                         AND (last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
                          AND poll_lease_owner = $3::UUID
                          AND poll_lease_expires_at > NOW()
                        RETURNING id`,
@@ -423,16 +423,16 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
                   recoveringUnderLock
                     ? `UPDATE campaign_accounts
                        SET last_seen_post_id = CASE
-                             WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
+                             WHEN last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1::TEXT
                              ELSE last_seen_post_id
                             END
                        WHERE id = $2
                          AND poll_lease_owner = $3::UUID
                          AND poll_lease_expires_at > NOW()
                        RETURNING id`
-                    : `UPDATE campaign_accounts SET last_seen_post_id = $1
+                    : `UPDATE campaign_accounts SET last_seen_post_id = $1::TEXT
                        WHERE id = $2
-                         AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+                         AND (last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
                          AND poll_lease_owner = $3::UUID
                          AND poll_lease_expires_at > NOW()
                        RETURNING id`,
@@ -448,16 +448,16 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
               recoveringUnderLock
                 ? `UPDATE campaign_accounts
                    SET last_seen_post_id = CASE
-                         WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
+                         WHEN last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1::TEXT
                          ELSE last_seen_post_id
                         END
                    WHERE id = $2
                      AND poll_lease_owner = $3::UUID
                      AND poll_lease_expires_at > NOW()
                    RETURNING id`
-                : `UPDATE campaign_accounts SET last_seen_post_id = $1
+                : `UPDATE campaign_accounts SET last_seen_post_id = $1::TEXT
                    WHERE id = $2
-                     AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+                     AND (last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
                      AND poll_lease_owner = $3::UUID
                      AND poll_lease_expires_at > NOW()
                    RETURNING id`,
@@ -489,8 +489,8 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
             `UPDATE campaign_accounts
              SET last_seen_post_id = CASE
                    WHEN $1::TEXT IS NOT NULL
-                    AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
-                   THEN $1
+                    AND (last_seen_post_id IS NULL OR CAST($1::TEXT AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+                   THEN $1::TEXT
                    ELSE last_seen_post_id
                  END,
                  initial_sync_pending = false
