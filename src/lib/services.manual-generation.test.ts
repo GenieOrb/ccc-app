@@ -54,7 +54,7 @@ describe('manual campaign generation inventory', () => {
     );
   });
 
-  it('creates an inactive initial 30-job cycle for every inserted post', async () => {
+  it('creates an active initial 30-job cycle for every inserted post', async () => {
     parseMultipleXUrls.mockReturnValue([{ postId: 'one' }, { postId: 'two' }]);
     fetchXPosts.mockResolvedValue([post('one'), post('two')]);
     checkCampaignSafety.mockResolvedValue({ allowed: true, category: 'safe', reason: 'ok' });
@@ -75,7 +75,7 @@ describe('manual campaign generation inventory', () => {
     await createCampaign({ urlsInput: 'two posts' });
 
     const campaignInsert = queries.find(({ sql }) => sql.includes('INSERT INTO campaigns'))!;
-    expect(campaignInsert.sql.replace(/\s+/g, ' ')).toContain("NULL, false, true");
+    expect(campaignInsert.sql.replace(/\s+/g, ' ')).toContain("NULL, true, true");
     const cycles = queries.filter(({ sql }) => sql.includes('INSERT INTO generation_cycles'));
     expect(cycles).toHaveLength(2);
     expect(cycles.map(({ params }) => params?.slice(0, 2))).toEqual([
@@ -108,6 +108,14 @@ describe('manual campaign generation inventory', () => {
     const jobs = queries.filter(({ sql }) => sql.includes('INSERT INTO generation_jobs'));
     expect(jobs).toHaveLength(10);
     expect(jobs.every(({ params }) => params?.[2] === 'depleted-post')).toBe(true);
+  });
+
+  it('does not replenish an inactive manual campaign', async () => {
+    queryDb.mockResolvedValueOnce([]);
+
+    await triggerReplenishmentIfNeeded('campaign-1');
+
+    expect(withTransaction).not.toHaveBeenCalled();
   });
 
   it('refuses activation while any manual initial cycle is incomplete', async () => {

@@ -334,17 +334,23 @@ async function executeJobTask(
         [job.jobId, workerId],
       );
       if (leaseRes.rows.length === 0) return;
-      // Re-check both publication and campaign status under transaction.  A
-      // job may have been leased just before an administrator deactivated its
-      // campaign, so it must never publish inventory after that transition.
+      // Re-check publication and the same campaign eligibility used to claim
+      // the job.  Legacy inactive manual initial cycles must finish, while
+      // inactive replenishment cycles remain ineligible.
       const postLockRes = await client.query(
         `SELECT 1
          FROM campaign_posts p
          JOIN campaigns c ON c.id = p.campaign_id
-         WHERE p.id = $1 AND c.is_active = true AND p.retired_at IS NULL
+         JOIN generation_cycles cy ON cy.id = $2
+         WHERE p.id = $1
+           AND (
+             c.is_active = true
+             OR (c.campaign_type = 'manual' AND cy.cycle_type = 'initial')
+           )
+           AND p.retired_at IS NULL
            AND (p.expires_at IS NULL OR p.expires_at > NOW())
          FOR SHARE`,
-        [job.campaignPostId]
+        [job.campaignPostId, job.cycleId]
       );
 
       if (postLockRes.rows.length === 0) {

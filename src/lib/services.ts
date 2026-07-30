@@ -241,7 +241,7 @@ export async function createCampaign(params: {
          slug, campaign_type, direction, post_active_lifetime_hours, is_active, safety_allowed, safety_category, safety_reason,
          initial_size, replenishment_threshold, replenishment_size, display_name, model_key
        ) VALUES (
-         $1, 'manual', $2, NULL, false, true, $3, $4, 30, 5, 10, $5, $6
+         $1, 'manual', $2, NULL, true, true, $3, $4, 30, 5, 10, $5, $6
        ) RETURNING id`,
       [slug, params.direction || null, safetyResult.category, safetyResult.reason, displayName, model.key]
     );
