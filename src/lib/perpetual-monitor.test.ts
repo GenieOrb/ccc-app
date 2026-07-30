@@ -47,7 +47,7 @@ describe('processPerpetualCampaigns', () => {
     expect(checkCampaignSafety).toHaveBeenCalledWith(['Fresh post'], undefined, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number));
     expect(transactionalSql.filter((sql) => sql.includes('INSERT INTO generation_jobs'))).toHaveLength(30);
     expect(transactionalSql.some((sql) => sql.includes('INSERT INTO generation_cycles'))).toBe(true);
-    expect(transactionalSql.some((sql) => sql.includes('initial_sync_pending = false'))).toBe(true);
+    expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('initial_sync_pending = false'))).toBe(true);
     expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('last_polled_at = NOW(), initial_sync_pending = false'))).toBe(false);
   });
 
@@ -61,7 +61,7 @@ describe('processPerpetualCampaigns', () => {
     expect(result.postsExpired).toBe(0);
   });
 
-  it('recovers the newest still-eligible post when a newer fetched post is expired', async () => {
+  it('recovers every still-eligible original when a newer fetched post is expired', async () => {
     const expiredNewer = { ...freshPost, postId: '999', postedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString() };
     fetchNewXPostsForAccount.mockResolvedValue([freshPost, expiredNewer]);
 
@@ -70,6 +70,21 @@ describe('processPerpetualCampaigns', () => {
     expect(result.postsImported).toBe(1);
     const postInsert = transactionalSql.find((sql) => sql.includes('INSERT INTO campaign_posts'));
     expect(postInsert).toBeDefined();
+  });
+
+  it('imports all eligible initial originals before advancing the cursor and completing recovery', async () => {
+    const laterFreshPost = { ...freshPost, postId: '901', textContent: 'Later fresh post', postedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString() };
+    fetchNewXPostsForAccount.mockResolvedValue([freshPost, laterFreshPost]);
+
+    const result = await processPerpetualCampaigns(10_000);
+
+    expect(result.postsImported).toBe(2);
+    expect(result.cyclesCreated).toBe(2);
+    expect(checkCampaignSafety).toHaveBeenCalledTimes(2);
+    expect(transactionalSql.filter((sql) => sql.includes('INSERT INTO campaign_posts'))).toHaveLength(2);
+    const completionWrites = queryDb.mock.calls.filter(([sql]) => String(sql).includes('initial_sync_pending = false'));
+    expect(completionWrites).toHaveLength(1);
+    expect(completionWrites[0][1]).toEqual(['901', 'account-1']);
   });
 
   it('uses initial_sync_pending rather than a pre-existing cursor for the initial recovery', async () => {
@@ -82,7 +97,7 @@ describe('processPerpetualCampaigns', () => {
     expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number));
     expect(result.postsImported).toBe(1);
     expect(transactionalSql.some((sql) => sql.includes('INSERT INTO campaign_posts'))).toBe(true);
-    expect(transactionalSql.some((sql) => sql.includes('initial_sync_pending = false'))).toBe(true);
+    expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('initial_sync_pending = false'))).toBe(true);
   });
 
   it('retains initial_sync_pending when durable recovery fails despite an advanced cursor', async () => {
@@ -132,7 +147,7 @@ describe('processPerpetualCampaigns', () => {
 
     expect(result.postsImported).toBe(1);
     expect(transactionalSql.some((sql) => sql.includes('INSERT INTO campaign_posts'))).toBe(true);
-    expect(transactionalSql.some((sql) => sql.includes('initial_sync_pending = false'))).toBe(true);
+    expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('initial_sync_pending = false'))).toBe(true);
     now.mockRestore();
   });
 

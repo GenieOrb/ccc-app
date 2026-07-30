@@ -41,7 +41,7 @@ async function handleProcess(req: Request) {
   try {
     const startPerpetual = Date.now();
     // Le damos 15 segundos al monitor de campañas perpetuas
-    const perpetualResult = await processPerpetualCampaigns(15000);
+    const perpetualResult = await processPerpetualCampaigns(30000);
     const replenishmentResult = await reconcileCampaignReplenishment();
 
     // El worker puede usar el resto del tiempo hasta llegar cerca de los 60s

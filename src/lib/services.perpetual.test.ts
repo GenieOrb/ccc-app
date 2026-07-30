@@ -40,7 +40,7 @@ describe('createPerpetualCampaign initial synchronization', () => {
     expect(accountInsertSql.replace(/\s+/g, ' ').trim()).toMatch(
       /INSERT INTO campaign_accounts \( campaign_id, username, username_normalized \) VALUES \(\$1, \$2, \$3\) RETURNING id$/,
     );
-    expect(processPerpetualCampaigns).toHaveBeenCalledWith({ campaignId: 'campaign-1', accountIds: ['account-1'], timeBudgetMs: 12_000 });
+    expect(processPerpetualCampaigns).toHaveBeenCalledWith({ campaignId: 'campaign-1', accountIds: ['account-1'], timeBudgetMs: 30_000 });
 
     resolveSync({ accountsProcessed: 1, postsDetected: 1, postsImported: 1, postsRejected: 0, postsExpired: 0, cyclesCreated: 1, errors: [] });
     await expect(pending).resolves.toMatchObject({ id: 'campaign-1', slug: 'new-slug', initialSync: { postsImported: 1 } });

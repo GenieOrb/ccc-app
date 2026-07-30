@@ -136,7 +136,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
       }
 
       // The durable flag, not the incidental cursor value, defines whether this
-      // account is still performing its one-post initial recovery.  A cursor can
+      // account is still performing its initial recovery. A cursor can
       // have been advanced by a partial prior attempt, while the flag remains
       // pending until a whole polling pass succeeds.
       if (!hasIoTimeRemaining()) break;
@@ -154,9 +154,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
         continue;
       }
       const fetchedPosts = Array.isArray(timelineResult) ? timelineResult : timelineResult.posts;
-      // Initial recovery imports at most one post, but eligibility must be
-      // decided before choosing the newest Snowflake: a newer expired post
-      // must not hide an older post that is still within its lifetime.
+      // Initial recovery imports every original post still within its lifetime.
       const initialEligiblePosts = isInitialRecovery
         ? fetchedPosts.filter((post) => {
             if (!account.post_active_lifetime_hours || !post.postedAt) return true;
@@ -164,9 +162,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
             return !Number.isNaN(postedAt.getTime()) && postedAt.getTime() + account.post_active_lifetime_hours * 3600 * 1000 > Date.now();
           })
         : fetchedPosts;
-      const newPosts = isInitialRecovery && initialEligiblePosts.length > 1
-        ? [initialEligiblePosts.reduce((latest, post) => BigInt(post.postId) > BigInt(latest.postId) ? post : latest)]
-        : initialEligiblePosts;
+      const newPosts = initialEligiblePosts;
 
       if (isInitialRecovery && newPosts.length === 0) {
         const highestExpiredPostId = fetchedPosts.length > 0
@@ -189,9 +185,13 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
       if (newPosts.length > 0) {
         summary.postsDetected += newPosts.length;
         let highestPostId = account.last_seen_post_id;
+        let completedInitialRecovery = isInitialRecovery;
 
         for (const post of newPosts) {
-          if (!hasIoTimeRemaining()) break;
+          if (!hasIoTimeRemaining()) {
+            completedInitialRecovery = false;
+            break;
+          }
           // Once safety has completed, this transaction is the durable
           // consequence of that decision. Do not strand a reviewed post just
           // because the deadline passed while the safety check was in flight.
@@ -210,8 +210,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
                    SET last_seen_post_id = CASE
                          WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
                          ELSE last_seen_post_id
-                       END,
-                       initial_sync_pending = false
+                        END
                    WHERE id = $2 AND initial_sync_pending = true`
                 : 'UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))',
               [highestPostId, account.id],
@@ -259,8 +258,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
                        SET last_seen_post_id = CASE
                              WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
                              ELSE last_seen_post_id
-                           END,
-                           initial_sync_pending = false
+                            END
                        WHERE id = $2`
                     : 'UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))',
                   [highestPostId, account.id]
@@ -307,13 +305,30 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
                    SET last_seen_post_id = CASE
                          WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
                          ELSE last_seen_post_id
-                       END,
-                       initial_sync_pending = false
+                        END
                    WHERE id = $2`
                 : 'UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))',
               [highestPostId, account.id],
             );
           });
+        }
+
+        // Partial initial batches are retried from the beginning. Only after
+        // every fetched eligible original has been durably handled may the
+        // independent completion flag be cleared.
+        if (isInitialRecovery && completedInitialRecovery) {
+          await queryDb(
+            `UPDATE campaign_accounts
+             SET last_seen_post_id = CASE
+                   WHEN $1::TEXT IS NOT NULL
+                    AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+                   THEN $1
+                   ELSE last_seen_post_id
+                 END,
+                 initial_sync_pending = false
+             WHERE id = $2 AND initial_sync_pending = true`,
+            [highestPostId, account.id],
+          );
         }
       }
 

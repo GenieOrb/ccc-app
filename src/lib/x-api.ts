@@ -535,10 +535,9 @@ export async function fetchNewXPostsForAccount(
     return new Date(a.postedAt).getTime() - new Date(b.postedAt).getTime();
   });
 
-  // A first recovery intentionally inspects only its first page: it imports
-  // one newest eligible post, rather than backfilling history. Ongoing polls
-  // drain a bounded number of pages under the caller's remaining time budget.
-  const nextToken = sincePostId ? data.meta?.next_token : undefined;
+  // Initial recovery scans the same bounded page window as an ongoing poll so
+  // older eligible originals are not skipped before completion is persisted.
+  const nextToken = data.meta?.next_token;
   if (nextToken) {
     if (remainingPages <= 1) return { posts: validPosts, complete: false };
     const elapsedMs = Date.now() - requestStartedAt;

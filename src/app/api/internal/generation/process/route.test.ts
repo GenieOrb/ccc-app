@@ -21,7 +21,7 @@ describe('internal generation cron route', () => {
     const response = await POST(new Request('http://localhost/api/internal/generation/process', { headers: { authorization: 'Bearer cron-only-secret' } }));
 
     expect(response.status).toBe(200);
-    expect(processPerpetualCampaigns).toHaveBeenCalledWith(15000);
+    expect(processPerpetualCampaigns).toHaveBeenCalledWith(30000);
     expect(reconcileCampaignReplenishment).toHaveBeenCalledOnce();
     expect(processBackgroundQueue).toHaveBeenCalledTimes(1);
   });

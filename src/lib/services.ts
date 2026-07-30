@@ -902,7 +902,7 @@ export async function createPerpetualCampaign(params: {
   const initialSync = await processPerpetualCampaigns({
     campaignId: created.id,
     accountIds: created.accountIds,
-    timeBudgetMs: 12_000,
+    timeBudgetMs: 30_000,
   });
   return { id: created.id, slug: created.slug, initialSync };
 }
@@ -1042,7 +1042,7 @@ export async function addAccountsToCampaign(campaignId: string, accountsInput: s
     return addedAccounts;
   });
   const initialSync = addedAccounts.length > 0
-    ? await processPerpetualCampaigns({ campaignId, accountIds: addedAccounts.map((account) => account.id), timeBudgetMs: 12_000 })
+    ? await processPerpetualCampaigns({ campaignId, accountIds: addedAccounts.map((account) => account.id), timeBudgetMs: 30_000 })
     : { accountsProcessed: 0, postsDetected: 0, postsImported: 0, postsRejected: 0, postsExpired: 0, cyclesCreated: 0, errors: [] };
   return { addedAccounts, initialSync };
 }
