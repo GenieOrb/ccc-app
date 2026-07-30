@@ -48,6 +48,13 @@ export interface CampaignSummary {
     isRemoved: boolean;
     createdAt: string;
     removedAt?: string;
+    lastCheckpoint?: {
+      phase: string;
+      severity: 'info' | 'warning' | 'error';
+      createdAt: string;
+      errorCode?: string;
+      errorMessage?: string;
+    };
   }[];
   withdrawnCount: number;
   createdAt: string;
@@ -157,11 +164,26 @@ export async function getCampaignsPage(
       username_normalized: string;
       created_at: string;
       removed_at: string | null;
+      checkpoint_phase: string | null;
+      checkpoint_severity: 'info' | 'warning' | 'error' | null;
+      checkpoint_created_at: string | null;
+      checkpoint_error_code: string | null;
+      checkpoint_error_message: string | null;
     }>(
-      `SELECT id, username, username_normalized, created_at, removed_at 
-       FROM campaign_accounts 
-       WHERE campaign_id = $1 
-       ORDER BY created_at ASC`,
+      `SELECT ca.id, ca.username, ca.username_normalized, ca.created_at, ca.removed_at,
+              checkpoint.phase AS checkpoint_phase, checkpoint.severity AS checkpoint_severity,
+              checkpoint.created_at AS checkpoint_created_at, checkpoint.error_code AS checkpoint_error_code,
+              checkpoint.error_message AS checkpoint_error_message
+       FROM campaign_accounts ca
+       LEFT JOIN LATERAL (
+         SELECT phase, severity, created_at, error_code, error_message
+         FROM perpetual_sync_checkpoints
+         WHERE campaign_account_id = ca.id
+         ORDER BY created_at DESC
+         LIMIT 1
+       ) checkpoint ON true
+       WHERE ca.campaign_id = $1
+       ORDER BY ca.created_at ASC`,
       [c.id]
     );
 
@@ -187,7 +209,14 @@ export async function getCampaignsPage(
         usernameNormalized: a.username_normalized,
         isRemoved: a.removed_at !== null,
         createdAt: new Date(a.created_at).toISOString(),
-        removedAt: a.removed_at ? new Date(a.removed_at).toISOString() : undefined
+        removedAt: a.removed_at ? new Date(a.removed_at).toISOString() : undefined,
+        lastCheckpoint: a.checkpoint_phase && a.checkpoint_severity && a.checkpoint_created_at ? {
+          phase: a.checkpoint_phase,
+          severity: a.checkpoint_severity,
+          createdAt: new Date(a.checkpoint_created_at).toISOString(),
+          errorCode: a.checkpoint_error_code || undefined,
+          errorMessage: a.checkpoint_error_message || undefined,
+        } : undefined,
       })),
       generationProgress: progress,
       validGeneratedCount: validGen,

@@ -35,6 +35,32 @@ interface AccountRow {
   model_key: string;
 }
 
+type CheckpointPhase = 'monitor' | 'account' | 'x_timeline' | 'post_selection' | 'safety' | 'db_import' | 'cycle' | 'jobs' | 'cursor' | 'completed' | 'failed';
+type CheckpointDetails = Record<string, boolean | number>;
+
+// The audit payload intentionally accepts no post content, URLs, provider
+// responses, or raw errors. Checkpoint persistence is always outside imports.
+async function writeCheckpoint(
+  account: Pick<AccountRow, 'id' | 'campaign_id'>,
+  runId: string,
+  phase: CheckpointPhase,
+  severity: 'info' | 'warning' | 'error' = 'info',
+  details: CheckpointDetails = {},
+  errorCode?: string,
+  errorMessage?: string,
+) {
+  try {
+    await queryDb(
+      `INSERT INTO perpetual_sync_checkpoints
+       (campaign_id, campaign_account_id, run_id, phase, severity, details, error_code, error_message)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)`,
+      [account.campaign_id, account.id, runId, phase, severity, JSON.stringify(details), errorCode ?? null, errorMessage ?? null],
+    );
+  } catch {
+    // Do not fail monitoring during a rolling migration or an audit DB outage.
+  }
+}
+
 export async function processPerpetualCampaigns(options: number | PerpetualMonitorOptions = 20000): Promise<PerpetualMonitorSummary> {
   const { timeBudgetMs = 20000, campaignId, accountIds } = typeof options === 'number'
     ? { timeBudgetMs: options }
@@ -48,6 +74,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
     cyclesCreated: 0,
     errors: [],
   };
+  const runId = randomUUID();
 
   const startTime = Date.now();
   const deadline = startTime + Math.max(0, timeBudgetMs);
@@ -121,8 +148,12 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
       break;
     }
 
+    let phase: CheckpointPhase = 'monitor';
     try {
       summary.accountsProcessed++;
+      await writeCheckpoint(account, runId, 'monitor', 'info', { scoped: Boolean(campaignId || accountIds?.length) });
+      phase = 'account';
+      await writeCheckpoint(account, runId, phase);
 
       let xUserId = account.x_user_id;
       if (!xUserId) {
@@ -141,6 +172,8 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
       // pending until a whole polling pass succeeds.
       if (!hasIoTimeRemaining()) break;
       const isInitialRecovery = account.initial_sync_pending;
+      phase = 'x_timeline';
+      await writeCheckpoint(account, runId, phase);
       const timelineResult = await fetchNewXPostsForAccount(
         xUserId,
         isInitialRecovery ? null : account.last_seen_post_id,
@@ -169,6 +202,8 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
       const newPosts = isInitialRecovery
         ? initialEligiblePosts.slice(-1)
         : initialEligiblePosts;
+      phase = 'post_selection';
+      await writeCheckpoint(account, runId, phase, 'info', { fetched: fetchedPosts.length, selected: newPosts.length, initialRecovery: isInitialRecovery });
 
       if (isInitialRecovery && newPosts.length === 0) {
         const highestExpiredPostId = fetchedPosts.length > 0
@@ -201,6 +236,8 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
           // Once safety has completed, this transaction is the durable
           // consequence of that decision. Do not strand a reviewed post just
           // because the deadline passed while the safety check was in flight.
+          phase = 'safety';
+          await writeCheckpoint(account, runId, phase);
           const safetyResult = await checkCampaignSafety(
             [post.textContent],
             account.direction || undefined,
@@ -224,6 +261,8 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
             continue;
           }
 
+          phase = 'db_import';
+          await writeCheckpoint(account, runId, phase);
           await withTransaction(async (client) => {
             const lockRes = await client.query<{ initial_sync_pending: boolean; last_seen_post_id: string | null; removed_at: Date | null; is_active: boolean }>(
               `SELECT ca.initial_sync_pending, ca.last_seen_post_id, ca.removed_at, c.is_active
@@ -257,7 +296,13 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
               // Recovery deliberately reaches backwards for the latest eligible
               // post, but an expired post must never create inventory or jobs.
               if (expiresAt && expiresAt <= new Date()) {
-                highestPostId = post.postId;
+          // These occur after the import transaction has committed, so audit
+          // writes are never rolled back together with imported data.
+          await writeCheckpoint(account, runId, 'cycle', 'info', { created: summary.cyclesCreated > 0 });
+          await writeCheckpoint(account, runId, 'jobs', 'info', { imported: summary.postsImported > 0 });
+          phase = 'cursor';
+          await writeCheckpoint(account, runId, phase);
+          highestPostId = post.postId;
                 await client.query(
                   recoveringUnderLock
                     ? `UPDATE campaign_accounts
@@ -339,10 +384,12 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
       }
 
       await queryDb('UPDATE campaign_accounts SET last_polled_at = NOW() WHERE id = $1', [account.id]);
+      await writeCheckpoint(account, runId, 'completed', 'info', { imported: summary.postsImported > 0 });
 
     } catch (error: unknown) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
       summary.errors.push(`Fallo parcial cuenta ${account.username}: ${errorMsg}`);
+      await writeCheckpoint(account, runId, 'failed', 'error', {}, `MONITOR_${phase.toUpperCase()}_FAILED`, `No se completó la fase ${phase}.`);
       try { await queryDb('UPDATE campaign_accounts SET last_polled_at = NOW() WHERE id = $1', [account.id]); } catch { /* Ignore secondary fail */ }
     }
   }

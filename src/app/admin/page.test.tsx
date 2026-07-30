@@ -46,6 +46,24 @@ describe('administration campaign cards', () => {
     expect(screen.getByText('$0.12500000')).toBeTruthy();
   });
 
+  it('shows the latest synchronization checkpoint for a perpetual X account', async () => {
+    const perpetual = {
+      ...campaign,
+      campaignType: 'perpetual' as const,
+      xAccounts: [{ id: 'account-1', username: 'author', usernameNormalized: 'author', isRemoved: false, createdAt: new Date().toISOString(), lastCheckpoint: { phase: 'completed', severity: 'error' as const, createdAt: new Date().toISOString(), errorCode: 'MONITOR_DB_IMPORT_FAILED' }}],
+    };
+    fetchMock.mockImplementation((input: string) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input.includes('/preview')) return Promise.resolve(json({ previews: [] }));
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [perpetual], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+    render(<AdminDashboardPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /expandir/i }));
+    expect((await screen.findByLabelText('Último checkpoint de @author')).textContent).toContain('completed');
+    expect(screen.getByText(/MONITOR_DB_IMPORT_FAILED/)).toBeTruthy();
+  });
+
   it('uses the persisted toggle response and does not change expansion', async () => {
     render(<AdminDashboardPage />);
     const arrow = await screen.findByRole('button', { name: /expandir/i });

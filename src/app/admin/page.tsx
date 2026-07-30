@@ -26,6 +26,13 @@ export interface CampaignSummary {
     isRemoved: boolean;
     createdAt: string;
     removedAt?: string;
+    lastCheckpoint?: {
+      phase: string;
+      severity: 'info' | 'warning' | 'error';
+      createdAt: string;
+      errorCode?: string;
+      errorMessage?: string;
+    };
   }[];
   generationProgress: number;
   validGeneratedCount: number;
@@ -409,6 +416,13 @@ function CampaignCardItem({
                     <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
                       Añadida: {new Date(acc.createdAt).toLocaleDateString()}
                     </span>
+                    {acc.lastCheckpoint && (
+                      <span aria-label={`Último checkpoint de @${acc.username}`} style={{ fontSize: '0.7rem', color: acc.lastCheckpoint.severity === 'error' ? 'var(--peach-accent)' : 'var(--text-muted)' }}>
+                        Sync: {acc.lastCheckpoint.phase} · {new Date(acc.lastCheckpoint.createdAt).toLocaleString()}
+                        {acc.lastCheckpoint.errorCode ? ` · ${acc.lastCheckpoint.errorCode}` : ''}
+                        {acc.lastCheckpoint.errorMessage ? `: ${acc.lastCheckpoint.errorMessage}` : ''}
+                      </span>
+                    )}
                   </div>
                   {acc.isRemoved ? (
                     <span style={{ fontSize: '0.75rem', color: 'var(--peach-accent)', fontWeight: 'bold', textAlign: 'right' }}>

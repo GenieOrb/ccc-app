@@ -49,6 +49,9 @@ describe('processPerpetualCampaigns', () => {
     expect(transactionalSql.some((sql) => sql.includes('INSERT INTO generation_cycles'))).toBe(true);
     expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('initial_sync_pending = false'))).toBe(true);
     expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('last_polled_at = NOW(), initial_sync_pending = false'))).toBe(false);
+    const checkpoints = queryDb.mock.calls.filter(([sql]) => String(sql).includes('INSERT INTO perpetual_sync_checkpoints'));
+    expect(checkpoints.some(([, args]) => Array.isArray(args) && args.includes('safety'))).toBe(true);
+    expect(JSON.stringify(checkpoints)).not.toContain(freshPost.textContent);
   });
 
   it('does not import an initial post already outside its active lifetime', async () => {
@@ -113,6 +116,8 @@ describe('processPerpetualCampaigns', () => {
     expect(transactionalSql.some((sql) => sql.includes('initial_sync_pending = false'))).toBe(false);
     expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('initial_sync_pending = false'))).toBe(false);
     expect(result.errors).toContain('Fallo parcial cuenta author: simulated transaction failure');
+    const failedCheckpoint = queryDb.mock.calls.find(([sql, args]) => String(sql).includes('INSERT INTO perpetual_sync_checkpoints') && Array.isArray(args) && args.includes('failed'));
+    expect(failedCheckpoint?.[1]).toContain('MONITOR_DB_IMPORT_FAILED');
   });
 
   it('keeps initial_sync_pending after a failed polling pass', async () => {

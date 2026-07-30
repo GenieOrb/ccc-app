@@ -68,6 +68,26 @@ CREATE INDEX IF NOT EXISTS campaign_accounts_username_idx
 ON campaign_accounts(username_normalized)
 WHERE removed_at IS NULL;
 
+-- Durable monitor audit trail. Details carry only bounded operational metadata.
+CREATE TABLE IF NOT EXISTS perpetual_sync_checkpoints (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE RESTRICT,
+    campaign_account_id UUID NOT NULL REFERENCES campaign_accounts(id) ON DELETE RESTRICT,
+    run_id UUID NOT NULL,
+    phase TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error')),
+    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_code TEXT,
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS perpetual_sync_checkpoints_account_recent_idx
+ON perpetual_sync_checkpoints(campaign_account_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS perpetual_sync_checkpoints_campaign_recent_idx
+ON perpetual_sync_checkpoints(campaign_id, created_at DESC);
+
 -- Table: campaign_posts
 CREATE TABLE IF NOT EXISTS campaign_posts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
