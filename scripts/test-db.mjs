@@ -30,6 +30,19 @@ try {
   const schema = await fs.readFile(path.join(here, 'setup-db.sql'), 'utf8');
   await testClient.query(schema);
   await testClient.query(schema);
+  await testClient.query(`DROP INDEX IF EXISTS campaign_accounts_poll_lease_idx`);
+  await testClient.query(`ALTER TABLE campaign_accounts DROP COLUMN IF EXISTS poll_lease_owner`);
+  await testClient.query(`ALTER TABLE campaign_accounts DROP COLUMN IF EXISTS poll_lease_expires_at`);
+  await testClient.query(schema);
+  const pollLeaseUpgrade = await testClient.query(`
+    SELECT
+      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'campaign_accounts' AND column_name = 'poll_lease_owner') AS has_owner,
+      EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'campaign_accounts' AND column_name = 'poll_lease_expires_at') AS has_expiry,
+      EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'campaign_accounts_poll_lease_idx') AS has_index
+  `);
+  if (!pollLeaseUpgrade.rows[0].has_owner || !pollLeaseUpgrade.rows[0].has_expiry || !pollLeaseUpgrade.rows[0].has_index) {
+    throw new Error('setup-db must upgrade campaign_accounts poll lease columns before creating their index.');
+  }
 
   const snapshotTriggers = await testClient.query(`
     SELECT t.tgname, p.proname

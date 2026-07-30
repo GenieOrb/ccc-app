@@ -38,6 +38,34 @@ interface AccountRow {
 type CheckpointPhase = 'monitor' | 'account' | 'x_timeline' | 'post_selection' | 'safety' | 'db_import' | 'cycle' | 'jobs' | 'cursor' | 'completed' | 'failed';
 type CheckpointDetails = Record<string, boolean | number>;
 
+function getSafeDatabaseErrorCode(error: unknown): string | undefined {
+  const code = typeof error === 'object' && error !== null && 'code' in error
+    ? (error as { code?: unknown }).code
+    : undefined;
+  return typeof code === 'string' && /^[A-Za-z0-9_]{1,32}$/.test(code)
+    ? code.toUpperCase()
+    : undefined;
+}
+
+class PollLeaseLostError extends Error {}
+
+function assertPollLeaseMutation(rows: unknown[]): void {
+  if (rows.length === 0) throw new PollLeaseLostError();
+}
+
+async function renewPollLease(accountId: string, runId: string, leaseDurationMs: number): Promise<void> {
+  const renewed = await queryDb<{ id: string }>(
+    `UPDATE campaign_accounts
+     SET poll_lease_expires_at = NOW() + ($3::BIGINT * INTERVAL '1 millisecond')
+     WHERE id = $1
+       AND poll_lease_owner = $2::UUID
+       AND poll_lease_expires_at > NOW()
+     RETURNING id`,
+    [accountId, runId, leaseDurationMs],
+  );
+  assertPollLeaseMutation(renewed);
+}
+
 // The audit payload intentionally accepts no post content, URLs, provider
 // responses, or raw errors. Checkpoint persistence is always outside imports.
 async function writeCheckpoint(
@@ -79,6 +107,9 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
   const startTime = Date.now();
   const deadline = startTime + Math.max(0, timeBudgetMs);
   const durableWriteReserveMs = Math.min(1_000, Math.max(0, Math.floor(timeBudgetMs / 10)));
+  // This outlives the serverless monitor budget with write slack, while a
+  // crashed invocation can still be recovered after a bounded delay.
+  const pollLeaseDurationMs = Math.max(30_000, timeBudgetMs + 15_000);
   const ioDeadline = deadline - durableWriteReserveMs;
   const hasTimeRemaining = () => Date.now() < deadline;
   const hasIoTimeRemaining = () => Date.now() < ioDeadline;
@@ -149,7 +180,21 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
     }
 
     let phase: CheckpointPhase = 'monitor';
+    let leaseClaimed = false;
     try {
+      // Claim before any network work so concurrent cron/scoped invocations
+      // cannot independently import the same account.
+      const claimed = await queryDb<{ id: string }>(
+        `UPDATE campaign_accounts
+         SET poll_lease_owner = $2::UUID,
+             poll_lease_expires_at = NOW() + ($3::BIGINT * INTERVAL '1 millisecond')
+         WHERE id = $1
+           AND (poll_lease_owner IS NULL OR poll_lease_expires_at IS NULL OR poll_lease_expires_at <= NOW())
+         RETURNING id`,
+        [account.id, runId, pollLeaseDurationMs],
+      );
+      if (claimed.length === 0) continue;
+      leaseClaimed = true;
       summary.accountsProcessed++;
       await writeCheckpoint(account, runId, 'monitor', 'info', { scoped: Boolean(campaignId || accountIds?.length) });
       phase = 'account';
@@ -158,12 +203,21 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
       let xUserId = account.x_user_id;
       if (!xUserId) {
         if (!hasIoTimeRemaining()) break;
+        await renewPollLease(account.id, runId, pollLeaseDurationMs);
         xUserId = await resolveXUsername(
           account.username,
           { campaignId: account.campaign_id, campaignAccountId: account.id },
           boundedIoTimeoutMs(10_000),
         );
-        await queryDb('UPDATE campaign_accounts SET x_user_id = $1 WHERE id = $2', [xUserId, account.id]);
+        assertPollLeaseMutation(await queryDb<{ id: string }>(
+          `UPDATE campaign_accounts
+           SET x_user_id = $1
+           WHERE id = $2
+             AND poll_lease_owner = $3::UUID
+             AND poll_lease_expires_at > NOW()
+           RETURNING id`,
+          [xUserId, account.id, runId],
+        ));
       }
 
       // The durable flag, not the incidental cursor value, defines whether this
@@ -174,6 +228,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
       const isInitialRecovery = account.initial_sync_pending;
       phase = 'x_timeline';
       await writeCheckpoint(account, runId, phase);
+      await renewPollLease(account.id, runId, pollLeaseDurationMs);
       const timelineResult = await fetchNewXPostsForAccount(
         xUserId,
         isInitialRecovery ? null : account.last_seen_post_id,
@@ -209,7 +264,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
         const highestExpiredPostId = fetchedPosts.length > 0
           ? fetchedPosts.reduce((latest, post) => BigInt(post.postId) > BigInt(latest.postId) ? post : latest).postId
           : null;
-        await queryDb(
+        assertPollLeaseMutation(await queryDb<{ id: string }>(
           `UPDATE campaign_accounts
            SET last_seen_post_id = CASE
                  WHEN $1::TEXT IS NOT NULL
@@ -218,9 +273,12 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
                  ELSE last_seen_post_id
                END,
                initial_sync_pending = false
-           WHERE id = $2 AND initial_sync_pending = true`,
-          [highestExpiredPostId, account.id],
-        );
+           WHERE id = $2 AND initial_sync_pending = true
+             AND poll_lease_owner = $3::UUID
+             AND poll_lease_expires_at > NOW()
+           RETURNING id`,
+          [highestExpiredPostId, account.id, runId],
+        ));
       }
 
       if (newPosts.length > 0) {
@@ -238,6 +296,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
           // because the deadline passed while the safety check was in flight.
           phase = 'safety';
           await writeCheckpoint(account, runId, phase);
+          await renewPollLease(account.id, runId, pollLeaseDurationMs);
           const safetyResult = await checkCampaignSafety(
             [post.textContent],
             account.direction || undefined,
@@ -247,41 +306,54 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
           if (!safetyResult.allowed) {
             summary.postsRejected++;
             highestPostId = post.postId;
-            await queryDb(
+            assertPollLeaseMutation(await queryDb<{ id: string }>(
               isInitialRecovery
                 ? `UPDATE campaign_accounts
                    SET last_seen_post_id = CASE
                          WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
                          ELSE last_seen_post_id
                         END
-                   WHERE id = $2 AND initial_sync_pending = true`
-                : 'UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))',
-              [highestPostId, account.id],
-            );
+                   WHERE id = $2 AND initial_sync_pending = true
+                     AND poll_lease_owner = $3::UUID
+                     AND poll_lease_expires_at > NOW()
+                   RETURNING id`
+                : `UPDATE campaign_accounts SET last_seen_post_id = $1
+                   WHERE id = $2
+                     AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+                     AND poll_lease_owner = $3::UUID
+                     AND poll_lease_expires_at > NOW()
+                   RETURNING id`,
+              [highestPostId, account.id, runId],
+            ));
             continue;
           }
 
           phase = 'db_import';
           await writeCheckpoint(account, runId, phase);
-          await withTransaction(async (client) => {
+          await renewPollLease(account.id, runId, pollLeaseDurationMs);
+          const durableResult = await withTransaction(async (client): Promise<{ imported: boolean; cycleCreated: boolean }> => {
             const lockRes = await client.query<{ initial_sync_pending: boolean; last_seen_post_id: string | null; removed_at: Date | null; is_active: boolean }>(
               `SELECT ca.initial_sync_pending, ca.last_seen_post_id, ca.removed_at, c.is_active
                FROM campaign_accounts ca
                JOIN campaigns c ON ca.campaign_id = c.id
-               WHERE ca.id = $1 FOR UPDATE`,
-              [account.id]
+               WHERE ca.id = $1
+                 AND ca.poll_lease_owner = $2::UUID
+                 AND ca.poll_lease_expires_at > NOW()
+               FOR UPDATE`,
+              [account.id, runId]
             );
 
             const currentData = lockRes.rows[0];
-            if (!currentData || currentData.removed_at !== null || !currentData.is_active) {
-              return; // Account removed or campaign inactive, skip
+            if (!currentData) throw new PollLeaseLostError();
+            if (currentData.removed_at !== null || !currentData.is_active) {
+              return { imported: false, cycleCreated: false }; // Account removed or campaign inactive, skip
             }
             if (isInitialRecovery && !currentData.initial_sync_pending) {
-              return; // Another monitor completed recovery while X was being queried.
+              return { imported: false, cycleCreated: false }; // Another monitor completed recovery while X was being queried.
             }
             const recoveringUnderLock = isInitialRecovery && currentData.initial_sync_pending;
             if (!recoveringUnderLock && currentData.last_seen_post_id && BigInt(post.postId) <= BigInt(currentData.last_seen_post_id)) {
-              return; // Post ya fue procesado o el cursor está por delante
+              return { imported: false, cycleCreated: false }; // Post ya fue procesado o el cursor está por delante
             }
             // lockRes is intentionally used for concurrency control (locking)
 
@@ -296,25 +368,28 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
               // Recovery deliberately reaches backwards for the latest eligible
               // post, but an expired post must never create inventory or jobs.
               if (expiresAt && expiresAt <= new Date()) {
-          // These occur after the import transaction has committed, so audit
-          // writes are never rolled back together with imported data.
-          await writeCheckpoint(account, runId, 'cycle', 'info', { created: summary.cyclesCreated > 0 });
-          await writeCheckpoint(account, runId, 'jobs', 'info', { imported: summary.postsImported > 0 });
-          phase = 'cursor';
-          await writeCheckpoint(account, runId, phase);
-          highestPostId = post.postId;
-                await client.query(
+                highestPostId = post.postId;
+                const cursorRes = await client.query(
                   recoveringUnderLock
                     ? `UPDATE campaign_accounts
                        SET last_seen_post_id = CASE
                              WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
                              ELSE last_seen_post_id
                             END
-                       WHERE id = $2`
-                    : 'UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))',
-                  [highestPostId, account.id]
+                       WHERE id = $2
+                         AND poll_lease_owner = $3::UUID
+                         AND poll_lease_expires_at > NOW()
+                       RETURNING id`
+                    : `UPDATE campaign_accounts SET last_seen_post_id = $1
+                       WHERE id = $2
+                         AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+                         AND poll_lease_owner = $3::UUID
+                         AND poll_lease_expires_at > NOW()
+                       RETURNING id`,
+                  [highestPostId, account.id, runId]
                 );
-                return;
+                if ((cursorRes.rowCount || 0) === 0) throw new PollLeaseLostError();
+                return { imported: false, cycleCreated: false };
               }
 
               const insertRes = await client.query<{ id: string }>(`
@@ -333,7 +408,6 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
 
               if ((insertRes.rowCount || 0) > 0) {
                 const newCampaignPostId = insertRes.rows[0].id;
-                summary.postsImported++;
                 const model = getAiModel(account.model_key);
                 if (!model) throw new Error('La campaÃ±a no tiene un modelo vÃ¡lido para generar el snapshot.');
 
@@ -345,30 +419,73 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
                 for (const plan of generateDeterministicSlotPlans([newCampaignPostId], 30)) {
                   await client.query(`INSERT INTO generation_jobs (cycle_id,campaign_id,campaign_post_id,slot_index,slot_plan,length_mode,emoji_policy,rhetorical_form,texture,status,model_name,prompt_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,1)`, [cycleId, account.campaign_id, newCampaignPostId, plan.slotIndex, JSON.stringify(plan), plan.lengthMode, plan.emojiPolicy, plan.rhetoricalForm, plan.texture, model.apiModel]);
                 }
-                summary.cyclesCreated++;
+                const cursorRes = await client.query(
+                  recoveringUnderLock
+                    ? `UPDATE campaign_accounts
+                       SET last_seen_post_id = CASE
+                             WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
+                             ELSE last_seen_post_id
+                            END
+                       WHERE id = $2
+                         AND poll_lease_owner = $3::UUID
+                         AND poll_lease_expires_at > NOW()
+                       RETURNING id`
+                    : `UPDATE campaign_accounts SET last_seen_post_id = $1
+                       WHERE id = $2
+                         AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+                         AND poll_lease_owner = $3::UUID
+                         AND poll_lease_expires_at > NOW()
+                       RETURNING id`,
+                  [post.postId, account.id, runId],
+                );
+                if ((cursorRes.rowCount || 0) === 0) throw new PollLeaseLostError();
+                return { imported: true, cycleCreated: true };
               }
             }
 
             highestPostId = post.postId;
-            await client.query(
+            const cursorRes = await client.query(
               recoveringUnderLock
                 ? `UPDATE campaign_accounts
                    SET last_seen_post_id = CASE
                          WHEN last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC) THEN $1
                          ELSE last_seen_post_id
                         END
-                   WHERE id = $2`
-                : 'UPDATE campaign_accounts SET last_seen_post_id = $1 WHERE id = $2 AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))',
-              [highestPostId, account.id],
+                   WHERE id = $2
+                     AND poll_lease_owner = $3::UUID
+                     AND poll_lease_expires_at > NOW()
+                   RETURNING id`
+                : `UPDATE campaign_accounts SET last_seen_post_id = $1
+                   WHERE id = $2
+                     AND (last_seen_post_id IS NULL OR CAST($1 AS NUMERIC) > CAST(last_seen_post_id AS NUMERIC))
+                     AND poll_lease_owner = $3::UUID
+                     AND poll_lease_expires_at > NOW()
+                   RETURNING id`,
+              [highestPostId, account.id, runId],
             );
+            if ((cursorRes.rowCount || 0) === 0) throw new PollLeaseLostError();
+            return { imported: false, cycleCreated: false };
           });
+          // Increment only after the fenced transaction commits. A lease-loss
+          // rollback must never be reported as a durable import or cycle.
+          if (durableResult.imported) {
+            summary.postsImported++;
+            highestPostId = post.postId;
+          }
+          if (durableResult.cycleCreated) summary.cyclesCreated++;
+          // These occur after the import transaction has committed, so audit
+          // writes cannot contend with its fenced account lock.
+          await writeCheckpoint(account, runId, 'cycle', 'info', { created: durableResult.cycleCreated });
+          await writeCheckpoint(account, runId, 'jobs', 'info', { imported: durableResult.imported });
+          phase = 'cursor';
+          await writeCheckpoint(account, runId, phase);
         }
 
         // Partial initial batches are retried from the beginning. Only after
         // every fetched eligible original has been durably handled may the
         // independent completion flag be cleared.
         if (isInitialRecovery && completedInitialRecovery) {
-          await queryDb(
+          assertPollLeaseMutation(await queryDb<{ id: string }>(
             `UPDATE campaign_accounts
              SET last_seen_post_id = CASE
                    WHEN $1::TEXT IS NOT NULL
@@ -377,20 +494,63 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
                    ELSE last_seen_post_id
                  END,
                  initial_sync_pending = false
-             WHERE id = $2 AND initial_sync_pending = true`,
-            [highestPostId, account.id],
-          );
+             WHERE id = $2 AND initial_sync_pending = true
+               AND poll_lease_owner = $3::UUID
+               AND poll_lease_expires_at > NOW()
+             RETURNING id`,
+            [highestPostId, account.id, runId],
+          ));
         }
       }
 
-      await queryDb('UPDATE campaign_accounts SET last_polled_at = NOW() WHERE id = $1', [account.id]);
+      assertPollLeaseMutation(await queryDb<{ id: string }>(
+        `UPDATE campaign_accounts
+         SET last_polled_at = NOW()
+         WHERE id = $1
+           AND poll_lease_owner = $2::UUID
+           AND poll_lease_expires_at > NOW()
+         RETURNING id`,
+        [account.id, runId],
+      ));
       await writeCheckpoint(account, runId, 'completed', 'info', { imported: summary.postsImported > 0 });
 
     } catch (error: unknown) {
-      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
-      summary.errors.push(`Fallo parcial cuenta ${account.username}: ${errorMsg}`);
-      await writeCheckpoint(account, runId, 'failed', 'error', {}, `MONITOR_${phase.toUpperCase()}_FAILED`, `No se completó la fase ${phase}.`);
-      try { await queryDb('UPDATE campaign_accounts SET last_polled_at = NOW() WHERE id = $1', [account.id]); } catch { /* Ignore secondary fail */ }
+      if (error instanceof PollLeaseLostError) continue;
+      const databaseErrorCode = getSafeDatabaseErrorCode(error);
+      summary.errors.push(`Fallo parcial cuenta ${account.username}: fase ${phase}${databaseErrorCode ? ` (${databaseErrorCode})` : ''}.`);
+      await writeCheckpoint(
+        account,
+        runId,
+        'failed',
+        'error',
+        {},
+        `MONITOR_${phase.toUpperCase()}_FAILED${databaseErrorCode ? `_${databaseErrorCode}` : ''}`,
+        `Error de monitor en la fase ${phase}.`,
+      );
+      try {
+        await queryDb(
+          `UPDATE campaign_accounts
+           SET last_polled_at = NOW()
+           WHERE id = $1
+             AND poll_lease_owner = $2::UUID
+             AND poll_lease_expires_at > NOW()
+           RETURNING id`,
+          [account.id, runId],
+        );
+      } catch { /* Ignore secondary fail */ }
+    } finally {
+      if (leaseClaimed) {
+        try {
+          await queryDb(
+            `UPDATE campaign_accounts
+             SET poll_lease_owner = NULL, poll_lease_expires_at = NULL
+             WHERE id = $1 AND poll_lease_owner = $2::UUID`,
+            [account.id, runId],
+          );
+        } catch {
+          // Expiry is the recovery path if this release write fails.
+        }
+      }
     }
   }
 

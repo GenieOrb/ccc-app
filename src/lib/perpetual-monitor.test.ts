@@ -15,13 +15,21 @@ const freshPost = { postId: '900', inputUrl: 'https://x.com/author/status/900', 
 let transactionalSql: string[] = [];
 let lockedAccount: { initial_sync_pending: boolean; last_seen_post_id: string | null; removed_at: Date | null; is_active: boolean };
 let transactionFailurePattern: string | null;
+let leaseClaimed: boolean;
 
 describe('processPerpetualCampaigns', () => {
   beforeEach(() => {
     queryDb.mockReset(); withTransaction.mockReset(); fetchNewXPostsForAccount.mockReset(); checkCampaignSafety.mockReset(); transactionalSql = [];
     lockedAccount = { initial_sync_pending: true, last_seen_post_id: null, removed_at: null, is_active: true };
     transactionFailurePattern = null;
-    queryDb.mockImplementation((sql: string) => sql.includes('SELECT ca.id') ? Promise.resolve([account]) : Promise.resolve([]));
+    leaseClaimed = true;
+    queryDb.mockImplementation((sql: string) => {
+      if (sql.includes('SELECT ca.id')) return Promise.resolve([account]);
+      if (sql.includes('SET poll_lease_owner = $2::UUID')) return Promise.resolve(leaseClaimed ? [{ id: account.id }] : []);
+      if (sql.includes('SET poll_lease_expires_at = NOW() +')) return Promise.resolve([{ id: account.id }]);
+      if (sql.includes('RETURNING id') && sql.includes('poll_lease_owner = $')) return Promise.resolve([{ id: account.id }]);
+      return Promise.resolve([]);
+    });
     checkCampaignSafety.mockResolvedValue({ allowed: true });
     withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => {
       const query = vi.fn(async (sql: string) => {
@@ -30,6 +38,7 @@ describe('processPerpetualCampaigns', () => {
         if (sql.includes('SELECT ca.initial_sync_pending')) return { rows: [lockedAccount], rowCount: 1 };
         if (sql.includes('SELECT id FROM campaign_posts')) return { rows: [], rowCount: 0 };
         if (sql.includes('INSERT INTO campaign_posts')) return { rows: [{ id: 'post-row-1' }], rowCount: 1 };
+        if (sql.includes('UPDATE campaign_accounts') && sql.includes('RETURNING id')) return { rows: [{ id: account.id }], rowCount: 1 };
         return { rows: [], rowCount: 0 };
       });
       return operation({ query });
@@ -64,6 +73,42 @@ describe('processPerpetualCampaigns', () => {
     expect(result.postsExpired).toBe(0);
   });
 
+  it('does not write a checkpoint through queryDb while expiring a post inside its import transaction', async () => {
+    let inTransactionCallback = false;
+    let checkpointAttemptedDuringTransaction = false;
+    const ongoingAccount = { ...account, initial_sync_pending: false, last_seen_post_id: '100' };
+    lockedAccount = { initial_sync_pending: false, last_seen_post_id: '100', removed_at: null, is_active: true };
+    queryDb.mockImplementation((sql: string) => {
+      if (sql.includes('INSERT INTO perpetual_sync_checkpoints')) {
+        if (inTransactionCallback) checkpointAttemptedDuringTransaction = true;
+        return Promise.resolve([]);
+      }
+      if (sql.includes('SELECT ca.id')) return Promise.resolve([ongoingAccount]);
+      if (sql.includes('SET poll_lease_owner = $2::UUID')) return Promise.resolve([{ id: account.id }]);
+      if (sql.includes('SET poll_lease_expires_at = NOW() +') || (sql.includes('RETURNING id') && sql.includes('poll_lease_owner = $'))) return Promise.resolve([{ id: account.id }]);
+      return Promise.resolve([]);
+    });
+    withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => {
+      const query = vi.fn(async (sql: string) => {
+        if (sql.includes('SELECT ca.initial_sync_pending')) return { rows: [lockedAccount], rowCount: 1 };
+        if (sql.includes('SELECT id FROM campaign_posts')) return { rows: [], rowCount: 0 };
+        if (sql.includes('UPDATE campaign_accounts') && sql.includes('RETURNING id')) return { rows: [{ id: account.id }], rowCount: 1 };
+        return { rows: [], rowCount: 0 };
+      });
+      inTransactionCallback = true;
+      try {
+        return await operation({ query });
+      } finally {
+        inTransactionCallback = false;
+      }
+    });
+    fetchNewXPostsForAccount.mockResolvedValue([{ ...freshPost, postedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString() }]);
+
+    await processPerpetualCampaigns(10_000);
+
+    expect(checkpointAttemptedDuringTransaction).toBe(false);
+  });
+
   it('recovers every still-eligible original when a newer fetched post is expired', async () => {
     const expiredNewer = { ...freshPost, postId: '999', postedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString() };
     fetchNewXPostsForAccount.mockResolvedValue([freshPost, expiredNewer]);
@@ -88,11 +133,16 @@ describe('processPerpetualCampaigns', () => {
     expect(transactionalSql.filter((sql) => sql.includes('INSERT INTO campaign_posts'))).toHaveLength(1);
     const completionWrites = queryDb.mock.calls.filter(([sql]) => String(sql).includes('initial_sync_pending = false'));
     expect(completionWrites).toHaveLength(1);
-    expect(completionWrites[0][1]).toEqual(['901', 'account-1']);
+    expect(completionWrites[0][1]).toEqual(['901', 'account-1', expect.any(String)]);
   });
 
   it('uses initial_sync_pending rather than a pre-existing cursor for the initial recovery', async () => {
-    queryDb.mockImplementation((sql: string) => sql.includes('SELECT ca.id') ? Promise.resolve([{ ...account, last_seen_post_id: '1000' }]) : Promise.resolve([]));
+    queryDb.mockImplementation((sql: string) => {
+      if (sql.includes('SELECT ca.id')) return Promise.resolve([{ ...account, last_seen_post_id: '1000' }]);
+      if (sql.includes('SET poll_lease_owner = $2::UUID')) return Promise.resolve([{ id: account.id }]);
+      if (sql.includes('SET poll_lease_expires_at = NOW() +') || (sql.includes('RETURNING id') && sql.includes('poll_lease_owner = $'))) return Promise.resolve([{ id: account.id }]);
+      return Promise.resolve([]);
+    });
     lockedAccount.last_seen_post_id = '1000';
     fetchNewXPostsForAccount.mockResolvedValue([freshPost]);
 
@@ -105,7 +155,12 @@ describe('processPerpetualCampaigns', () => {
   });
 
   it('retains initial_sync_pending when durable recovery fails despite an advanced cursor', async () => {
-    queryDb.mockImplementation((sql: string) => sql.includes('SELECT ca.id') ? Promise.resolve([{ ...account, last_seen_post_id: '1000' }]) : Promise.resolve([]));
+    queryDb.mockImplementation((sql: string) => {
+      if (sql.includes('SELECT ca.id')) return Promise.resolve([{ ...account, last_seen_post_id: '1000' }]);
+      if (sql.includes('SET poll_lease_owner = $2::UUID')) return Promise.resolve([{ id: account.id }]);
+      if (sql.includes('SET poll_lease_expires_at = NOW() +') || (sql.includes('RETURNING id') && sql.includes('poll_lease_owner = $'))) return Promise.resolve([{ id: account.id }]);
+      return Promise.resolve([]);
+    });
     lockedAccount.last_seen_post_id = '1000';
     transactionFailurePattern = 'INSERT INTO campaign_posts';
     fetchNewXPostsForAccount.mockResolvedValue([freshPost]);
@@ -115,9 +170,74 @@ describe('processPerpetualCampaigns', () => {
     expect(transactionalSql.some((sql) => sql.includes('INSERT INTO campaign_posts'))).toBe(true);
     expect(transactionalSql.some((sql) => sql.includes('initial_sync_pending = false'))).toBe(false);
     expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('initial_sync_pending = false'))).toBe(false);
-    expect(result.errors).toContain('Fallo parcial cuenta author: simulated transaction failure');
+    expect(result.errors).toContain('Fallo parcial cuenta author: fase db_import.');
     const failedCheckpoint = queryDb.mock.calls.find(([sql, args]) => String(sql).includes('INSERT INTO perpetual_sync_checkpoints') && Array.isArray(args) && args.includes('failed'));
     expect(failedCheckpoint?.[1]).toContain('MONITOR_DB_IMPORT_FAILED');
+    expect(failedCheckpoint?.[1]).toContain('Error de monitor en la fase db_import.');
+  });
+
+  it('claims, releases, and skips an account already leased by another monitor', async () => {
+    fetchNewXPostsForAccount.mockResolvedValue([]);
+
+    await processPerpetualCampaigns(10_000);
+
+    const claim = queryDb.mock.calls.find(([sql]) => String(sql).includes('SET poll_lease_owner = $2::UUID'));
+    const release = queryDb.mock.calls.find(([sql]) => String(sql).includes('SET poll_lease_owner = NULL'));
+    expect(claim?.[1]?.[2]).toBeGreaterThan(10_000);
+    expect(release?.[1]?.[1]).toEqual(claim?.[1]?.[1]);
+
+    queryDb.mockClear();
+    leaseClaimed = false;
+    const skipped = await processPerpetualCampaigns(10_000);
+    expect(skipped.accountsProcessed).toBe(0);
+    expect(fetchNewXPostsForAccount).toHaveBeenCalledTimes(1);
+    expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('SET poll_lease_owner = NULL'))).toBe(false);
+  });
+
+  it('records only a sanitized database error code and bounded checkpoint message', async () => {
+    fetchNewXPostsForAccount.mockResolvedValue([freshPost]);
+    withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => {
+      const query = vi.fn(async (sql: string) => {
+        if (sql.includes('SELECT ca.initial_sync_pending')) return { rows: [lockedAccount], rowCount: 1 };
+        if (sql.includes('SELECT id FROM campaign_posts')) return { rows: [], rowCount: 0 };
+        if (sql.includes('INSERT INTO campaign_posts')) {
+          throw Object.assign(new Error(`database rejected ${freshPost.textContent}`), { code: '23505' });
+        }
+        return { rows: [], rowCount: 0 };
+      });
+      return operation({ query });
+    });
+
+    await processPerpetualCampaigns(10_000);
+
+    const failedCheckpoint = queryDb.mock.calls.find(([sql, args]) => String(sql).includes('INSERT INTO perpetual_sync_checkpoints') && Array.isArray(args) && args.includes('failed'));
+    expect(failedCheckpoint?.[1]).toContain('MONITOR_DB_IMPORT_FAILED_23505');
+    expect(failedCheckpoint?.[1]).toContain('Error de monitor en la fase db_import.');
+    expect(JSON.stringify(failedCheckpoint)).not.toContain(freshPost.textContent);
+  });
+
+  it('does not import after losing lease ownership before the durable transaction', async () => {
+    fetchNewXPostsForAccount.mockResolvedValue([freshPost]);
+    withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => {
+      const query = vi.fn(async (sql: string) => {
+        transactionalSql.push(sql);
+        if (sql.includes('SELECT ca.initial_sync_pending')) {
+          const hasLeaseFence = sql.includes('poll_lease_owner = $2::UUID') && sql.includes('poll_lease_expires_at > NOW()');
+          return hasLeaseFence ? { rows: [], rowCount: 0 } : { rows: [lockedAccount], rowCount: 1 };
+        }
+        if (sql.includes('SELECT id FROM campaign_posts')) return { rows: [], rowCount: 0 };
+        if (sql.includes('INSERT INTO campaign_posts')) return { rows: [{ id: 'post-row-1' }], rowCount: 1 };
+        return { rows: [], rowCount: 0 };
+      });
+      return operation({ query });
+    });
+
+    const result = await processPerpetualCampaigns(10_000);
+
+    expect(transactionalSql.find((sql) => sql.includes('SELECT ca.initial_sync_pending'))).toContain('poll_lease_owner = $2::UUID');
+    expect(transactionalSql.some((sql) => sql.includes('INSERT INTO campaign_posts'))).toBe(false);
+    expect(result.postsImported).toBe(0);
+    expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('initial_sync_pending = false'))).toBe(false);
   });
 
   it('keeps initial_sync_pending after a failed polling pass', async () => {
@@ -126,7 +246,7 @@ describe('processPerpetualCampaigns', () => {
     await processPerpetualCampaigns(10_000);
 
     expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('initial_sync_pending = false'))).toBe(false);
-    expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('SET last_polled_at = NOW() WHERE id = $1'))).toBe(true);
+    expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('SET last_polled_at = NOW()'))).toBe(true);
   });
 
   it('does not start account polling after its time budget is exhausted', async () => {
@@ -175,7 +295,9 @@ describe('processPerpetualCampaigns', () => {
   it('does not advance the ongoing cursor when X reports an incomplete paginated scan', async () => {
     queryDb.mockImplementation((sql: string) => sql.includes('SELECT ca.id')
       ? Promise.resolve([{ ...account, initial_sync_pending: false, last_seen_post_id: '100' }])
-      : Promise.resolve([]));
+      : sql.includes('SET poll_lease_owner = $2::UUID') || sql.includes('SET poll_lease_expires_at = NOW() +') || (sql.includes('RETURNING id') && sql.includes('poll_lease_owner = $'))
+        ? Promise.resolve([{ id: account.id }])
+        : Promise.resolve([]));
     lockedAccount = { initial_sync_pending: false, last_seen_post_id: '100', removed_at: null, is_active: true };
     fetchNewXPostsForAccount.mockResolvedValue({ posts: [freshPost], complete: false });
 

@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS campaign_accounts (
     initial_sync_pending BOOLEAN NOT NULL DEFAULT true,
     last_seen_post_id TEXT,
     last_polled_at TIMESTAMPTZ,
+    poll_lease_owner UUID,
+    poll_lease_expires_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     removed_at TIMESTAMPTZ
 );
@@ -275,6 +277,11 @@ FOR EACH ROW EXECUTE FUNCTION prevent_assignment_mutation();
 ALTER TABLE campaign_accounts ADD COLUMN IF NOT EXISTS monitoring_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE campaign_accounts ADD COLUMN IF NOT EXISTS last_seen_post_id TEXT;
 ALTER TABLE campaign_accounts ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ;
+ALTER TABLE campaign_accounts ADD COLUMN IF NOT EXISTS poll_lease_owner UUID;
+ALTER TABLE campaign_accounts ADD COLUMN IF NOT EXISTS poll_lease_expires_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS campaign_accounts_poll_lease_idx
+ON campaign_accounts(poll_lease_expires_at)
+WHERE poll_lease_expires_at IS NOT NULL;
 
 ALTER TABLE generation_cycles ADD COLUMN IF NOT EXISTS campaign_post_id UUID;
 
