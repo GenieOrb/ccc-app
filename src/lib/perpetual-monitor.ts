@@ -398,7 +398,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
                   author_name, author_username, text_content, language, conversation_id,
                   posted_at, accessible_context, expires_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                ON CONFLICT (campaign_account_id, x_post_id) DO NOTHING
+                ON CONFLICT (campaign_account_id, x_post_id) WHERE campaign_account_id IS NOT NULL DO NOTHING
                 RETURNING id
               `, [
                 account.campaign_id, account.id, post.postId, post.inputUrl, post.canonicalUrl,

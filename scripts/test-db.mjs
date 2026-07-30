@@ -67,6 +67,33 @@ try {
   );
   const accountId = account.rows[0].id;
   if (account.rows[0].initial_sync_pending !== true) throw new Error('campaign_accounts initial_sync_pending must default to true.');
+  const perpetualPostInsert = `
+    INSERT INTO campaign_posts (campaign_id,campaign_account_id,x_post_id,input_url,canonical_url,text_content)
+    VALUES ($1,$2,$3,$4,$4,'perpetual upsert contract')
+    ON CONFLICT (campaign_account_id, x_post_id) WHERE campaign_account_id IS NOT NULL DO NOTHING
+    RETURNING id
+  `;
+  const perpetualPostValues = [campaignId, accountId, 'perpetual-contract', 'https://x.com/db_author/status/perpetual-contract'];
+  const firstPerpetualInsert = await testClient.query(perpetualPostInsert, perpetualPostValues);
+  if (firstPerpetualInsert.rowCount !== 1) throw new Error('perpetual post first insert must insert exactly one row.');
+  const duplicatePerpetualInsert = await testClient.query(perpetualPostInsert, perpetualPostValues);
+  if (duplicatePerpetualInsert.rowCount !== 0) throw new Error('perpetual post duplicate must insert no rows.');
+  await testClient.query(`UPDATE campaign_posts SET retired_at=NOW() WHERE id=$1`, [firstPerpetualInsert.rows[0].id]);
+  const retiredPerpetualRetry = await testClient.query(perpetualPostInsert, perpetualPostValues);
+  if (retiredPerpetualRetry.rowCount !== 0) throw new Error('retired perpetual post retry must remain a no-op.');
+
+  const firstManualPost = await testClient.query(
+    `INSERT INTO campaign_posts (campaign_id,x_post_id,input_url,canonical_url,text_content)
+     VALUES ($1,'manual-reinsert','https://x.com/manual/status/reinsert','https://x.com/manual/status/reinsert','manual control') RETURNING id`,
+    [campaignId],
+  );
+  await testClient.query(`UPDATE campaign_posts SET retired_at=NOW() WHERE id=$1`, [firstManualPost.rows[0].id]);
+  const manualReinsert = await testClient.query(
+    `INSERT INTO campaign_posts (campaign_id,x_post_id,input_url,canonical_url,text_content)
+     VALUES ($1,'manual-reinsert','https://x.com/manual/status/reinsert','https://x.com/manual/status/reinsert','manual control') RETURNING id`,
+    [campaignId],
+  );
+  if (manualReinsert.rowCount !== 1) throw new Error('retired manual post must remain reinsertable.');
   await testClient.query(`UPDATE campaign_accounts SET last_seen_post_id='999' WHERE id=$1`, [accountId]);
   const pendingAfterCursor = await testClient.query(`SELECT initial_sync_pending FROM campaign_accounts WHERE id=$1`, [accountId]);
   if (pendingAfterCursor.rows[0].initial_sync_pending !== true) throw new Error('Advancing last_seen_post_id must not implicitly complete initial sync.');
