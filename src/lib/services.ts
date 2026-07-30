@@ -399,6 +399,12 @@ export async function toggleCampaignStatus(campaignId: string): Promise<boolean>
 
 export async function retryFailedCampaignJobs(campaignId: string): Promise<void> {
   await withTransaction(async (client) => {
+    const campaignRes = await client.query<{ id: string }>(
+      `SELECT id FROM campaigns WHERE id = $1 FOR UPDATE`,
+      [campaignId]
+    );
+    if (campaignRes.rows.length === 0) return;
+
     // Find a cycle that has failed jobs, prioritizing 'initial' over others, oldest first.
     const cycleRes = await client.query<{ id: string }>(
       `SELECT id 
@@ -414,9 +420,7 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
       [campaignId]
     );
 
-    if (cycleRes.rows.length === 0) {
-      throw new Error('No hay trabajos fallidos que reintentar en esta campaña.');
-    }
+    if (cycleRes.rows.length === 0) return;
 
     const cycleId = cycleRes.rows[0].id;
 
@@ -438,7 +442,8 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
     await client.query(
       `UPDATE generation_cycles 
        SET status = 'processing',
-           error_message = NULL
+           error_message = NULL,
+           finished_at = NULL
        WHERE id = $1`,
       [cycleId]
     );
@@ -528,6 +533,9 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
       const campaignPostIds = postRows.rows.map((p) => p.id);
 
       for (const postId of campaignPostIds) {
+        // Maintain campaign -> post -> cycle locking for concurrent replenishment.
+        await client.query(`SELECT 1 FROM campaign_posts WHERE id = $1 FOR UPDATE`, [postId]);
+
         const availRowsLock = await client.query<{ count: string }>(
           `SELECT COUNT(*) as count FROM suggestions WHERE campaign_id = $1 AND campaign_post_id = $2 AND status = 'available'`,
           [campaignId, postId]
@@ -536,13 +544,48 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
         if (availableCountLock > threshold) continue;
 
         const checkRes = await client.query(
-          `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND campaign_post_id = $2 AND status IN ('pending', 'processing', 'failed') LIMIT 1`,
+          `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND campaign_post_id = $2 AND status IN ('pending', 'processing') LIMIT 1`,
           [campaignId, postId]
         );
         if (checkRes.rows.length > 0) continue;
 
-        // Post lock to prevent concurrent replenishment for the same post
-        await client.query(`SELECT 1 FROM campaign_posts WHERE id = $1 FOR UPDATE`, [postId]);
+        const failedCycleRes = await client.query<{ id: string }>(
+          `SELECT id
+           FROM generation_cycles
+           WHERE campaign_id = $1
+             AND campaign_post_id = $2
+             AND status = 'failed'
+             AND EXISTS (
+               SELECT 1 FROM generation_jobs
+               WHERE cycle_id = generation_cycles.id AND status = 'failed'
+             )
+           ORDER BY created_at ASC
+           LIMIT 1
+           FOR UPDATE`,
+          [campaignId, postId]
+        );
+        if (failedCycleRes.rows.length > 0) {
+          const cycleId = failedCycleRes.rows[0].id;
+          await client.query(
+            `UPDATE generation_jobs
+             SET status = 'pending',
+                 attempts_count = 0,
+                 error_message = NULL,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 next_attempt_at = NOW(),
+                 updated_at = NOW()
+             WHERE cycle_id = $1 AND status = 'failed'`,
+            [cycleId]
+          );
+          await client.query(
+            `UPDATE generation_cycles
+             SET status = 'processing', error_message = NULL, finished_at = NULL
+             WHERE id = $1`,
+            [cycleId]
+          );
+          continue;
+        }
 
         const slotPlans = generateDeterministicSlotPlans([postId], repSize);
         if (slotPlans.length === 0) continue;
