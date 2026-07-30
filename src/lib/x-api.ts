@@ -409,6 +409,7 @@ export async function fetchNewXPostsForAccount(
   timeoutMs?: number,
   paginationToken?: string,
   remainingPages = 5,
+  initialPageOnly = false,
 ): Promise<XTimelineFetchResult> {
   const config = getConfig();
   if (!config.xBearerToken) {
@@ -535,9 +536,13 @@ export async function fetchNewXPostsForAccount(
     return new Date(a.postedAt).getTime() - new Date(b.postedAt).getTime();
   });
 
-  // Initial recovery scans the same bounded page window as an ongoing poll so
-  // older eligible originals are not skipped before completion is persisted.
   const nextToken = data.meta?.next_token;
+  // Recovery is deliberately a one-page operation. The monitor selects the
+  // newest eligible original from this page and persists its cursor before
+  // clearing the recovery flag; it must never walk older pages here.
+  if (initialPageOnly) {
+    return { posts: validPosts, complete: true };
+  }
   if (nextToken) {
     if (remainingPages <= 1) return { posts: validPosts, complete: false };
     const elapsedMs = Date.now() - requestStartedAt;
@@ -548,6 +553,7 @@ export async function fetchNewXPostsForAccount(
       Math.max(1, requestTimeoutMs - elapsedMs),
       nextToken,
       remainingPages - 1,
+      false,
     );
     const posts = [...validPosts, ...next.posts];
     posts.sort((a, b) => {

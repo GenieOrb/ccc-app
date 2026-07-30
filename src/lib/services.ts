@@ -317,7 +317,7 @@ export async function createCampaign(params: {
 }
 
 export async function toggleCampaignStatus(campaignId: string): Promise<boolean> {
-  const created = await withTransaction(async (client) => {
+  const result = await withTransaction(async (client) => {
     const campRes = await client.query<{ is_active: boolean; campaign_type: 'manual' | 'perpetual' }>(
       `SELECT is_active, campaign_type FROM campaigns WHERE id = $1 FOR UPDATE`,
       [campaignId]
@@ -393,15 +393,22 @@ export async function toggleCampaignStatus(campaignId: string): Promise<boolean>
       await client.query(`UPDATE campaigns SET is_active = true, updated_at = NOW() WHERE id = $1`, [
         campaignId,
       ]);
-      return true;
+      return { isActive: true, synchronizePerpetualCampaign: campaignType === 'perpetual' };
     } else {
       await client.query(`UPDATE campaigns SET is_active = false, updated_at = NOW() WHERE id = $1`, [
         campaignId,
       ]);
-      return false;
+      return { isActive: false, synchronizePerpetualCampaign: false };
     }
   });
-  return created;
+
+  // This must run after the activation transaction has committed: the monitor
+  // reads the campaign's active state and imports the first posts immediately.
+  if (result.synchronizePerpetualCampaign) {
+    await processPerpetualCampaigns({ campaignId, timeBudgetMs: 30_000 });
+  }
+
+  return result.isActive;
 }
 
 export async function retryFailedCampaignJobs(campaignId: string): Promise<void> {

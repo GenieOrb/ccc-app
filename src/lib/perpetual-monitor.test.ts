@@ -43,7 +43,7 @@ describe('processPerpetualCampaigns', () => {
 
     expect(result.postsImported).toBe(1);
     expect(result.cyclesCreated).toBe(1);
-    expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number));
+    expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number), undefined, undefined, true);
     expect(checkCampaignSafety).toHaveBeenCalledWith(['Fresh post'], undefined, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number));
     expect(transactionalSql.filter((sql) => sql.includes('INSERT INTO generation_jobs'))).toHaveLength(30);
     expect(transactionalSql.some((sql) => sql.includes('INSERT INTO generation_cycles'))).toBe(true);
@@ -72,16 +72,17 @@ describe('processPerpetualCampaigns', () => {
     expect(postInsert).toBeDefined();
   });
 
-  it('imports all eligible initial originals before advancing the cursor and completing recovery', async () => {
+  it('imports only the newest eligible initial original before advancing the cursor and completing recovery', async () => {
     const laterFreshPost = { ...freshPost, postId: '901', textContent: 'Later fresh post', postedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString() };
     fetchNewXPostsForAccount.mockResolvedValue([freshPost, laterFreshPost]);
 
     const result = await processPerpetualCampaigns(10_000);
 
-    expect(result.postsImported).toBe(2);
-    expect(result.cyclesCreated).toBe(2);
-    expect(checkCampaignSafety).toHaveBeenCalledTimes(2);
-    expect(transactionalSql.filter((sql) => sql.includes('INSERT INTO campaign_posts'))).toHaveLength(2);
+    expect(result.postsImported).toBe(1);
+    expect(result.cyclesCreated).toBe(1);
+    expect(checkCampaignSafety).toHaveBeenCalledTimes(1);
+    expect(checkCampaignSafety).toHaveBeenCalledWith(['Later fresh post'], undefined, expect.any(Object), expect.any(Number));
+    expect(transactionalSql.filter((sql) => sql.includes('INSERT INTO campaign_posts'))).toHaveLength(1);
     const completionWrites = queryDb.mock.calls.filter(([sql]) => String(sql).includes('initial_sync_pending = false'));
     expect(completionWrites).toHaveLength(1);
     expect(completionWrites[0][1]).toEqual(['901', 'account-1']);
@@ -94,7 +95,7 @@ describe('processPerpetualCampaigns', () => {
 
     const result = await processPerpetualCampaigns(10_000);
 
-    expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number));
+    expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number), undefined, undefined, true);
     expect(result.postsImported).toBe(1);
     expect(transactionalSql.some((sql) => sql.includes('INSERT INTO campaign_posts'))).toBe(true);
     expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('initial_sync_pending = false'))).toBe(true);

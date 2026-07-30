@@ -90,7 +90,7 @@ describe('perpetual X ingestion contract', () => {
     expect(new URL(fetchMock.mock.calls[1][0]).searchParams.get('pagination_token')).toBe('older-page');
   });
 
-  it('also paginates initial recovery and continues to exclude replies and retweets', async () => {
+  it('does not paginate initial recovery when X returns next_token', async () => {
     process.env.X_BEARER_TOKEN = 'test-token';
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -102,20 +102,16 @@ describe('perpetual X ingestion contract', () => {
         meta: { next_token: 'older-page' },
       }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
-        data: [
-          { id: '101', text: 'older original', author_id: '42', created_at: '2026-01-02T00:00:00.000Z' },
-          { id: '100', text: 'retweet', author_id: '42', referenced_tweets: [{ type: 'retweeted', id: '1' }], created_at: '2026-01-02T00:00:00.000Z' },
-        ],
+        data: [{ id: '101', text: 'must not be requested', author_id: '42', created_at: '2026-01-02T00:00:00.000Z' }],
         includes: { users: [{ id: '42', name: 'Author', username: 'author' }] },
         meta: {},
       }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
 
-    const result = await fetchNewXPostsForAccount('42', null, undefined, 1_000);
+    const result = await fetchNewXPostsForAccount('42', null, undefined, 1_000, undefined, undefined, true);
 
     expect(result.complete).toBe(true);
-    expect(result.posts.map((post) => post.postId)).toEqual(['101', '103']);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(new URL(fetchMock.mock.calls[1][0]).searchParams.get('pagination_token')).toBe('older-page');
+    expect(result.posts.map((post) => post.postId)).toEqual(['103']);
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });

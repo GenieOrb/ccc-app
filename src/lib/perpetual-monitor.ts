@@ -146,6 +146,9 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
         isInitialRecovery ? null : account.last_seen_post_id,
         { campaignId: account.campaign_id, campaignAccountId: account.id },
         boundedIoTimeoutMs(15_000),
+        undefined,
+        undefined,
+        isInitialRecovery,
       );
       // Keep the durable cursor unchanged when X could not finish the bounded
       // scan. Retrying from that cursor is safe because inserts are idempotent.
@@ -154,7 +157,8 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
         continue;
       }
       const fetchedPosts = Array.isArray(timelineResult) ? timelineResult : timelineResult.posts;
-      // Initial recovery imports every original post still within its lifetime.
+      // Initial recovery is bounded to X's first page and imports only its
+      // newest original that is still within the campaign lifetime.
       const initialEligiblePosts = isInitialRecovery
         ? fetchedPosts.filter((post) => {
             if (!account.post_active_lifetime_hours || !post.postedAt) return true;
@@ -162,7 +166,9 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
             return !Number.isNaN(postedAt.getTime()) && postedAt.getTime() + account.post_active_lifetime_hours * 3600 * 1000 > Date.now();
           })
         : fetchedPosts;
-      const newPosts = initialEligiblePosts;
+      const newPosts = isInitialRecovery
+        ? initialEligiblePosts.slice(-1)
+        : initialEligiblePosts;
 
       if (isInitialRecovery && newPosts.length === 0) {
         const highestExpiredPostId = fetchedPosts.length > 0

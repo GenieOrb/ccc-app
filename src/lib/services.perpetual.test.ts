@@ -12,7 +12,52 @@ vi.mock('./planner', () => ({ generateDeterministicSlotPlans }));
 vi.mock('./perpetual-monitor', () => ({ processPerpetualCampaigns }));
 vi.mock('./ai/models', () => ({ DEFAULT_MODEL_KEY: 'test-model', getAiModel: () => ({ key: 'test-model', enabled: true, provider: 'openai', apiModel: 'test-model' }), isProviderConfigured: () => true }));
 
-import { createPerpetualCampaign, retryFailedCampaignJobs, triggerReplenishmentIfNeeded } from './services';
+import { createPerpetualCampaign, retryFailedCampaignJobs, toggleCampaignStatus, triggerReplenishmentIfNeeded } from './services';
+
+describe('toggleCampaignStatus perpetual activation recovery', () => {
+  it('awaits a campaign-scoped monitor only after the activation transaction commits', async () => {
+    let committed = false;
+    withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => {
+      const result = await operation({
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('SELECT is_active, campaign_type')) return { rows: [{ is_active: false, campaign_type: 'perpetual' }] };
+          if (sql.includes('SELECT COUNT(*) FROM campaign_accounts')) return { rows: [{ count: '1' }] };
+          if (sql.includes('UPDATE campaign_accounts') || sql.includes('UPDATE campaigns SET is_active = true')) return { rows: [] };
+          throw new Error(`Unexpected SQL in test: ${sql}`);
+        }),
+      });
+      committed = true;
+      return result;
+    });
+    processPerpetualCampaigns.mockImplementation(async () => {
+      expect(committed).toBe(true);
+      return { accountsProcessed: 1, postsDetected: 1, postsImported: 1, postsRejected: 0, postsExpired: 0, cyclesCreated: 1, errors: [] };
+    });
+
+    await expect(toggleCampaignStatus('campaign-1')).resolves.toBe(true);
+    expect(processPerpetualCampaigns).toHaveBeenCalledWith({ campaignId: 'campaign-1', timeBudgetMs: 30_000 });
+  });
+
+  it('does not invoke the monitor for manual activation or deactivation', async () => {
+    for (const campaign of [
+      { is_active: false, campaign_type: 'manual' as const },
+      { is_active: true, campaign_type: 'perpetual' as const },
+    ]) {
+      withTransaction.mockImplementationOnce(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('SELECT is_active, campaign_type')) return { rows: [campaign] };
+          if (sql.includes('COUNT(*) AS initial_cycle_count')) return { rows: [{ initial_cycle_count: '1', incomplete_cycle_count: '0', valid_produced_count: '1', target_count: '1' }] };
+          if (sql.includes('FROM suggestions')) return { rows: [{ avail_count: '1' }] };
+          if (sql.includes('UPDATE campaigns SET is_active')) return { rows: [] };
+          throw new Error(`Unexpected SQL in test: ${sql}`);
+        }),
+      }));
+      await toggleCampaignStatus('campaign-1');
+    }
+
+    expect(processPerpetualCampaigns).not.toHaveBeenCalled();
+  });
+});
 
 describe('createPerpetualCampaign initial synchronization', () => {
   it('awaits a bounded, post-commit monitor scoped to the new campaign accounts', async () => {

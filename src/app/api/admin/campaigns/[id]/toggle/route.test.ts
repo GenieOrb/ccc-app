@@ -22,6 +22,19 @@ describe('campaign toggle route', () => {
     expect(toggleCampaignStatus).toHaveBeenCalledWith('campaign-1');
   });
 
+  it('does not return activation success until the service finishes its recovery work', async () => {
+    let finishRecovery!: (isActive: boolean) => void;
+    toggleCampaignStatus.mockReturnValue(new Promise((resolve) => { finishRecovery = resolve; }));
+    const pending = POST(new Request('http://localhost/api/admin/campaigns/campaign-1/toggle', { method: 'POST' }), context);
+
+    await vi.waitFor(() => expect(toggleCampaignStatus).toHaveBeenCalledWith('campaign-1'));
+    finishRecovery(true);
+
+    const response = await pending;
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ success: true, isActive: true });
+  });
+
   it('rejects cross-origin requests before touching campaign state', async () => {
     validateSameOrigin.mockReturnValue(false);
     const response = await POST(new Request('http://localhost/api/admin/campaigns/campaign-1/toggle', { method: 'POST' }), context);
