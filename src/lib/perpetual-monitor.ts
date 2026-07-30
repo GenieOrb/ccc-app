@@ -141,12 +141,19 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
       // pending until a whole polling pass succeeds.
       if (!hasIoTimeRemaining()) break;
       const isInitialRecovery = account.initial_sync_pending;
-      const fetchedPosts = await fetchNewXPostsForAccount(
+      const timelineResult = await fetchNewXPostsForAccount(
         xUserId,
         isInitialRecovery ? null : account.last_seen_post_id,
         { campaignId: account.campaign_id, campaignAccountId: account.id },
         boundedIoTimeoutMs(15_000),
       );
+      // Keep the durable cursor unchanged when X could not finish the bounded
+      // scan. Retrying from that cursor is safe because inserts are idempotent.
+      if (!Array.isArray(timelineResult) && !timelineResult.complete) {
+        summary.errors.push(`Escaneo incompleto de X para cuenta ${account.username}; se reintentarÃ¡ desde el cursor actual.`);
+        continue;
+      }
+      const fetchedPosts = Array.isArray(timelineResult) ? timelineResult : timelineResult.posts;
       // Initial recovery imports at most one post, but eligibility must be
       // decided before choosing the newest Snowflake: a newer expired post
       // must not hide an older post that is still within its lifetime.

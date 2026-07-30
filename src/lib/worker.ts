@@ -147,7 +147,10 @@ async function claimNextJob(workerId: string): Promise<ClaimedJob | null> {
          (j.status = 'pending' AND j.next_attempt_at <= NOW())
          OR (j.status = 'processing' AND j.lease_expires_at < NOW())
        )
-       AND c.is_active = true
+       AND (
+         c.is_active = true
+         OR (c.campaign_type = 'manual' AND cy.cycle_type = 'initial')
+       )
        AND p.retired_at IS NULL
        AND cy.status IN ('pending', 'processing')
        ORDER BY

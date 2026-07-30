@@ -44,3 +44,5 @@ backups/
 *.bak
 *.backup
 *.dump
+.vercel
+.env*

@@ -241,7 +241,7 @@ export async function createCampaign(params: {
          slug, campaign_type, direction, post_active_lifetime_hours, is_active, safety_allowed, safety_category, safety_reason,
          initial_size, replenishment_threshold, replenishment_size, display_name, model_key
        ) VALUES (
-         $1, 'manual', $2, NULL, true, true, $3, $4, 30, 5, 10, $5, $6
+         $1, 'manual', $2, NULL, false, true, $3, $4, 30, 5, 10, $5, $6
        ) RETURNING id`,
       [slug, params.direction || null, safetyResult.category, safetyResult.reason, displayName, model.key]
     );
@@ -274,43 +274,33 @@ export async function createCampaign(params: {
       campaignPostIds.push(postRes.rows[0].id);
     }
 
-    // Generate 50 slot plans balanced across posts
-    const slotPlans = generateDeterministicSlotPlans(campaignPostIds, 30);
-
-    // Create Initial Generation Cycle
-    const cycleRes = await client.query<{ id: string }>(
-      `INSERT INTO generation_cycles (
-          campaign_id, cycle_type, target_count, status, model_key, model_name, prompt_version
-       ) VALUES (
-          $1, 'initial', 30, 'pending', $2, $3, 1
-       ) RETURNING id`,
-       [campaignId, model.key, model.apiModel]
-    );
-    const cycleId = cycleRes.rows[0].id;
-
-    // Create 50 Generation Jobs
-    for (const plan of slotPlans) {
-      await client.query(
-        `INSERT INTO generation_jobs (
-           cycle_id, campaign_id, campaign_post_id, slot_index, slot_plan,
-           length_mode, emoji_policy, rhetorical_form, texture, status,
-           model_name, prompt_version
+    for (const campaignPostId of campaignPostIds) {
+      const slotPlans = generateDeterministicSlotPlans([campaignPostId], 30);
+      const cycleRes = await client.query<{ id: string }>(
+        `INSERT INTO generation_cycles (
+            campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name, prompt_version
          ) VALUES (
-           $1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, 1
-         )`,
-        [
-          cycleId,
-          campaignId,
-          plan.assignedPostId,
-          plan.slotIndex,
-          JSON.stringify(plan),
-          plan.lengthMode,
-          plan.emojiPolicy,
-          plan.rhetoricalForm,
-          plan.texture,
-           model.apiModel,
-        ]
+            $1, $2, 'initial', 30, 'pending', $3, $4, 1
+         ) RETURNING id`,
+        [campaignId, campaignPostId, model.key, model.apiModel]
       );
+      const cycleId = cycleRes.rows[0].id;
+
+      for (const plan of slotPlans) {
+        await client.query(
+          `INSERT INTO generation_jobs (
+             cycle_id, campaign_id, campaign_post_id, slot_index, slot_plan,
+             length_mode, emoji_policy, rhetorical_form, texture, status,
+             model_name, prompt_version
+           ) VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, 1
+           )`,
+          [
+            cycleId, campaignId, plan.assignedPostId, plan.slotIndex, JSON.stringify(plan),
+            plan.lengthMode, plan.emojiPolicy, plan.rhetoricalForm, plan.texture, model.apiModel,
+          ]
+        );
+      }
     }
 
     return { id: campaignId, slug };
@@ -335,21 +325,28 @@ export async function toggleCampaignStatus(campaignId: string): Promise<boolean>
     if (!currentStatus) {
       if (campaignType === 'manual') {
         // Trying to activate: check if initial cycle generated its target count, and at least 1 comment is available.
-        const cycleRes = await client.query<{ status: string; target_count: number; valid_produced_count: number }>(
-          `SELECT status, target_count, valid_produced_count 
-           FROM generation_cycles 
-           WHERE campaign_id = $1 AND cycle_type = 'initial' 
-           ORDER BY created_at ASC LIMIT 1`,
+        const cycleRes = await client.query<{
+          initial_cycle_count: string;
+          incomplete_cycle_count: string;
+          valid_produced_count: string;
+          target_count: string;
+        }>(
+          `SELECT
+             COUNT(*) AS initial_cycle_count,
+             COUNT(*) FILTER (WHERE status <> 'completed') AS incomplete_cycle_count,
+             COALESCE(SUM(valid_produced_count), 0) AS valid_produced_count,
+             COALESCE(SUM(target_count), 0) AS target_count
+           FROM generation_cycles
+           WHERE campaign_id = $1 AND cycle_type = 'initial'`,
           [campaignId]
         );
 
-        if (cycleRes.rows.length === 0 || cycleRes.rows[0].status !== 'completed') {
+        const cycle = cycleRes.rows[0];
+        if (!cycle || Number(cycle.initial_cycle_count) === 0 || Number(cycle.incomplete_cycle_count) > 0) {
           throw new Error('No se puede activar: ciclo inicial inexistente o incompleto.');
         }
 
-        const cycle = cycleRes.rows[0];
-
-        if (cycle.valid_produced_count < cycle.target_count) {
+        if (Number(cycle.valid_produced_count) < Number(cycle.target_count)) {
           throw new Error('No se puede activar: ciclo inicial sin haber producido el objetivo.');
         }
 
@@ -462,83 +459,56 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
   const model = resolveCampaignModel(campaignInfo.model_key);
 
   if (campaignInfo.campaign_type === 'manual') {
-    const availRows = await queryDb<{ count: string }>(
-      `SELECT COUNT(*) as count FROM suggestions WHERE campaign_id = $1 AND status = 'available'`,
-      [campaignId]
-    );
-    const availableCount = parseInt(availRows[0]?.count || '0', 10);
-
-    if (availableCount > threshold) {
-      return;
-    }
-
-    const cycleRows = await queryDb<{ status: string }>(
-      `SELECT status FROM generation_cycles WHERE campaign_id = $1 AND status IN ('pending', 'processing', 'failed') AND campaign_post_id IS NULL ORDER BY created_at DESC LIMIT 1`,
-      [campaignId]
-    );
-
-    if (cycleRows.length > 0) return;
-
     try {
       await withTransaction(async (client) => {
         const campaignLock = await client.query(`SELECT 1 FROM campaigns WHERE id = $1 AND is_active = true FOR UPDATE`, [campaignId]);
         if (campaignLock.rows.length === 0) return;
-
-        const availRowsLock = await client.query<{ count: string }>(
-          `SELECT COUNT(*) as count FROM suggestions WHERE campaign_id = $1 AND status = 'available'`,
-          [campaignId]
-        );
-        if (parseInt(availRowsLock.rows[0]?.count || '0', 10) > threshold) return;
-
-        const checkRes = await client.query(
-          `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND status IN ('pending', 'processing', 'failed') AND campaign_post_id IS NULL LIMIT 1`,
-          [campaignId]
-        );
-        if (checkRes.rows.length > 0) return;
-
         const postRows = await client.query<{ id: string }>(
           `SELECT id FROM campaign_posts WHERE campaign_id = $1 AND retired_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at ASC`,
           [campaignId]
         );
-        const campaignPostIds = postRows.rows.map((p) => p.id);
-        if (campaignPostIds.length === 0) return;
+        for (const { id: postId } of postRows.rows) {
+          const availRowsLock = await client.query<{ count: string }>(
+            `SELECT COUNT(*) as count FROM suggestions WHERE campaign_id = $1 AND campaign_post_id = $2 AND status = 'available'`,
+            [campaignId, postId]
+          );
+          if (parseInt(availRowsLock.rows[0]?.count || '0', 10) > threshold) continue;
 
-        const slotPlans = generateDeterministicSlotPlans(campaignPostIds, repSize);
+          const checkRes = await client.query(
+            `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND campaign_post_id = $2 AND status IN ('pending', 'processing', 'failed') LIMIT 1`,
+            [campaignId, postId]
+          );
+          if (checkRes.rows.length > 0) continue;
 
-        const cycleRes = await client.query<{ id: string }>(
-          `INSERT INTO generation_cycles (
-            campaign_id, cycle_type, target_count, status, model_key, model_name, prompt_version
-         ) VALUES (
-            $1, 'replenishment', $2, 'pending', $3, $4, 1
-         ) RETURNING id`,
-         [campaignId, repSize, model.key, model.apiModel]
-      );
-      const cycleId = cycleRes.rows[0].id;
-
-      for (const plan of slotPlans) {
-        await client.query(
-          `INSERT INTO generation_jobs (
-             cycle_id, campaign_id, campaign_post_id, slot_index, slot_plan,
-             length_mode, emoji_policy, rhetorical_form, texture, status,
-             model_name, prompt_version
+          await client.query(`SELECT 1 FROM campaign_posts WHERE id = $1 FOR UPDATE`, [postId]);
+          const slotPlans = generateDeterministicSlotPlans([postId], repSize);
+          const cycleRes = await client.query<{ id: string }>(
+            `INSERT INTO generation_cycles (
+              campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name, prompt_version
            ) VALUES (
-             $1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, 1
-           )`,
-          [
-            cycleId,
-            campaignId,
-            plan.assignedPostId,
-            plan.slotIndex,
-            JSON.stringify(plan),
-            plan.lengthMode,
-            plan.emojiPolicy,
-            plan.rhetoricalForm,
-            plan.texture,
-             model.apiModel,
-          ]
-        );
-      }
-    });
+              $1, $2, 'replenishment', $3, 'pending', $4, $5, 1
+           ) RETURNING id`,
+            [campaignId, postId, repSize, model.key, model.apiModel]
+          );
+          const cycleId = cycleRes.rows[0].id;
+
+          for (const plan of slotPlans) {
+            await client.query(
+              `INSERT INTO generation_jobs (
+                 cycle_id, campaign_id, campaign_post_id, slot_index, slot_plan,
+                 length_mode, emoji_policy, rhetorical_form, texture, status,
+                 model_name, prompt_version
+               ) VALUES (
+                 $1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, 1
+               )`,
+              [
+                cycleId, campaignId, plan.assignedPostId, plan.slotIndex, JSON.stringify(plan),
+                plan.lengthMode, plan.emojiPolicy, plan.rhetoricalForm, plan.texture, model.apiModel,
+              ]
+            );
+          }
+        }
+      });
 
   } catch {
     // Ignore duplicate cycle creation conflicts gracefully

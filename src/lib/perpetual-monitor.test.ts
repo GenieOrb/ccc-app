@@ -150,4 +150,18 @@ describe('processPerpetualCampaigns', () => {
     expect(checkCampaignSafety.mock.calls[0][3]).toBe(600);
     now.mockRestore();
   });
+
+  it('does not advance the ongoing cursor when X reports an incomplete paginated scan', async () => {
+    queryDb.mockImplementation((sql: string) => sql.includes('SELECT ca.id')
+      ? Promise.resolve([{ ...account, initial_sync_pending: false, last_seen_post_id: '100' }])
+      : Promise.resolve([]));
+    lockedAccount = { initial_sync_pending: false, last_seen_post_id: '100', removed_at: null, is_active: true };
+    fetchNewXPostsForAccount.mockResolvedValue({ posts: [freshPost], complete: false });
+
+    const result = await processPerpetualCampaigns(10_000);
+
+    expect(result.postsImported).toBe(0);
+    expect(transactionalSql.some((sql) => sql.includes('INSERT INTO campaign_posts'))).toBe(false);
+    expect(transactionalSql.some((sql) => sql.includes('last_seen_post_id = $1'))).toBe(false);
+  });
 });

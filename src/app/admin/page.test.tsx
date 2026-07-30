@@ -1,7 +1,8 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('next/navigation', () => ({ useRouter: () => ({ push: vi.fn(), refresh: vi.fn() }) }));
+const routerMock = { push: vi.fn(), refresh: vi.fn() };
+vi.mock('next/navigation', () => ({ useRouter: () => routerMock }));
 import AdminDashboardPage from './page';
 
 const campaign = {
@@ -98,5 +99,33 @@ describe('administration campaign cards', () => {
     expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/toggle'))).toHaveLength(1);
     resolveToggle?.(json({ success: true, isActive: false }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'Desactivar' })).toBeTruthy());
+  });
+
+  it('submits the default manual campaign with only its X post URLs', async () => {
+    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true }));
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+    render(<AdminDashboardPage />);
+
+    expect((await screen.findByLabelText(/tipo de campaña/i) as HTMLSelectElement).value).toBe('manual');
+    expect(screen.queryByLabelText(/cuentas de x a monitorizar/i)).toBeNull();
+    fireEvent.change(screen.getByLabelText(/urls de los posts de x/i), {
+      target: { value: 'https://x.com/genieorb/status/123' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
+
+    await waitFor(() => {
+      const postCall = fetchMock.mock.calls.find(([url, init]) =>
+        String(url) === '/api/admin/campaigns' && (init as RequestInit | undefined)?.method === 'POST',
+      );
+      expect(postCall).toBeTruthy();
+      const payload = JSON.parse((postCall?.[1] as RequestInit).body as string);
+      expect(payload).toMatchObject({ campaignType: 'manual', urlsInput: 'https://x.com/genieorb/status/123' });
+      expect(payload).not.toHaveProperty('accountsInput');
+    });
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/admin/campaigns?page=1'))).toHaveLength(2));
   });
 });

@@ -86,6 +86,12 @@ export interface XApiResponse {
     media?: XMedia[];
     tweets?: XTweetApiItem[];
   };
+  meta?: { next_token?: string };
+}
+
+export interface XTimelineFetchResult {
+  posts: FetchedXPost[];
+  complete: boolean;
 }
 
 const ALLOWED_X_HOSTS = new Set([
@@ -401,7 +407,9 @@ export async function fetchNewXPostsForAccount(
   sincePostId: string | null,
   attribution?: XCallAttribution,
   timeoutMs?: number,
-): Promise<FetchedXPost[]> {
+  paginationToken?: string,
+  remainingPages = 5,
+): Promise<XTimelineFetchResult> {
   const config = getConfig();
   if (!config.xBearerToken) {
     throw new Error('X_BEARER_TOKEN no está configurado en el servidor.');
@@ -422,9 +430,13 @@ export async function fetchNewXPostsForAccount(
   if (sincePostId) {
     url.searchParams.set('since_id', sincePostId);
   }
+  if (paginationToken) {
+    url.searchParams.set('pagination_token', paginationToken);
+  }
 
   const apiUrl = url.toString();
 
+  const requestStartedAt = Date.now();
   const controller = new AbortController();
   const requestTimeoutMs = boundedXTimeoutMs(timeoutMs, 15_000);
   const timeoutId = setTimeout(() => controller.abort(), requestTimeoutMs);
@@ -456,10 +468,6 @@ export async function fetchNewXPostsForAccount(
 
   const data = (await response.json()) as XApiResponse;
   await finishXCall(callKey, 'succeeded', response.status);
-  if (!data.data || data.data.length === 0) {
-    return [];
-  }
-
   const rawTweets = data.data || [];
   const tweetsData: XTweet[] = [];
   for (const item of rawTweets) {
@@ -527,5 +535,28 @@ export async function fetchNewXPostsForAccount(
     return new Date(a.postedAt).getTime() - new Date(b.postedAt).getTime();
   });
 
-  return validPosts;
+  // A first recovery intentionally inspects only its first page: it imports
+  // one newest eligible post, rather than backfilling history. Ongoing polls
+  // drain a bounded number of pages under the caller's remaining time budget.
+  const nextToken = sincePostId ? data.meta?.next_token : undefined;
+  if (nextToken) {
+    if (remainingPages <= 1) return { posts: validPosts, complete: false };
+    const elapsedMs = Date.now() - requestStartedAt;
+    const next = await fetchNewXPostsForAccount(
+      xUserId,
+      sincePostId,
+      attribution,
+      Math.max(1, requestTimeoutMs - elapsedMs),
+      nextToken,
+      remainingPages - 1,
+    );
+    const posts = [...validPosts, ...next.posts];
+    posts.sort((a, b) => {
+      if (!a.postedAt || !b.postedAt) return 0;
+      return new Date(a.postedAt).getTime() - new Date(b.postedAt).getTime();
+    });
+    return { posts, complete: next.complete };
+  }
+
+  return { posts: validPosts, complete: true };
 }

@@ -217,8 +217,9 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 * Usa cuentas de X.
 * Duración de posts entre 1 y 720 horas.
 * Slug y URL pública permanentes.
-* Creación sin posts, ciclos, jobs ni sugerencias iniciales.
-* Creación sin llamadas a X ni OpenAI.
+* La creación de la campaña y el alta de una cuenta esperan una recuperación inicial acotada y posterior al commit.
+* Esa recuperación puede importar como máximo el post existente elegible más reciente de la cuenta; no crea un backfill histórico sin límite.
+* Después de la recuperación inicial, el cron incorpora los posts futuros mediante la sincronización de la cronología paginada, sin perder publicaciones entre páginas.
 * Activación permitida cuando existe al menos una cuenta activa.
 * URL pública activa sin posts devuelve `unavailable`.
 
@@ -253,8 +254,9 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 
 ## 30. Implementación de Campañas Perpetuas
 - **Monitorización casi en tiempo real**: Implementada mediante polling regular de la API v2 de X aprovechando el cron de un minuto, sin usar Filtered Stream de larga duración en entorno serverless.
-- **Resolución y estado**: Resuelve automáticamente `x_user_id` desde el username. Mantiene un cursor `last_seen_post_id` para importar publicaciones de forma idempotente y evitar saltos o duplicados.
-- **Posts admitidos**: Solo se importan posts nuevos (no retweets, no respuestas a terceros). No existe backfill histórico ni importación de contenido previo al inicio de la monitorización (`monitoring_started_at`).
+- **Recuperación inicial acotada**: Tras confirmar el commit de crear una campaña perpetua o añadir una cuenta, la operación espera una recuperación inicial con límite de tiempo. Esta solo puede incorporar el post existente elegible más reciente; no realiza un backfill histórico sin límite.
+- **Resolución y estado**: Resuelve automáticamente `x_user_id` desde el username. Mantiene un cursor `last_seen_post_id` para importar publicaciones de forma idempotente y evitar saltos o duplicados. La sincronización posterior recorre los resultados paginados de la cronología antes de avanzar el cursor, por lo que no descarta posts situados en páginas posteriores.
+- **Posts admitidos**: Solo se importan posts elegibles (no retweets, no respuestas a terceros). La recuperación inicial se limita al más reciente ya existente y el polling incorpora los futuros; no existe backfill histórico ilimitado.
 - **Seguridad y ciclos individuales**: Cada post descubierto se somete al preflight de seguridad de forma individual. En caso de ser admitido, se crea de forma inmediata un ciclo de generación (`generation_cycles`) de 50 comentarios exclusivos para ese `campaign_post_id`.
 - **Inventario específico por post**: En campañas perpetuas, el inventario se repone individualmente cuando las sugerencias disponibles de un post caen por debajo del umbral, sin bloquearse mutuamente por el inventario de posts antiguos.
 - **Priorización de generación**: El worker procesa los jobs dando prioridad absoluta a los posts más recientes y a los que todavía no tienen sugerencias disponibles.

@@ -32,9 +32,9 @@ describe('perpetual X ingestion contract', () => {
     }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
 
-    const posts = await fetchNewXPostsForAccount('42', '100');
+    const result = await fetchNewXPostsForAccount('42', '100');
 
-    expect(posts.map((post) => post.postId)).toEqual(['103']);
+    expect(result.posts.map((post) => post.postId)).toEqual(['103']);
     const requestUrl = new URL(fetchMock.mock.calls[0][0]);
     expect(requestUrl.searchParams.get('exclude')).toBe('replies,retweets');
     expect(requestUrl.searchParams.get('since_id')).toBe('100');
@@ -65,5 +65,28 @@ describe('perpetual X ingestion contract', () => {
     const requestSignal = fetchMock.mock.calls[0][1]?.signal;
     expect(requestSignal).toBeInstanceOf(AbortSignal);
     expect((requestSignal as AbortSignal).aborted).toBe(true);
+  });
+
+  it('follows later timeline pages with pagination_token and returns every unseen post before declaring the scan complete', async () => {
+    process.env.X_BEARER_TOKEN = 'test-token';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{ id: '102', text: 'newest', author_id: '42', created_at: '2026-01-02T00:00:00.000Z' }],
+        includes: { users: [{ id: '42', name: 'Author', username: 'author' }] },
+        meta: { next_token: 'older-page' },
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [{ id: '101', text: 'older', author_id: '42', created_at: '2026-01-01T00:00:00.000Z' }],
+        includes: { users: [{ id: '42', name: 'Author', username: 'author' }] },
+        meta: {},
+      }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await fetchNewXPostsForAccount('42', '100', undefined, 1_000);
+
+    expect(result.complete).toBe(true);
+    expect(result.posts.map((post) => post.postId)).toEqual(['101', '102']);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(new URL(fetchMock.mock.calls[1][0]).searchParams.get('pagination_token')).toBe('older-page');
   });
 });
