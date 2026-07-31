@@ -72,6 +72,7 @@ export async function POST(
         assignmentId: result.assignmentId,
         comment: result.comment,
         postUrl: result.postUrl,
+        replyIntentUrl: result.replyIntentUrl,
       },
       { status: 200, headers: { 'Cache-Control': 'no-store' } }
     );

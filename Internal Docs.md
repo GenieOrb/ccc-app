@@ -309,3 +309,13 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 - Variables visuales centralizadas en `globals.css` (ej. `--bg-primary`, `--bg-card`, `--color-primary`).
 - La promoción pública está separada y siempre visible fuera de los estados condicionales.
 - El enlace de promoción es exactamente https://t.me/PunkPinkTG.
+
+## 36. Botón Post como Enlace a Web Intent
+- El botón Post usa un enlace directo al Web Intent oficial.
+- El formato de la URL es `/intent/tweet?in_reply_to=<post_id>`.
+- No se incluye `text` en la URL; el usuario copia y pega manualmente.
+- El clic de finalización se registra de forma paralela y no bloqueante mediante `fetch(..., { keepalive: true })`.
+- El enlace implementa protección de procedencia estricta usando `noopener`, `noreferrer` y la política `no-referrer` tanto en el tag HTML, como en la cabecera HTTP y meta tag.
+- No se cargan recursos (scripts/widgets) de X antes del clic del visitante.
+- Este cambio no requiere migración de base de datos.
+- No se garantiza anonimato absoluto, solo minimización estándar del referrer a través del navegador.

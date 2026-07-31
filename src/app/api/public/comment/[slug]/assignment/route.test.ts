@@ -44,10 +44,10 @@ describe('public assignment route', () => {
   });
 
   it('returns only the assigned public fields and supplies a deferred rate-limit check', async () => {
-    assignCommentToVisitor.mockResolvedValue({ status: 'success', assignmentId: 'assignment-1', comment: 'Comentario', postUrl: 'https://x.com/user/status/1' });
+    assignCommentToVisitor.mockResolvedValue({ status: 'success', assignmentId: 'assignment-1', comment: 'Comentario', postUrl: 'https://x.com/user/status/1', replyIntentUrl: 'https://x.com/intent/tweet?in_reply_to=1' });
     const response = await POST(request(), params);
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ status: 'success', assignmentId: 'assignment-1', comment: 'Comentario', postUrl: 'https://x.com/user/status/1' });
+    expect(await response.json()).toEqual({ status: 'success', assignmentId: 'assignment-1', comment: 'Comentario', postUrl: 'https://x.com/user/status/1', replyIntentUrl: 'https://x.com/intent/tweet?in_reply_to=1' });
     expect(assignCommentToVisitor).toHaveBeenCalledWith('public-slug', 'visitor-hash', expect.any(Function));
     const rateCheck = assignCommentToVisitor.mock.calls[0][2];
     await expect(rateCheck()).resolves.toBe(true);

@@ -661,7 +661,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
 }
 
 export type AssignmentResponse =
-  | { status: 'success'; assignmentId: string; comment: string; postUrl: string }
+  | { status: 'success'; assignmentId: string; comment: string; postUrl: string; replyIntentUrl?: string }
   | { status: 'expired' }
   | { status: 'unavailable' }
   | { status: 'generating'; retryAfterMs: number }
@@ -669,7 +669,7 @@ export type AssignmentResponse =
   | { status: 'rate_limited' };
 
 type InternalAssignmentResponse = 
-  | { status: 'success'; assignmentId: string; comment: string; postUrl: string; isNewAssignment?: boolean; campaignId?: string }
+  | { status: 'success'; assignmentId: string; comment: string; postUrl: string; replyIntentUrl?: string; isNewAssignment?: boolean; campaignId?: string }
   | { status: 'expired' }
   | { status: 'unavailable' }
   | { status: 'no_inventory'; campaignId: string }
@@ -725,8 +725,9 @@ export async function assignCommentToVisitor(
       const existingRes = await client.query<{
         comment_text: string;
         canonical_url: string;
+        x_post_id: string;
       }>(
-        `SELECT s.comment_text, p.canonical_url
+        `SELECT s.comment_text, p.canonical_url, p.x_post_id
          FROM assignments a
          JOIN suggestions s ON a.suggestion_id = s.id
          JOIN campaign_posts p ON a.campaign_post_id = p.id
@@ -736,11 +737,19 @@ export async function assignCommentToVisitor(
       
       if (existingRes.rows.length > 0) {
         const row = existingRes.rows[0];
+        let replyIntentUrl: string | undefined;
+        if (/^[0-9]+$/.test(row.x_post_id)) {
+          const url = new URL('https://x.com/intent/tweet');
+          url.searchParams.set('in_reply_to', row.x_post_id);
+          replyIntentUrl = url.toString();
+        }
+
         return {
           status: 'success',
           assignmentId: activeAssignmentId,
           comment: row.comment_text,
           postUrl: row.canonical_url,
+          replyIntentUrl,
         };
       }
     }
@@ -773,8 +782,9 @@ export async function assignCommentToVisitor(
       campaign_post_id: string;
       comment_text: string;
       canonical_url: string;
+      x_post_id: string;
     }>(
-      `SELECT s.id as suggestion_id, s.campaign_post_id, s.comment_text, p.canonical_url
+      `SELECT s.id as suggestion_id, s.campaign_post_id, s.comment_text, p.canonical_url, p.x_post_id
        FROM suggestions s
        JOIN campaign_posts p ON s.campaign_post_id = p.id
        WHERE s.campaign_id = $1 AND s.status = 'available' AND p.retired_at IS NULL
@@ -835,11 +845,19 @@ export async function assignCommentToVisitor(
       throw new Error('Failed to assign active assignment state securely');
     }
 
+    let replyIntentUrl: string | undefined;
+    if (/^[0-9]+$/.test(claimedSuggestion.x_post_id)) {
+      const url = new URL('https://x.com/intent/tweet');
+      url.searchParams.set('in_reply_to', claimedSuggestion.x_post_id);
+      replyIntentUrl = url.toString();
+    }
+
     return {
       status: 'success',
       assignmentId: newAssignmentId,
       comment: claimedSuggestion.comment_text,
       postUrl: claimedSuggestion.canonical_url,
+      replyIntentUrl,
       isNewAssignment: true,
       campaignId,
     };
@@ -860,6 +878,7 @@ export async function assignCommentToVisitor(
       assignmentId: txResult.assignmentId,
       comment: txResult.comment,
       postUrl: txResult.postUrl,
+      replyIntentUrl: txResult.replyIntentUrl,
     };
   }
   

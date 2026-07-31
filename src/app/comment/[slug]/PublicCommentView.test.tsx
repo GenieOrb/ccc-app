@@ -14,7 +14,7 @@ describe('PublicCommentView banner', () => {
     ['unavailable', json({ status: 'unavailable' })],
     ['generating', json({ status: 'generating', retryAfterMs: 60_000 })],
     ['expired', json({ status: 'expired' })],
-    ['success', json({ status: 'success', assignmentId: 'a1', comment: 'A comment' })],
+    ['success', json({ status: 'success', assignmentId: 'a1', comment: 'A comment', replyIntentUrl: 'https://x.com/intent/tweet?in_reply_to=1' })],
   ] as const) {
     it(`renders the exact single banner while ${name}`, async () => {
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response));
@@ -44,34 +44,46 @@ describe('PublicCommentView banner', () => {
     expect(link.getAttribute('rel')).toBe('noopener noreferrer');
   });
 
-  it('opens the assigned X post synchronously before completing the assignment', async () => {
+  it('navigates via native link without blocking on completion fetch', async () => {
     const complete = vi.fn().mockResolvedValue(json({ status: 'success' }));
     vi.stubGlobal('fetch', vi.fn()
-      .mockResolvedValueOnce(json({ status: 'success', assignmentId: 'a1', comment: 'A comment', postUrl: 'https://x.com/user/status/1' }))
+      .mockResolvedValueOnce(json({ status: 'success', assignmentId: 'a1', comment: 'A comment', postUrl: 'https://x.com/user/status/1', replyIntentUrl: 'https://x.com/intent/tweet?in_reply_to=1' }))
       .mockImplementationOnce(complete));
-    vi.stubGlobal('open', vi.fn().mockReturnValue({}));
     vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
     const user = userEvent.setup();
 
     render(<PublicCommentView slug="test" />);
     await user.click(await screen.findByRole('button', { name: 'Copy' }));
-    await user.click(screen.getByRole('button', { name: 'Post' }));
 
-    expect(window.open).toHaveBeenCalledWith('https://x.com/user/status/1', '_blank', 'noopener,noreferrer');
+    // The Post button is now a link
+    const link = screen.getByRole('link', { name: 'Post' });
+    expect(link.getAttribute('href')).toBe('https://x.com/intent/tweet?in_reply_to=1');
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(link.getAttribute('rel')).toBe('noopener noreferrer');
+    expect(link.getAttribute('referrerpolicy')).toBe('no-referrer');
+
+    await user.click(link);
+
+    // The fetch should happen in parallel, with keepalive true
     expect(complete).toHaveBeenCalled();
+    const fetchCall = vi.mocked(fetch).mock.calls[1];
+    expect(fetchCall[0]).toContain('/complete');
+    expect(fetchCall[1]?.keepalive).toBe(true);
   });
 
-  it('shows a generic error when the post popup is blocked', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(json({ status: 'success', assignmentId: 'a1', comment: 'A comment', postUrl: 'https://x.com/user/status/1' })));
-    vi.stubGlobal('open', vi.fn().mockReturnValue(null));
+  it('does not crash if tracking fails', async () => {
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(json({ status: 'success', assignmentId: 'a1', comment: 'A comment', postUrl: 'https://x.com/user/status/1', replyIntentUrl: 'https://x.com/intent/tweet?in_reply_to=1' }))
+      .mockRejectedValueOnce(new Error('Network error')));
     vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
     const user = userEvent.setup();
 
     render(<PublicCommentView slug="test" />);
     await user.click(await screen.findByRole('button', { name: 'Copy' }));
-    await user.click(screen.getByRole('button', { name: 'Post' }));
+
+    const link = screen.getByRole('link', { name: 'Post' });
+    await user.click(link);
 
     expect(await screen.findByText('Please try again')).toBeTruthy();
-    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

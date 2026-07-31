@@ -12,11 +12,12 @@ export default function PublicCommentView({ slug }: Props) {
   const [status, setStatus] = useState<'success' | 'expired' | 'unavailable' | 'generating' | 'error'>('success');
   const [waitLong, setWaitLong] = useState(false);
   const [assignmentId, setAssignmentId] = useState('');
-  const [postUrl, setPostUrl] = useState('');
+  const [, setPostUrl] = useState('');
+  const [replyIntentUrl, setReplyIntentUrl] = useState('');
   const [comment, setComment] = useState('');
   const [hasCopied, setHasCopied] = useState(false);
   const [isCompleted, setIsCompleted] = useState(false);
-  const [isPosting, setIsPosting] = useState(false);
+  const [, setIsPosting] = useState(false);
   const [postError, setPostError] = useState(false);
   const isPostingRef = useRef(false);
 
@@ -37,6 +38,7 @@ export default function PublicCommentView({ slug }: Props) {
         if (res.ok && data.status === 'success') {
           setAssignmentId(data.assignmentId || '');
           setPostUrl(data.postUrl || '');
+          setReplyIntentUrl(data.replyIntentUrl || '');
           setComment(data.comment || '');
           setStatus('success');
         } else if (data.status === 'expired') {
@@ -97,47 +99,40 @@ export default function PublicCommentView({ slug }: Props) {
     }
   }
 
-  async function handlePost() {
-    if (!hasCopied || !assignmentId || !postUrl || isCompleted || isPostingRef.current) return;
-    
+  function handlePostClick() {
+    if (!hasCopied || !assignmentId || !replyIntentUrl || isCompleted || isPostingRef.current) return;
+
     isPostingRef.current = true;
     setIsPosting(true);
     setPostError(false);
-    
-    try {
-      const newTab = window.open(postUrl, '_blank', 'noopener,noreferrer');
-      if (!newTab) throw new Error('popup_blocked');
-    } catch {
-      isPostingRef.current = false;
-      setIsPosting(false);
-      setPostError(true);
-      return;
-    }
 
-    try {
-      const res = await fetch(`/api/public/comment/${slug}/assignment/complete`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ assignmentId })
-      });
-
-      const data = await res.json();
-      
+    fetch(`/api/public/comment/${slug}/assignment/complete`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ assignmentId }),
+      keepalive: true,
+      cache: 'no-store'
+    })
+    .then(async (res) => {
+      const data = await res.json().catch(() => ({}));
       if (res.ok && data.status === 'success') {
         setIsCompleted(true);
         setIsPosting(false);
+        // Note: we don't reset isPostingRef to false here on success,
+        // to prevent any further clicks from doing anything.
       } else {
         isPostingRef.current = false;
         setIsPosting(false);
         setPostError(true);
       }
-    } catch {
+    })
+    .catch(() => {
       isPostingRef.current = false;
       setIsPosting(false);
       setPostError(true);
-    }
+    });
   }
 
   const shell = (content: ReactNode) => (
@@ -226,14 +221,27 @@ export default function PublicCommentView({ slug }: Props) {
             Copy
           </button>
 
-          <button
-            type="button"
-            onClick={handlePost}
-            className="btn-public btn-post"
-            disabled={!hasCopied || isCompleted || isPosting}
-          >
-            Post
-          </button>
+          {!hasCopied || !replyIntentUrl || isCompleted ? (
+            <button
+              type="button"
+              className="btn-public btn-post"
+              disabled
+            >
+              Post
+            </button>
+          ) : (
+            <a
+              href={replyIntentUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              referrerPolicy="no-referrer"
+              onClick={handlePostClick}
+              className="btn-public btn-post"
+              style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', textDecoration: 'none' }}
+            >
+              Post
+            </a>
+          )}
         </div>
       </div>
     </>)
