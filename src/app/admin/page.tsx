@@ -85,7 +85,7 @@ function CampaignCardItem({
 }: {
   c: CampaignSummary;
   fetchCampaigns: () => Promise<void>;
-  handleToggleStatus: (id: string) => Promise<boolean>;
+  handleToggleStatus: (id: string, currentStatus: boolean) => Promise<boolean>;
   handleRetryGeneration: (id: string) => Promise<void>;
   handleCopyUrl: (url: string, id: string) => void;
   copiedId: string | null;
@@ -795,7 +795,6 @@ export default function AdminDashboardPage() {
 
       setCreatedPreview(
         comments.map(c => typeof c === 'object' && c !== null ? c.text : String(c))
-          : []
       );
     } catch (previewError: unknown) {
       setPreviewFormError(previewError instanceof Error ? previewError.message : 'No se pudo generar el preview.');
