@@ -162,7 +162,7 @@ export function generateDeterministicSlotPlans(
     { id: 'self_correction', weight: 10 },
     { id: 'run_on_sentence', weight: 10 },
     { id: 'short_bursts', weight: 10 },
-    { id: 'parenthetical_aside', weight: 10 },
+    { id: 'double_space_between_words', weight: 10 },
     { id: 'line_breaks', weight: 10 },
     { id: 'rhetorical_question', weight: 10 },
   ], totalSlots);

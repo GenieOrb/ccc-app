@@ -220,7 +220,10 @@ export async function generateSingleComment(params: {
     ? 'EXPRESSION: Start with a spontaneous vocal reaction (like Oh, Ah, Wow, Ugh, Pfft, etc.).'
     : 'EXPRESSION: Standard.';
 
-  const syntaxInstruction = `SYNTAX MODE: ${plan.syntaxMode.replace(/_/g, ' ')}.`;
+  let syntaxInstruction = `SYNTAX MODE: ${plan.syntaxMode.replace(/_/g, ' ')}.`;
+  if (plan.syntaxMode === 'double_space_between_words') {
+    syntaxInstruction = `SYNTAX MODE: Insert exactly one accidental double space (two ASCII spaces) between two words. Use single spaces everywhere else. Do NOT use three spaces, do NOT start or end with spaces, and do NOT mention this rule.`;
+  }
 
   const brandInstruction = plan.brandVariant
     ? `BRAND VARIANT: You MUST include the exact text "${plan.brandVariant}" exactly once in the comment. This exact text is required and its exact casing overrides the lowercase restriction strictly for this string.`

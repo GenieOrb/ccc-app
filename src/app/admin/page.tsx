@@ -351,12 +351,12 @@ function CampaignCardItem({
               ))}
             </ul>
             <form onSubmit={handleAddPost} style={{ display: 'flex', gap: '8px', marginTop: '8px', marginBottom: '16px' }}>
-              <input 
-                type="text" 
-                value={newUrlsInput} 
-                onChange={(e) => setNewUrlsInput(e.target.value)} 
-                placeholder="Añadir nuevas URLs de X..." 
-                className="form-textarea" 
+              <input
+                type="text"
+                value={newUrlsInput}
+                onChange={(e) => setNewUrlsInput(e.target.value)}
+                placeholder="Añadir nuevas URLs de X..."
+                className="form-textarea"
                 style={{ minHeight: '30px', flex: 1, padding: '4px 8px', fontSize: '0.8rem' }}
                 disabled={addingPost}
               />
@@ -371,12 +371,12 @@ function CampaignCardItem({
           <>
             <form onSubmit={handleChangeDuration} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '16px', background: '#f8fafc', padding: '8px', borderRadius: '4px', border: '1px solid #e2e8f0' }}>
               <label style={{ fontSize: '0.85rem', fontWeight: 'bold', color: '#475569' }}>Duración activa de cada post (horas):</label>
-              <input 
-                type="number" 
+              <input
+                type="number"
                 min="1" max="720" step="1"
-                value={durationInput} 
-                onChange={(e) => setDurationInput(e.target.value)} 
-                className="form-textarea" 
+                value={durationInput}
+                onChange={(e) => setDurationInput(e.target.value)}
+                className="form-textarea"
                 style={{ width: '80px', padding: '4px 8px', fontSize: '0.85rem' }}
                 disabled={changingDuration}
               />
@@ -417,12 +417,12 @@ function CampaignCardItem({
               ))}
             </ul>
             <form onSubmit={handleAddAccount} style={{ display: 'flex', gap: '8px', marginTop: '8px', marginBottom: '16px' }}>
-              <input 
-                type="text" 
-                value={newAccountsInput} 
-                onChange={(e) => setNewAccountsInput(e.target.value)} 
-                placeholder="Añadir nuevas cuentas (ej: @usuario)" 
-                className="form-textarea" 
+              <input
+                type="text"
+                value={newAccountsInput}
+                onChange={(e) => setNewAccountsInput(e.target.value)}
+                placeholder="Añadir nuevas cuentas (ej: @usuario)"
+                className="form-textarea"
                 style={{ minHeight: '30px', flex: 1, padding: '4px 8px', fontSize: '0.8rem' }}
                 disabled={addingAccount}
               />
@@ -569,7 +569,7 @@ function CampaignCardItem({
         <button type="button" onClick={toggleComments} className="btn-admin btn-secondary" style={{ width: '100%' }}>
           {showComments ? 'Ocultar comentarios' : 'Ver comentarios'}
         </button>
-        
+
         {showComments && (
           <div style={{ marginTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
             {suggestions.map((s) => (
@@ -577,10 +577,10 @@ function CampaignCardItem({
                 <p style={{ margin: '0 0 4px 0' }}>{s.text}</p>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <div>
-                    <span style={{ 
-                      fontWeight: 'bold', 
+                    <span style={{
+                      fontWeight: 'bold',
                       marginRight: '8px',
-                      color: s.status === 'available' ? 'var(--success-color)' : s.status === 'assigned' ? 'var(--lavender-accent)' : 'var(--peach-accent)' 
+                      color: s.status === 'available' ? 'var(--success-color)' : s.status === 'assigned' ? 'var(--lavender-accent)' : 'var(--peach-accent)'
                     }}>
                       {s.status.toUpperCase()}
                     </span>
@@ -596,15 +596,15 @@ function CampaignCardItem({
                 </div>
               </div>
             ))}
-            
+
             {loadingComments && <p style={{ fontSize: '0.8rem', textAlign: 'center' }}>Cargando...</p>}
-            
+
             {!loadingComments && nextCursor && (
               <button type="button" onClick={() => loadComments(nextCursor)} className="btn-admin btn-secondary">
                 Cargar más
               </button>
             )}
-            
+
             {!loadingComments && suggestions.length === 0 && (
               <p style={{ fontSize: '0.8rem', textAlign: 'center', color: 'var(--text-muted)' }}>No hay comentarios.</p>
             )}
@@ -637,6 +637,7 @@ export default function AdminDashboardPage() {
   const [creating, setCreating] = useState(false);
   const [generatingPreview, setGeneratingPreview] = useState(false);
   const [createdPreview, setCreatedPreview] = useState<string[] | null>(null);
+  const [previewFormError, setPreviewFormError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [brandVariants, setBrandVariants] = useState<Array<{value: string, percentage: number}>>([]);
 
@@ -703,7 +704,7 @@ export default function AdminDashboardPage() {
     router.refresh();
   }
 
-  async function createCampaign(generatePreview: boolean) {
+  async function createCampaign() {
     if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
     if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
     const parsedDuration = Number(postActiveLifetimeHours);
@@ -743,28 +744,6 @@ export default function AdminDashboardPage() {
       setAccountsInput('');
       setDirection('');
       await fetchCampaigns(1);
-
-      if (!generatePreview) return;
-
-      const campaignId = data.campaign?.id;
-      if (typeof campaignId !== 'string') {
-        setError('La campaña se creó, pero no se pudo obtener su identificador para generar el preview.');
-        return;
-      }
-
-      setGeneratingPreview(true);
-      try {
-        const previewResponse = await fetch(`/api/admin/campaigns/${campaignId}/preview`, { method: 'POST' });
-        const previewData = await previewResponse.json();
-        if (!previewResponse.ok) throw new Error(previewData.error || 'Error al generar preview.');
-        const comments = previewData.preview?.comments;
-        setCreatedPreview(Array.isArray(comments) ? comments : typeof comments === 'string' ? [comments] : []);
-      } catch (previewError: unknown) {
-        setError(previewError instanceof Error ? previewError.message : 'La campaña se creó, pero no se pudo generar el preview.');
-      } finally {
-        setGeneratingPreview(false);
-        await fetchCampaigns(1);
-      }
     } catch {
       setError('Error al enviar la petición de creación.');
     } finally {
@@ -772,9 +751,52 @@ export default function AdminDashboardPage() {
     }
   }
 
+  async function generatePreview(e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
+    if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
+
+    setPreviewFormError(null);
+    setGeneratingPreview(true);
+
+    try {
+      const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, displayName, modelKey };
+      if (campaignTypeToCreate === 'manual') {
+        payload.urlsInput = urlsInput;
+      } else {
+        payload.accountsInput = accountsInput;
+      }
+
+      if (brandVariants.length > 0) {
+        payload.brandVariants = brandVariants.map(bv => ({ value: bv.value.trim(), percentage: bv.percentage })).filter(bv => bv.value);
+      }
+
+      const previewResponse = await fetch(`/api/admin/campaigns/preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const previewData = await previewResponse.json();
+      if (!previewResponse.ok) throw new Error(previewData.error || 'Error al generar preview.');
+      const comments = previewData.preview?.comments;
+      setCreatedPreview(
+        Array.isArray(comments)
+          ? comments.map(c => typeof c === 'object' && c !== null ? c.text : String(c))
+          : []
+      );
+    } catch (previewError: unknown) {
+      setPreviewFormError(previewError instanceof Error ? previewError.message : 'No se pudo generar el preview.');
+      setCreatedPreview(null);
+    } finally {
+      setGeneratingPreview(false);
+    }
+  }
+
   function handleCreateCampaign(e: React.FormEvent) {
     e.preventDefault();
-    void createCampaign(false);
+    void createCampaign();
   }
 
   async function handleToggleStatus(campaignId: string) {
@@ -971,17 +993,22 @@ export default function AdminDashboardPage() {
               <button
                 type="button"
                 className="btn-admin btn-secondary"
-                disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
-                onClick={() => void createCampaign(true)}
+                disabled={generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
+                onClick={generatePreview}
               >
                 {generatingPreview ? 'Generando preview...' : 'Generar preview'}
               </button>
             </div>
+            {previewFormError && (
+              <div style={{ marginTop: '16px', color: 'var(--peach-accent)' }}>
+                {previewFormError}
+              </div>
+            )}
             {createdPreview && (
               <section aria-label="Preview recién generado" style={{ marginTop: '16px' }}>
-                <strong>Preview generado</strong>
-                <ol>
-                  {createdPreview.map((comment, index) => <li key={`${index}-${comment}`}>{comment}</li>)}
+                <strong>Preview de comentarios</strong>
+                <ol style={{ whiteSpace: 'pre-wrap', listStyleType: 'decimal', paddingLeft: '20px' }}>
+                  {createdPreview.map((comment, index) => <li key={index} style={{ marginBottom: '12px' }}>{comment}</li>)}
                 </ol>
               </section>
             )}

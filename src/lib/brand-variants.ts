@@ -40,7 +40,8 @@ export type SyntaxMode =
   | 'self_correction'
   | 'run_on_sentence'
   | 'short_bursts'
-  | 'parenthetical_aside'
+  | 'parenthetical_aside' // Kept only for historical backward compatibility
+  | 'double_space_between_words'
   | 'line_breaks'
   | 'rhetorical_question';
 
@@ -203,19 +204,13 @@ export function isValidCombination(
   syntaxMode: SyntaxMode
 ): boolean {
   if (punctuationMode === 'no_punctuation' || punctuationMode === 'commas_only') {
-    if (syntaxMode === 'rhetorical_question' || syntaxMode === 'parenthetical_aside') {
+    if (syntaxMode === 'rhetorical_question') {
       return false;
     }
   }
 
   if (lengthMode === 'ultra_short') {
     if (syntaxMode === 'short_bursts' || syntaxMode === 'line_breaks') {
-      return false;
-    }
-  }
-
-  if (syntaxMode === 'parenthetical_aside') {
-    if (punctuationMode !== 'standard' && punctuationMode !== 'ellipsis_required') {
       return false;
     }
   }

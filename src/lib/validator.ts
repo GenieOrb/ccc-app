@@ -21,7 +21,7 @@ export function computeNormalizedHash(normalizedText: string): string {
 export function countEmojisInText(text: string): { totalCount: number; validListCount: number; foundEmojis: string[] } {
   const segmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });
   const allowedSet = new Set(ALLOWED_EMOJIS);
-  
+
   let totalCount = 0;
   let validListCount = 0;
   const foundEmojis: string[] = [];
@@ -127,6 +127,36 @@ export function validateCommentLocally(
     if (!trimmed.includes('(') || !trimmed.includes(')')) {
       return { valid: false, reason: `parenthetical_aside syntax requires parentheses.` };
     }
+  } else if (plan.syntaxMode === 'double_space_between_words') {
+    if (commentText.length !== trimmed.length) {
+      return { valid: false, reason: 'double_space_between_words mode violated (leading or trailing spaces found).' };
+    }
+    if (/\t/.test(commentText)) {
+      return { valid: false, reason: 'double_space_between_words mode violated (tab character found).' };
+    }
+    if (/ {3,}/.test(commentText)) {
+      return { valid: false, reason: 'double_space_between_words mode violated (three or more spaces found).' };
+    }
+    const doubleSpaceMatches = [...commentText.matchAll(/ {2}/g)];
+    if (doubleSpaceMatches.length === 0) {
+      return { valid: false, reason: 'double_space_between_words mode violated (no double space found).' };
+    }
+    if (doubleSpaceMatches.length > 1) {
+      return { valid: false, reason: 'double_space_between_words mode violated (multiple double spaces found).' };
+    }
+    const match = /([\p{L}\p{N}]) {2}([\p{L}\p{N}])/u.exec(commentText);
+    if (!match) {
+      return { valid: false, reason: 'double_space_between_words mode violated (double space not strictly between two ASCII/Unicode words).' };
+    }
+    if (plan.brandVariant) {
+      const brandIdx = commentText.indexOf(plan.brandVariant);
+      if (brandIdx !== -1) {
+        const doubleSpaceIdx = commentText.indexOf('  ');
+        if (doubleSpaceIdx >= brandIdx && doubleSpaceIdx < brandIdx + plan.brandVariant.length) {
+          return { valid: false, reason: 'double_space_between_words mode violated (double space is inside the brand variant).' };
+        }
+      }
+    }
   } else if (plan.syntaxMode === 'rhetorical_question') {
     if (!trimmed.includes('?')) {
       return { valid: false, reason: `rhetorical_question syntax requires a question mark.` };
@@ -227,16 +257,16 @@ export function validateCommentLocally(
     const dirWords = normDir.split(' ').filter(Boolean);
     if (dirWords.length >= 2) {
       if (currentNormalized.includes(normDir)) {
-        return { 
-          valid: false, 
-          reason: 'The comment literally copied the administrative campaign direction. You must generate a new comment applying the direction semantically without repeating it.' 
+        return {
+          valid: false,
+          reason: 'The comment literally copied the administrative campaign direction. You must generate a new comment applying the direction semantically without repeating it.'
         };
       }
       const firstTwoDirWords = dirWords.slice(0, 2).join(' ');
       if (currentNormalized.startsWith(firstTwoDirWords)) {
-        return { 
-          valid: false, 
-          reason: 'The comment starts with the administrative campaign direction. You must generate a new comment directly talking about the post without using the instruction as a prefix.' 
+        return {
+          valid: false,
+          reason: 'The comment starts with the administrative campaign direction. You must generate a new comment directly talking about the post without using the instruction as a prefix.'
         };
       }
     }
