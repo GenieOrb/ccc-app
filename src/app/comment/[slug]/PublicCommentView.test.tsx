@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import PublicCommentView from './PublicCommentView';
 
-const banner = 'Promocionate con nuestra APP, mas info aqui.';
+const banner = 'Get thousands of original comments from real users for your posts.';
 const json = (body: unknown, ok = true) => ({ ok, json: async () => body });
 
 describe('PublicCommentView banner', () => {
@@ -20,8 +20,16 @@ describe('PublicCommentView banner', () => {
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response));
       render(<PublicCommentView slug="test" />);
       expect(screen.getAllByText(banner, { exact: true })).toHaveLength(1);
+      expect(screen.getAllByText(/Promote with us:/i)).toHaveLength(1);
+      const link = screen.getByRole('link', { name: 'https://t.me/PunkPinkTG' });
+      expect(link.getAttribute('href')).toBe('https://t.me/PunkPinkTG');
+      expect(link.getAttribute('target')).toBe('_blank');
+      expect(link.getAttribute('rel')).toBe('noopener noreferrer');
+
       await waitFor(() => expect(screen.getByText(banner, { exact: true })).toBeTruthy());
       expect(screen.getAllByText(banner, { exact: true })).toHaveLength(1);
+      expect(screen.getAllByText(/Promote with us:/i)).toHaveLength(1);
+      expect(screen.getByRole('link', { name: 'https://t.me/PunkPinkTG' })).toBeTruthy();
     });
   }
 
@@ -29,6 +37,11 @@ describe('PublicCommentView banner', () => {
     vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
     render(<PublicCommentView slug="test" />);
     expect(screen.getAllByText(banner, { exact: true })).toHaveLength(1);
+    expect(screen.getAllByText(/Promote with us:/i)).toHaveLength(1);
+    const link = screen.getByRole('link', { name: 'https://t.me/PunkPinkTG' });
+    expect(link.getAttribute('href')).toBe('https://t.me/PunkPinkTG');
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(link.getAttribute('rel')).toBe('noopener noreferrer');
   });
 
   it('opens the assigned X post synchronously before completing the assignment', async () => {

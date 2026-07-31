@@ -26,7 +26,11 @@ export async function POST(
 
   try {
     const { id } = await params;
-    const newStatus = await toggleCampaignStatus(id);
+    const body = await req.json().catch(() => ({}));
+    if (typeof body.isActive !== 'boolean') {
+      return NextResponse.json({ error: 'Debes proporcionar isActive booleano.' }, { status: 400, headers: { 'Cache-Control': 'no-store' } });
+    }
+    const newStatus = await toggleCampaignStatus(id, body.isActive);
     return NextResponse.json(
       { success: true, isActive: newStatus },
       { headers: { 'Cache-Control': 'no-store' } }

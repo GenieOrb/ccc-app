@@ -42,15 +42,12 @@ export default function AdminLoginPage() {
   return (
     <div className="public-container">
       <div className="public-card" style={{ maxWidth: '400px' }}>
-        <h1
-          style={{
-            fontSize: '1.4rem',
-            fontWeight: '700',
-            textAlign: 'center',
-            marginBottom: '24px',
-            color: 'var(--lavender-accent)',
-          }}
-        >
+        <h1 style={{
+          fontSize: '1.75rem',
+          marginBottom: '20px',
+          color: 'var(--color-primary)',
+          textAlign: 'center'
+        }}>
           Acceso Administrativo
         </h1>
 

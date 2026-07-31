@@ -92,24 +92,28 @@ export async function POST(req: Request) {
     const plans = generateDeterministicSlotPlans([postContent.post_id], 7, (brandVariants as any) || []);
     const comments: Array<{ text: string, slotIndex: number, slotPlan?: unknown }> = [];
 
-    // Since we don't save anything, we just call generateSingleComment
-    for (const plan of plans) {
-      try {
-        const generatedComment = await generateSingleComment({
-          apiModel: model.apiModel,
-          provider: model.provider,
-          postText: postContent.text_content,
-          authorName: postContent.author_name || '',
-          authorUsername: postContent.author_username || '',
-          accessibleContext: (postContent.accessible_context as Record<string, unknown>) || {},
-          direction: direction || undefined,
-          plan,
-          recentComments: comments.map(c => c.text),
-        });
-        comments.push({ text: generatedComment.comment, slotIndex: plan.slotIndex, slotPlan: plan });
-      } catch (error) {
-        return NextResponse.json({ error: `La preview con ${model.displayName} falló en el slot ${plan.slotIndex}. Error: ${error instanceof Error ? error.message : 'Unknown'}` }, { status: 400 });
-      }
+    // Generar concurrentemente para no superar el límite de maxDuration (60s)
+    for (const batch of [plans.slice(0, 5), plans.slice(5)]) {
+      if (batch.length === 0) continue;
+      const generated = await Promise.all(batch.map(async (plan) => {
+        try {
+          const generatedComment = await generateSingleComment({
+            apiModel: model.apiModel,
+            provider: model.provider,
+            postText: postContent!.text_content,
+            authorName: postContent!.author_name || '',
+            authorUsername: postContent!.author_username || '',
+            accessibleContext: (postContent!.accessible_context as Record<string, unknown>) || {},
+            direction: direction || undefined,
+            plan,
+            recentComments: comments.map(c => c.text),
+          });
+          return { text: generatedComment.comment, slotIndex: plan.slotIndex, slotPlan: plan };
+        } catch (error) {
+          throw new Error(`La preview con ${model.displayName} falló en el slot ${plan.slotIndex}. Error: ${error instanceof Error ? error.message : 'Unknown'}`);
+        }
+      }));
+      comments.push(...generated);
     }
 
     return NextResponse.json(

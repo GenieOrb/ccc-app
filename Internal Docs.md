@@ -302,3 +302,10 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 - `v1.3.1`: Corregido el ciclo de vida de las conexiones Neon en entornos serverless para evitar reutilizar conexiones WebSocket terminadas, creando y cerrando un pool local por cada transacción.
 - `v1.5.0`: Implementación de Diversidad Determinista V2. Se amplían las dimensiones del plan incorporando `firstPersonSubfamily`, `emotionalTone`, `expressionMode`, `punctuationMode`, `capitalizationMode`, `syntaxMode` y `brandVariant` (con distribución LRM). Validación local estricta basada en Regex y comprobación sintáctica rigurosa.
 - `v1.5.1`: Corrección quirúrgica. Se sustituye el modo de escritura `parenthetical_aside` (que obligaba a paréntesis) por `double_space_between_words`, que inyecta exactamente dos espacios consecutivos. El botón de Preview se separa completamente de la creación de campaña y persistencia mediante un nuevo endpoint puro y sin estado.
+
+## 35. Sistema Visual
+- Se ha aplicado una estética pastel cálida y amable con bordes redondeados (radios de 12px a 24px) y sombras suaves.
+- Tipografías utilizadas: Fredoka (títulos y botones) y Nunito (cuerpo y formularios).
+- Variables visuales centralizadas en `globals.css` (ej. `--bg-primary`, `--bg-card`, `--color-primary`).
+- La promoción pública está separada y siempre visible fuera de los estados condicionales.
+- El enlace de promoción es exactamente https://t.me/PunkPinkTG.

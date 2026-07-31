@@ -132,7 +132,7 @@ function CampaignCardItem({
     if (togglingStatus) return;
     setTogglingStatus(true);
     try {
-      await handleToggleStatus(c.id);
+      await handleToggleStatus(c.id, c.isActive);
     } finally {
       setTogglingStatus(false);
     }
@@ -339,11 +339,11 @@ function CampaignCardItem({
             <ul style={{ paddingLeft: '20px', fontSize: '0.85rem' }}>
               {c.xPosts.map((post) => (
                 <li key={post.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
-                  <a href={post.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--lavender-accent)', textDecoration: post.isRetired ? 'line-through' : 'none', opacity: post.isRetired ? 0.6 : 1 }}>
+                  <a href={post.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-primary)', textDecoration: post.isRetired ? 'line-through' : 'none', opacity: post.isRetired ? 0.6 : 1 }}>
                     {post.url}
                   </a>
                   {post.isRetired ? (
-                    <span style={{ fontSize: '0.75rem', color: 'var(--peach-accent)', fontWeight: 'bold' }}>RETIRADO</span>
+                    <span style={{ fontSize: '0.75rem', color: 'var(--error-color)', fontWeight: 'bold' }}>RETIRADO</span>
                   ) : (
                     <button type="button" onClick={() => handleWithdrawPost(post.id)} className="btn-admin btn-danger" style={{ padding: '2px 6px', fontSize: '0.7rem' }}>Retirar</button>
                   )}
@@ -392,14 +392,14 @@ function CampaignCardItem({
               {c.xAccounts.map((acc) => (
                 <li key={acc.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
                   <div style={{ display: 'flex', flexDirection: 'column' }}>
-                    <a href={`https://x.com/${acc.username}`} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--lavender-accent)', textDecoration: acc.isRemoved ? 'line-through' : 'none', opacity: acc.isRemoved ? 0.6 : 1, fontWeight: 'bold' }}>
+                    <a href={`https://x.com/${acc.username}`} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--color-primary)', textDecoration: acc.isRemoved ? 'line-through' : 'none', opacity: acc.isRemoved ? 0.6 : 1, fontWeight: 'bold' }}>
                       @{acc.username}
                     </a>
                     <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
                       Añadida: {new Date(acc.createdAt).toLocaleDateString()}
                     </span>
                     {acc.lastCheckpoint && (
-                      <span aria-label={`Último checkpoint de @${acc.username}`} style={{ fontSize: '0.7rem', color: acc.lastCheckpoint.severity === 'error' ? 'var(--peach-accent)' : 'var(--text-muted)' }}>
+                      <span aria-label={`Último checkpoint de @${acc.username}`} style={{ fontSize: '0.7rem', color: acc.lastCheckpoint.severity === 'error' ? 'var(--error-color)' : 'var(--text-muted)' }}>
                         Sync: {acc.lastCheckpoint.phase} · {new Date(acc.lastCheckpoint.createdAt).toLocaleString()}
                         {acc.lastCheckpoint.errorCode ? ` · ${acc.lastCheckpoint.errorCode}` : ''}
                         {acc.lastCheckpoint.errorMessage ? `: ${acc.lastCheckpoint.errorMessage}` : ''}
@@ -407,7 +407,7 @@ function CampaignCardItem({
                     )}
                   </div>
                   {acc.isRemoved ? (
-                    <span style={{ fontSize: '0.75rem', color: 'var(--peach-accent)', fontWeight: 'bold', textAlign: 'right' }}>
+                    <span style={{ fontSize: '0.75rem', color: 'var(--error-color)', fontWeight: 'bold', textAlign: 'right' }}>
                       RETIRADA<br />({new Date(acc.removedAt!).toLocaleDateString()})
                     </span>
                   ) : (
@@ -471,7 +471,7 @@ function CampaignCardItem({
         </div>
         <div className="stat-item">
           <span className="stat-label">Retirados</span>
-          <span className="stat-value" style={{ color: 'var(--peach-accent)' }}>{c.withdrawnCount}</span>
+          <span className="stat-value" style={{ color: 'var(--error-color)' }}>{c.withdrawnCount}</span>
         </div>
         <div className="stat-item">
           <span className="stat-label">En Cola</span>
@@ -479,7 +479,7 @@ function CampaignCardItem({
         </div>
         <div className="stat-item">
           <span className="stat-label">Fallidos</span>
-          <span className="stat-value" style={{ color: c.failedJobsCount > 0 ? 'var(--peach-accent)' : 'inherit' }}>
+          <span className="stat-value" style={{ color: c.failedJobsCount > 0 ? 'var(--error-color)' : 'inherit' }}>
             {c.failedJobsCount}
           </span>
         </div>
@@ -524,12 +524,12 @@ function CampaignCardItem({
         )}
       </div>
 
-      <section style={{ borderTop: '1px solid var(--border-color)', paddingTop: '16px', marginBottom: '16px' }} aria-label="Previews de comentarios">
+      <section style={{ borderTop: '1px solid var(--border-warm)', paddingTop: '16px', marginBottom: '16px' }} aria-label="Previews de comentarios">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', marginBottom: '10px' }}>
           <strong>Preview de comentarios</strong>
         </div>
 
-        {previewError && <p role="alert" style={{ color: 'var(--peach-accent)', margin: '0 0 10px' }}>{previewError}</p>}
+        {previewError && <p role="alert" style={{ color: 'var(--error-color)', margin: '0 0 10px' }}>{previewError}</p>}
         {loadingPreviews ? (
           <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: 0 }}>Cargando historial de previews...</p>
         ) : previews.length === 0 ? (
@@ -545,7 +545,7 @@ function CampaignCardItem({
               }
 
               return (
-                <article key={preview.id} style={{ padding: '10px', border: '1px solid var(--border-color)', borderRadius: '6px', fontSize: '0.85rem' }}>
+                <article key={preview.id} style={{ padding: '10px', border: '1px solid var(--border-warm)', borderRadius: '6px', fontSize: '0.85rem' }}>
                   <div style={{ color: 'var(--text-muted)', marginBottom: '8px' }}>
                     <time dateTime={preview.created_at}>{new Date(preview.created_at).toLocaleString()}</time>
                     {' · '}Modelo: {preview.model_key} ({preview.api_model})
@@ -553,7 +553,7 @@ function CampaignCardItem({
                     {' · '}Post: {preview.campaign_post_id}
                     {preview.estimated_cost !== null && <> {' · '}Coste: ${Number(preview.estimated_cost).toFixed(8)}</>}
                   </div>
-                  {preview.error_message && <p role="alert" style={{ color: 'var(--peach-accent)', margin: '0 0 8px' }}>{preview.error_message}</p>}
+                  {preview.error_message && <p role="alert" style={{ color: 'var(--error-color)', margin: '0 0 8px' }}>{preview.error_message}</p>}
                   <ol style={{ margin: 0, paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
                     {Array.from({ length: 7 }, (_, index) => <li key={index}>{comments[index] || 'No generado.'}</li>)}
                   </ol>
@@ -565,7 +565,7 @@ function CampaignCardItem({
       </section>
 
       {/* Comments Section */}
-      <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
+      <div style={{ borderTop: '1px solid var(--border-warm)', paddingTop: '16px' }}>
         <button type="button" onClick={toggleComments} className="btn-admin btn-secondary" style={{ width: '100%' }}>
           {showComments ? 'Ocultar comentarios' : 'Ver comentarios'}
         </button>
@@ -573,14 +573,14 @@ function CampaignCardItem({
         {showComments && (
           <div style={{ marginTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
             {suggestions.map((s) => (
-              <div key={s.id} style={{ padding: '8px', border: '1px solid var(--border-color)', borderRadius: '6px', fontSize: '0.85rem', background: 'var(--surface-color)' }}>
+              <div key={s.id} style={{ padding: '8px', border: '1px solid var(--border-warm)', borderRadius: '6px', fontSize: '0.85rem', background: 'var(--surface-light)' }}>
                 <p style={{ margin: '0 0 4px 0' }}>{s.text}</p>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <div>
                     <span style={{
                       fontWeight: 'bold',
                       marginRight: '8px',
-                      color: s.status === 'available' ? 'var(--success-color)' : s.status === 'assigned' ? 'var(--lavender-accent)' : 'var(--peach-accent)'
+                      color: s.status === 'available' ? 'var(--success-color)' : s.status === 'assigned' ? 'var(--color-primary)' : 'var(--error-color)'
                     }}>
                       {s.status.toUpperCase()}
                     </span>
@@ -778,12 +778,23 @@ export default function AdminDashboardPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+
+      const contentType = previewResponse.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        await previewResponse.text(); // consume the body
+        throw new Error(`La preview no pudo generarse porque el servidor devolvió una respuesta inesperada (HTTP ${previewResponse.status}).`);
+      }
+
       const previewData = await previewResponse.json();
-      if (!previewResponse.ok) throw new Error(previewData.error || 'Error al generar preview.');
+      if (!previewResponse.ok) throw new Error(previewData.error || `Error al generar preview (HTTP ${previewResponse.status}).`);
+
       const comments = previewData.preview?.comments;
+      if (!Array.isArray(comments) || comments.length !== 7) {
+        throw new Error('La preview devolvió una cantidad incorrecta de comentarios.');
+      }
+
       setCreatedPreview(
-        Array.isArray(comments)
-          ? comments.map(c => typeof c === 'object' && c !== null ? c.text : String(c))
+        comments.map(c => typeof c === 'object' && c !== null ? c.text : String(c))
           : []
       );
     } catch (previewError: unknown) {
@@ -799,11 +810,14 @@ export default function AdminDashboardPage() {
     void createCampaign();
   }
 
-  async function handleToggleStatus(campaignId: string) {
+  async function handleToggleStatus(campaignId: string, currentStatus: boolean) {
     setError(null);
+    const desiredStatus = !currentStatus;
     try {
       const res = await fetch(`/api/admin/campaigns/${campaignId}/toggle`, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isActive: desiredStatus }),
       });
       const data = await res.json();
 
@@ -1000,7 +1014,7 @@ export default function AdminDashboardPage() {
               </button>
             </div>
             {previewFormError && (
-              <div style={{ marginTop: '16px', color: 'var(--peach-accent)' }}>
+              <div style={{ marginTop: '16px', color: 'var(--error-color)' }}>
                 {previewFormError}
               </div>
             )}

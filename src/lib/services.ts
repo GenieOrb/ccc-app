@@ -346,7 +346,7 @@ export async function createCampaign(params: {
   return created;
 }
 
-export async function toggleCampaignStatus(campaignId: string): Promise<boolean> {
+export async function toggleCampaignStatus(campaignId: string, desiredStatus: boolean): Promise<boolean> {
   const result = await withTransaction(async (client) => {
     const campRes = await client.query<{ is_active: boolean; campaign_type: 'manual' | 'perpetual' }>(
       `SELECT is_active, campaign_type FROM campaigns WHERE id = $1 FOR UPDATE`,
@@ -359,47 +359,23 @@ export async function toggleCampaignStatus(campaignId: string): Promise<boolean>
     const currentStatus = campRes.rows[0].is_active;
     const campaignType = campRes.rows[0].campaign_type;
 
-    if (!currentStatus) {
+    if (currentStatus === desiredStatus) {
+      return { isActive: currentStatus, synchronizePerpetualCampaign: false, triggerManualReplenishment: false };
+    }
+
+    if (desiredStatus) {
       if (campaignType === 'manual') {
-        // Trying to activate: check if initial cycle generated its target count, and at least 1 comment is available.
-        const cycleRes = await client.query<{
-          initial_cycle_count: string;
-          incomplete_cycle_count: string;
-          valid_produced_count: string;
-          target_count: string;
-        }>(
-          `SELECT
-             COUNT(*) AS initial_cycle_count,
-             COUNT(*) FILTER (WHERE status <> 'completed') AS incomplete_cycle_count,
-             COALESCE(SUM(valid_produced_count), 0) AS valid_produced_count,
-             COALESCE(SUM(target_count), 0) AS target_count
-           FROM generation_cycles
-           WHERE campaign_id = $1 AND cycle_type = 'initial'`,
+        const postRes = await client.query<{ count: string }>(
+          `SELECT COUNT(*) as count FROM campaign_posts WHERE campaign_id = $1 AND retired_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())`,
           [campaignId]
         );
-
-        const cycle = cycleRes.rows[0];
-        if (!cycle || Number(cycle.initial_cycle_count) === 0 || Number(cycle.incomplete_cycle_count) > 0) {
-          throw new Error('No se puede activar: ciclo inicial inexistente o incompleto.');
-        }
-
-        if (Number(cycle.valid_produced_count) < Number(cycle.target_count)) {
-          throw new Error('No se puede activar: ciclo inicial sin haber producido el objetivo.');
-        }
-
-        const availRes = await client.query<{ avail_count: string }>(
-          `SELECT COUNT(*) as avail_count FROM suggestions WHERE campaign_id = $1 AND status = 'available'`,
-          [campaignId]
-        );
-        const avail = parseInt(availRes.rows[0]?.avail_count || '0', 10);
-
-        if (avail < 1) {
-          throw new Error('No se puede activar: ausencia de comentarios disponibles.');
+        if (parseInt(postRes.rows[0]?.count || '0', 10) < 1) {
+          throw new Error('No se puede activar: la campaña debe tener al menos un post vigente.');
         }
       } else {
         // Perpetual campaign activation logic
         const accountsRes = await client.query<{ count: string }>(
-          `SELECT COUNT(*) FROM campaign_accounts WHERE campaign_id = $1 AND removed_at IS NULL`,
+          `SELECT COUNT(*) as count FROM campaign_accounts WHERE campaign_id = $1 AND removed_at IS NULL`,
           [campaignId]
         );
         const activeAccountsCount = parseInt(accountsRes.rows[0]?.count || '0', 10);
@@ -423,12 +399,12 @@ export async function toggleCampaignStatus(campaignId: string): Promise<boolean>
       await client.query(`UPDATE campaigns SET is_active = true, updated_at = NOW() WHERE id = $1`, [
         campaignId,
       ]);
-      return { isActive: true, synchronizePerpetualCampaign: campaignType === 'perpetual' };
+      return { isActive: true, synchronizePerpetualCampaign: campaignType === 'perpetual', triggerManualReplenishment: campaignType === 'manual' };
     } else {
       await client.query(`UPDATE campaigns SET is_active = false, updated_at = NOW() WHERE id = $1`, [
         campaignId,
       ]);
-      return { isActive: false, synchronizePerpetualCampaign: false };
+      return { isActive: false, synchronizePerpetualCampaign: false, triggerManualReplenishment: false };
     }
   });
 
@@ -436,6 +412,12 @@ export async function toggleCampaignStatus(campaignId: string): Promise<boolean>
   // reads the campaign's active state and imports the first posts immediately.
   if (result.synchronizePerpetualCampaign) {
     await processPerpetualCampaigns({ campaignId, timeBudgetMs: 30_000 });
+  }
+  if (result.triggerManualReplenishment) {
+    // Retry failed jobs in case it was stuck on errors
+    await retryFailedCampaignJobs(campaignId).catch(() => undefined);
+    // Then attempt to replenish if any post needs a cycle and has none
+    await triggerReplenishmentIfNeeded(campaignId).catch(() => undefined);
   }
 
   return result.isActive;
