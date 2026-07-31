@@ -638,6 +638,15 @@ export default function AdminDashboardPage() {
   const [generatingPreview, setGeneratingPreview] = useState(false);
   const [createdPreview, setCreatedPreview] = useState<string[] | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [brandVariants, setBrandVariants] = useState<Array<{value: string, percentage: number}>>([]);
+
+  const handleAddBrandVariant = () => setBrandVariants([...brandVariants, { value: '', percentage: 100 }]);
+  const handleRemoveBrandVariant = (index: number) => setBrandVariants(brandVariants.filter((_, i) => i !== index));
+  const handleUpdateBrandVariant = (index: number, field: 'value'|'percentage', val: string|number) => {
+    const next = [...brandVariants];
+    next[index] = { ...next[index], [field]: val };
+    setBrandVariants(next);
+  };
 
   const router = useRouter();
 
@@ -704,12 +713,16 @@ export default function AdminDashboardPage() {
     setCreating(true);
 
     try {
-      const payload: Record<string, string | number> = { campaignType: campaignTypeToCreate, direction, displayName, modelKey };
+      const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, displayName, modelKey };
       if (campaignTypeToCreate === 'manual') {
         payload.urlsInput = urlsInput;
       } else {
         payload.accountsInput = accountsInput;
         payload.postActiveLifetimeHours = parsedDuration;
+      }
+
+      if (brandVariants.length > 0) {
+        payload.brandVariants = brandVariants.map(bv => ({ value: bv.value.trim(), percentage: bv.percentage })).filter(bv => bv.value);
       }
 
       const res = await fetch('/api/admin/campaigns', {
@@ -931,6 +944,20 @@ export default function AdminDashboardPage() {
                 placeholder="Instrucciones sobre el tono, enfoque o intención deseada..."
                 disabled={creating}
               />
+            </div>
+
+            <div className="form-group">
+              <label className="form-label">Variantes de Marca (opcional)</label>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                {brandVariants.map((bv, idx) => (
+                  <div key={idx} style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                    <input type="text" placeholder="Texto exacto (ej. Marca)" className="form-textarea" style={{ minHeight: 'auto', padding: '8px', flex: 1 }} value={bv.value} onChange={(e) => handleUpdateBrandVariant(idx, 'value', e.target.value)} disabled={creating} />
+                    <input type="number" placeholder="%" className="form-textarea" style={{ minHeight: 'auto', padding: '8px', width: '80px' }} value={bv.percentage} onChange={(e) => handleUpdateBrandVariant(idx, 'percentage', Number(e.target.value))} disabled={creating} />
+                    <button type="button" onClick={() => handleRemoveBrandVariant(idx)} className="btn-admin btn-danger" disabled={creating}>X</button>
+                  </div>
+                ))}
+                <button type="button" onClick={handleAddBrandVariant} className="btn-admin btn-secondary" style={{ alignSelf: 'flex-start' }} disabled={creating}>+ Añadir variante</button>
+              </div>
             </div>
 
             <div style={{ display: 'flex', gap: '8px' }}>

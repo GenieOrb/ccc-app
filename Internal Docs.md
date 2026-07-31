@@ -58,15 +58,18 @@ Antes de crear el lote de slots, se evalúa el texto del post y la dirección ad
 - Cada petición genera exactamente 1 comentario estructurado en inglés.
 - No se utilizan traducciones, Batch API, modelos mini/nano ni generación de imágenes.
 
-## 7. Plan Determinista de 50 Slots
-Cada ciclo de 50 comentarios sigue un plan determinista pre-calculado:
+## 7. Plan Determinista de 50 Slots (V2)
+Cada ciclo de 50 comentarios sigue un plan determinista V2 pre-calculado:
 - 35 slots `ultra_short` (6 con 1 emoji, 29 sin emojis). Maximum 20 palabras, 1 sentence, 180 Unicode chars.
 - 15 slots `normal` sin emojis. Maximum 45 palabras, 260 Unicode chars.
 - Emojis limitados estrictamente a una lista permitida de 33 emojis y contados mediante `Intl.Segmenter` por grafema.
 - 10 formas retóricas (5 slots de cada una) y 5 texturas (10 slots de cada una).
+- Agregados V2: `firstPersonSubfamily`, `emotionalTone`, `expressionMode`, `punctuationMode`, `capitalizationMode`, `syntaxMode`.
+- Repartición de Variantes de Marca mediante el algoritmo de "mayores restos" para asegurar que la suma de slots coincida exactamente.
 - Mezcla aleatoria mediante `node:crypto`.
 - Distribución equilibrada entre posts si la campaña contiene múltiples URLs de X.
 - El plan del slot se guarda inmutablemente en PostgreSQL antes de llamar a OpenAI.
+
 
 ## 8. Validación Local y Diversidad
 Antes de aceptar un comentario generado:
@@ -297,3 +300,4 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 - `Fixes Fase 1`: Corrección quirúrgica implementando validación estricta de UUID en `/complete`, unificación en transacción única con bloqueo `FOR SHARE` en campañas para evitar carreras de retirada, validación rigurosa de pertenencia y estado activo antes de completar clics, bloqueo síncrono del cliente contra dobles clics evitando cierres prematuros, manejo seguro del fallback y reintento en UI, e idempotencia real en `setup-db.sql` utilizando verificaciones internas y claves foráneas compuestas.
 - `v1.3.0 (Fase 2)`: Añadidas campañas manuales y perpetuas con `campaign_accounts` y duración configurable. Implementada gestión administrativa de cuentas y nuevos endpoints. Base de datos de `campaign_posts` preparada para cuenta de origen y expiración. Todavía sin Filtered Stream ni ingestión automática. Migración aún pendiente.
 - `v1.3.1`: Corregido el ciclo de vida de las conexiones Neon en entornos serverless para evitar reutilizar conexiones WebSocket terminadas, creando y cerrando un pool local por cada transacción.
+- `v1.5.0`: Implementación de Diversidad Determinista V2. Se amplían las dimensiones del plan incorporando `firstPersonSubfamily`, `emotionalTone`, `expressionMode`, `punctuationMode`, `capitalizationMode`, `syntaxMode` y `brandVariant` (con distribución LRM). Validación local estricta basada en Regex y comprobación sintáctica rigurosa.

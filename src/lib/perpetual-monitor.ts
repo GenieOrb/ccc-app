@@ -33,6 +33,7 @@ interface AccountRow {
   direction: string | null;
   post_active_lifetime_hours: number | null;
   model_key: string;
+  brand_variants: unknown;
 }
 
 type CheckpointPhase = 'monitor' | 'account' | 'x_timeline' | 'post_selection' | 'safety' | 'db_import' | 'cycle' | 'jobs' | 'cursor' | 'completed' | 'failed';
@@ -164,7 +165,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
   const scopedAccountIds = accountIds?.filter(Boolean) ?? [];
   if (accountIds && scopedAccountIds.length === 0) return summary;
   const accountsRows = await queryDb<AccountRow>(`
-    SELECT ca.id, ca.campaign_id, ca.username, ca.x_user_id, ca.monitoring_started_at, ca.initial_sync_pending, ca.last_seen_post_id, c.direction, c.post_active_lifetime_hours, c.model_key
+    SELECT ca.id, ca.campaign_id, ca.username, ca.x_user_id, ca.monitoring_started_at, ca.initial_sync_pending, ca.last_seen_post_id, c.direction, c.post_active_lifetime_hours, c.model_key, c.brand_variants
     FROM campaign_accounts ca
     JOIN campaigns c ON ca.campaign_id = c.id
     WHERE ca.removed_at IS NULL AND c.is_active = true AND c.campaign_type = 'perpetual'
@@ -416,7 +417,8 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
                   INSERT INTO generation_cycles (id, campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name)
                   VALUES ($1, $2, $3, 'initial', 30, 'pending', $4, $5)
                 `, [cycleId, account.campaign_id, newCampaignPostId, model.key, model.apiModel]);
-                for (const plan of generateDeterministicSlotPlans([newCampaignPostId], 30)) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                for (const plan of generateDeterministicSlotPlans([newCampaignPostId], 30, (account.brand_variants as any) || [])) {
                   await client.query(`INSERT INTO generation_jobs (cycle_id,campaign_id,campaign_post_id,slot_index,slot_plan,length_mode,emoji_policy,rhetorical_form,texture,status,model_name,prompt_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,1)`, [cycleId, account.campaign_id, newCampaignPostId, plan.slotIndex, JSON.stringify(plan), plan.lengthMode, plan.emojiPolicy, plan.rhetoricalForm, plan.texture, model.apiModel]);
                 }
                 const cursorRes = await client.query(

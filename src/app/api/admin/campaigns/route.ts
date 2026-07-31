@@ -77,7 +77,7 @@ export async function POST(req: Request) {
         );
       }
 
-      const { urlsInput, direction, displayName, modelKey } = body;
+      const { urlsInput, direction, displayName, modelKey, brandVariants } = body;
       
       if (!urlsInput || typeof urlsInput !== 'string') {
         return NextResponse.json(
@@ -95,7 +95,8 @@ export async function POST(req: Request) {
 
       if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length > 120)) return NextResponse.json({ error: 'Nombre de campaña no válido.' }, { status: 400 });
       if (modelKey !== undefined && typeof modelKey !== 'string') return NextResponse.json({ error: 'Modelo no válido.' }, { status: 400 });
-      const created = await createCampaign({ urlsInput, direction, displayName, modelKey });
+      if (brandVariants !== undefined && !Array.isArray(brandVariants)) return NextResponse.json({ error: 'Variantes de marca no válidas.' }, { status: 400 });
+      const created = await createCampaign({ urlsInput, direction, displayName, modelKey, brandVariants });
 
       return NextResponse.json(
         { success: true, campaign: { ...created, campaignType: 'manual' } },
@@ -109,7 +110,7 @@ export async function POST(req: Request) {
         );
       }
 
-      const { accountsInput, direction, postActiveLifetimeHours, displayName, modelKey } = body;
+      const { accountsInput, direction, postActiveLifetimeHours, displayName, modelKey, brandVariants } = body;
       
       if (!accountsInput || typeof accountsInput !== 'string') {
         return NextResponse.json(
@@ -134,7 +135,8 @@ export async function POST(req: Request) {
 
       if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length > 120)) return NextResponse.json({ error: 'Nombre de campaña no válido.' }, { status: 400 });
       if (modelKey !== undefined && typeof modelKey !== 'string') return NextResponse.json({ error: 'Modelo no válido.' }, { status: 400 });
-      const created = await createPerpetualCampaign({ accountsInput, direction, postActiveLifetimeHours, displayName, modelKey });
+      if (brandVariants !== undefined && !Array.isArray(brandVariants)) return NextResponse.json({ error: 'Variantes de marca no válidas.' }, { status: 400 });
+      const created = await createPerpetualCampaign({ accountsInput, direction, postActiveLifetimeHours, displayName, modelKey, brandVariants });
 
       return NextResponse.json(
         { success: true, campaign: { id: created.id, slug: created.slug, campaignType: 'perpetual' }, initialSync: created.initialSync },

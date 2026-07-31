@@ -2,7 +2,6 @@ import 'server-only';
 import type { PoolClient } from '@neondatabase/serverless';
 import { randomUUID } from 'node:crypto';
 import { queryDb, withTransaction } from './db';
-import { SlotPlan } from './planner';
 import { generateSingleComment } from './openai';
 import { getConfiguredFallbackModel } from './ai/models';
 import {
@@ -10,6 +9,7 @@ import {
   normalizeCommentText,
   validateCommentLocally,
 } from './validator';
+import { SlotPlanV2, normalizeStoredSlotPlan } from './brand-variants';
 
 export interface ClaimedJob {
   jobId: string;
@@ -17,7 +17,7 @@ export interface ClaimedJob {
   campaignId: string;
   campaignPostId: string;
   slotIndex: number;
-  slotPlan: SlotPlan;
+  slotPlan: SlotPlanV2;
   attemptsCount: number;
   postText: string;
   authorName: string;
@@ -193,7 +193,7 @@ async function claimNextJob(workerId: string): Promise<ClaimedJob | null> {
       campaignId: row.campaign_id,
       campaignPostId: row.campaign_post_id,
       slotIndex: row.slot_index,
-      slotPlan: row.slot_plan as SlotPlan,
+      slotPlan: normalizeStoredSlotPlan(row.slot_plan),
       attemptsCount: row.attempts_count,
       postText: row.post_text,
       authorName: row.author_name || 'Desconocido',

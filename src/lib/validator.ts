@@ -1,6 +1,7 @@
 import 'server-only';
 import { createHash } from 'node:crypto';
-import { ALLOWED_EMOJIS, SlotPlan } from './planner';
+import { ALLOWED_EMOJIS } from './planner';
+import { SlotPlanV2 } from './brand-variants';
 
 export function normalizeCommentText(text: string): string {
   if (!text) return '';
@@ -25,7 +26,6 @@ export function countEmojisInText(text: string): { totalCount: number; validList
   let validListCount = 0;
   const foundEmojis: string[] = [];
 
-  // Match emoji ranges using Unicode property escapes
   const emojiRegex = /\p{Extended_Pictographic}/u;
 
   for (const { segment } of segmenter.segment(text)) {
@@ -48,9 +48,8 @@ function countWords(text: string): number {
 }
 
 function countSentences(text: string): number {
-  // Splits by period, exclamation, or question mark followed by space or end
   const sentences = text
-    .split(/[.!?]+(?:\s+|$)/)
+    .split(/[.!?]+(?:\s+|$)|(?:\n+)/)
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
   return sentences.length;
@@ -63,7 +62,7 @@ export interface ValidationResult {
 
 export function validateCommentLocally(
   commentText: string,
-  plan: SlotPlan,
+  plan: SlotPlanV2,
   recentComments: string[] = [],
   campaignDirection?: string
 ): ValidationResult {
@@ -75,6 +74,67 @@ export function validateCommentLocally(
   // 1. Check for URLs
   if (/https?:\/\/\S+/i.test(trimmed) || /www\.\S+/i.test(trimmed)) {
     return { valid: false, reason: 'Comment contains a forbidden URL.' };
+  }
+
+  // Brand Variant Validation
+  let textForStrictChecks = trimmed;
+  if (plan.brandVariant) {
+    const brandIdx = trimmed.indexOf(plan.brandVariant);
+    if (brandIdx === -1) {
+      return { valid: false, reason: `Brand variant "${plan.brandVariant}" is missing or incorrect casing.` };
+    }
+    const lastIdx = trimmed.lastIndexOf(plan.brandVariant);
+    if (brandIdx !== lastIdx) {
+      return { valid: false, reason: `Brand variant "${plan.brandVariant}" appears more than once.` };
+    }
+    // Remove the brand variant for lowercase/punctuation checks
+    textForStrictChecks = trimmed.replace(plan.brandVariant, '');
+  }
+
+  // Voice Family Validation
+  const firstPersonRegex = /\b(i|me|my|mine|i'm|i've|i'll|i'd|im|ive|ill|id)\b/i;
+  const hasFirstPerson = firstPersonRegex.test(trimmed);
+  if (plan.voiceFamily === 'first_person' && !hasFirstPerson) {
+    return { valid: false, reason: `First person voice required but no first person pronouns found.` };
+  } else if (plan.voiceFamily === 'general' && hasFirstPerson) {
+    return { valid: false, reason: `General voice required but first person pronouns found.` };
+  }
+
+  // Punctuation Validation
+  if (plan.punctuationMode === 'no_punctuation') {
+    if (/[.,!?;:()[\]{}"'`\-—_…]/.test(textForStrictChecks)) {
+      return { valid: false, reason: `no_punctuation mode violated.` };
+    }
+  } else if (plan.punctuationMode === 'commas_only') {
+    if (/[.!?;:()[\]{}"'`\-—_…]/.test(textForStrictChecks)) {
+      return { valid: false, reason: `commas_only mode violated by other punctuation.` };
+    }
+  } else if (plan.punctuationMode === 'ellipsis_required') {
+    if (!trimmed.includes('...')) {
+      return { valid: false, reason: `ellipsis_required mode violated (no ... found).` };
+    }
+  }
+
+  // Capitalization Validation
+  if (plan.capitalizationMode === 'lowercase_only') {
+    if (/[A-Z]/.test(textForStrictChecks)) {
+      return { valid: false, reason: `lowercase_only mode violated.` };
+    }
+  }
+
+  // Syntax Validation
+  if (plan.syntaxMode === 'parenthetical_aside') {
+    if (!trimmed.includes('(') || !trimmed.includes(')')) {
+      return { valid: false, reason: `parenthetical_aside syntax requires parentheses.` };
+    }
+  } else if (plan.syntaxMode === 'rhetorical_question') {
+    if (!trimmed.includes('?')) {
+      return { valid: false, reason: `rhetorical_question syntax requires a question mark.` };
+    }
+  } else if (plan.syntaxMode === 'line_breaks') {
+    if (!trimmed.includes('\n')) {
+      return { valid: false, reason: `line_breaks syntax requires at least one newline.` };
+    }
   }
 
   // 2. Length & Sentence constraints
@@ -101,6 +161,12 @@ export function validateCommentLocally(
     }
   }
 
+  if (plan.syntaxMode === 'short_bursts') {
+    if (sentenceCount < 2) {
+      return { valid: false, reason: `short_bursts syntax requires multiple short sentences.` };
+    }
+  }
+
   // 3. Emoji rules
   const emojiInfo = countEmojisInText(trimmed);
   if (plan.emojiPolicy === 'one_emoji') {
@@ -117,7 +183,6 @@ export function validateCommentLocally(
   }
 
   // 4. English language character sanity check
-  // Ensures most characters are Latin/standard English
   const latinCount = (trimmed.match(/[\p{Script=Latin}\p{N}\p{P}\s]/gu) || []).length;
   const nonEmojiCharLength = charLength - emojiInfo.totalCount;
   if (nonEmojiCharLength > 0 && latinCount / nonEmojiCharLength < 0.85) {

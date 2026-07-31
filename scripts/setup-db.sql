@@ -20,11 +20,21 @@ CREATE TABLE IF NOT EXISTS campaigns (
     replenishment_threshold INT NOT NULL DEFAULT 5,
     replenishment_size INT NOT NULL DEFAULT 10,
     prompt_version INT NOT NULL DEFAULT 1,
+    brand_variants JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_brand_variants_is_array CHECK (jsonb_typeof(brand_variants) = 'array')
 );
 
 -- Migración de campañas existentes
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS brand_variants JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_brand_variants_is_array' AND conrelid = 'campaigns'::regclass) THEN
+        ALTER TABLE campaigns ADD CONSTRAINT chk_brand_variants_is_array CHECK (jsonb_typeof(brand_variants) = 'array');
+    END IF;
+END $$;
 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS campaign_type TEXT NOT NULL DEFAULT 'manual';
 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS post_active_lifetime_hours INTEGER;
 

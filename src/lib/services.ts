@@ -246,6 +246,7 @@ export async function createCampaign(params: {
   direction?: string;
   displayName?: string;
   modelKey?: string;
+  brandVariants?: { value: string; percentage: number }[];
 }): Promise<{ id: string; slug: string }> {
   // 1. Validate & deduplicate X URLs
   const extractedUrls = parseMultipleXUrls(params.urlsInput);
@@ -275,11 +276,11 @@ export async function createCampaign(params: {
     const campRes = await client.query<{ id: string }>(
       `INSERT INTO campaigns (
          slug, campaign_type, direction, post_active_lifetime_hours, is_active, safety_allowed, safety_category, safety_reason,
-         initial_size, replenishment_threshold, replenishment_size, display_name, model_key
+         initial_size, replenishment_threshold, replenishment_size, display_name, model_key, brand_variants
        ) VALUES (
-         $1, 'manual', $2, NULL, true, true, $3, $4, 30, 5, 10, $5, $6
+         $1, 'manual', $2, NULL, true, true, $3, $4, 30, 5, 10, $5, $6, $7::jsonb
        ) RETURNING id`,
-      [slug, params.direction || null, safetyResult.category, safetyResult.reason, displayName, model.key]
+      [slug, params.direction || null, safetyResult.category, safetyResult.reason, displayName, model.key, JSON.stringify(params.brandVariants || [])]
     );
     const campaignId = campRes.rows[0].id;
 
@@ -311,7 +312,7 @@ export async function createCampaign(params: {
     }
 
     for (const campaignPostId of campaignPostIds) {
-      const slotPlans = generateDeterministicSlotPlans([campaignPostId], 30);
+      const slotPlans = generateDeterministicSlotPlans([campaignPostId], 30, params.brandVariants || []);
       const cycleRes = await client.query<{ id: string }>(
         `INSERT INTO generation_cycles (
             campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name, prompt_version
@@ -496,8 +497,8 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
 
 export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<void> {
   // Determine campaign type first outside transaction for fast paths
-  const campTypeRes = await queryDb<{ campaign_type: string, replenishment_threshold: number, replenishment_size: number, model_key: string }>(
-    `SELECT campaign_type, replenishment_threshold, replenishment_size, model_key FROM campaigns WHERE id = $1 AND is_active = true`,
+  const campTypeRes = await queryDb<{ campaign_type: string, replenishment_threshold: number, replenishment_size: number, model_key: string, brand_variants: unknown }>(
+    `SELECT campaign_type, replenishment_threshold, replenishment_size, model_key, brand_variants FROM campaigns WHERE id = $1 AND is_active = true`,
     [campaignId]
   );
   if (campTypeRes.length === 0) return;
@@ -529,7 +530,8 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
           if (checkRes.rows.length > 0) continue;
 
           await client.query(`SELECT 1 FROM campaign_posts WHERE id = $1 FOR UPDATE`, [postId]);
-          const slotPlans = generateDeterministicSlotPlans([postId], repSize);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const slotPlans = generateDeterministicSlotPlans([postId], repSize, (campaignInfo.brand_variants as any) || []);
           const cycleRes = await client.query<{ id: string }>(
             `INSERT INTO generation_cycles (
               campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name, prompt_version
@@ -630,7 +632,8 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
           continue;
         }
 
-        const slotPlans = generateDeterministicSlotPlans([postId], repSize);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const slotPlans = generateDeterministicSlotPlans([postId], repSize, (campaignInfo.brand_variants as any) || []);
         if (slotPlans.length === 0) continue;
 
         const cycleRes = await client.query<{ id: string }>(
@@ -893,6 +896,7 @@ export async function createPerpetualCampaign(params: {
   postActiveLifetimeHours: number;
   displayName?: string;
   modelKey?: string;
+  brandVariants?: { value: string; percentage: number }[];
 }): Promise<{ id: string; slug: string; initialSync: PerpetualMonitorSummary }> {
   const normalizedAccounts = normalizeXAccounts(params.accountsInput);
   const model = resolveCampaignModel(params.modelKey);
@@ -910,11 +914,11 @@ export async function createPerpetualCampaign(params: {
     const campRes = await client.query<{ id: string }>(
       `INSERT INTO campaigns (
          slug, campaign_type, direction, post_active_lifetime_hours, is_active, safety_allowed,
-         initial_size, replenishment_threshold, replenishment_size, display_name, model_key
+         initial_size, replenishment_threshold, replenishment_size, display_name, model_key, brand_variants
        ) VALUES (
-         $1, 'perpetual', $2, $3, true, true, 30, 5, 10, $4, $5
+         $1, 'perpetual', $2, $3, true, true, 30, 5, 10, $4, $5, $6::jsonb
        ) RETURNING id`,
-      [slug, params.direction || null, params.postActiveLifetimeHours, displayName, model.key]
+      [slug, params.direction || null, params.postActiveLifetimeHours, displayName, model.key, JSON.stringify(params.brandVariants || [])]
     );
     const campaignId = campRes.rows[0].id;
 
@@ -962,14 +966,15 @@ export async function reconcileCampaignReplenishment(limit = 50): Promise<{ chec
 }
 
 export async function generateCampaignPreview(campaignId: string) {
-  const rows = await queryDb<{ model_key: string; direction: string | null; post_id: string; text_content: string; author_name: string | null; author_username: string | null; accessible_context: unknown }>(
-    `SELECT c.model_key,c.direction,p.id post_id,p.text_content,p.author_name,p.author_username,p.accessible_context
+  const rows = await queryDb<{ model_key: string; direction: string | null; brand_variants: unknown; post_id: string; text_content: string; author_name: string | null; author_username: string | null; accessible_context: unknown }>(
+    `SELECT c.model_key,c.direction,c.brand_variants,p.id post_id,p.text_content,p.author_name,p.author_username,p.accessible_context
      FROM campaigns c JOIN campaign_posts p ON p.campaign_id=c.id
      WHERE c.id=$1 AND p.retired_at IS NULL AND (p.expires_at IS NULL OR p.expires_at>NOW())
      ORDER BY p.posted_at DESC NULLS LAST,p.created_at DESC LIMIT 1`, [campaignId]);
   if (!rows[0]) throw new Error('No hay ningún post vigente para generar la preview.');
   const row = rows[0]; const model = resolveCampaignModel(row.model_key);
-  const plans = generateDeterministicSlotPlans([row.post_id], 7);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const plans = generateDeterministicSlotPlans([row.post_id], 7, (row.brand_variants as any) || []);
   const comments: string[] = []; let errorMessage: string | null = null;
   let inputTokens: number | null = 0;
   let cachedInputTokens: number | null = 0;
