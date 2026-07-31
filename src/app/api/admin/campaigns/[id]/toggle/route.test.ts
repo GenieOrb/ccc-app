@@ -16,18 +16,26 @@ describe('campaign toggle route', () => {
   });
 
   it('persists and returns the server status only for an authenticated same-origin request', async () => {
-    const response = await POST(new Request('http://localhost/api/admin/campaigns/campaign-1/toggle', { method: 'POST' }), context);
+    const response = await POST(new Request('http://localhost/api/admin/campaigns/campaign-1/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ isActive: false })
+    }), context);
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({ success: true, isActive: false });
-    expect(toggleCampaignStatus).toHaveBeenCalledWith('campaign-1');
+    expect(toggleCampaignStatus).toHaveBeenCalledWith('campaign-1', false);
   });
 
   it('does not return activation success until the service finishes its recovery work', async () => {
     let finishRecovery!: (isActive: boolean) => void;
     toggleCampaignStatus.mockReturnValue(new Promise((resolve) => { finishRecovery = resolve; }));
-    const pending = POST(new Request('http://localhost/api/admin/campaigns/campaign-1/toggle', { method: 'POST' }), context);
+    const pending = POST(new Request('http://localhost/api/admin/campaigns/campaign-1/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ isActive: true })
+    }), context);
 
-    await vi.waitFor(() => expect(toggleCampaignStatus).toHaveBeenCalledWith('campaign-1'));
+    await vi.waitFor(() => expect(toggleCampaignStatus).toHaveBeenCalledWith('campaign-1', true));
     finishRecovery(true);
 
     const response = await pending;

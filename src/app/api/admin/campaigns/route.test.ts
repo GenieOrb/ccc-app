@@ -64,4 +64,40 @@ describe('admin campaigns route', () => {
     await expect(response.json()).resolves.toMatchObject({ campaign: { id: 'perpetual-1', campaignType: 'perpetual' }, initialSync: { accountsProcessed: 1, postsImported: 1 } });
     expect(createPerpetualCampaign).toHaveBeenCalledWith(expect.objectContaining({ accountsInput: '@author', postActiveLifetimeHours: 24 }));
   });
+
+  describe('maxCommentsTotal validation', () => {
+    it('accepts a valid maxCommentsTotal', async () => {
+      const response = await POST(new Request('http://localhost/api/admin/campaigns', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ campaignType: 'manual', urlsInput: 'https://x.com/a/status/1', maxCommentsTotal: 500 })
+      }));
+      expect(response.status).toBe(200);
+      expect(createCampaign).toHaveBeenCalledWith(expect.objectContaining({ maxCommentsTotal: 500 }));
+    });
+
+    it('accepts when maxCommentsTotal is undefined (omitted)', async () => {
+      const response = await POST(new Request('http://localhost/api/admin/campaigns', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ campaignType: 'manual', urlsInput: 'https://x.com/a/status/1' })
+      }));
+      expect(response.status).toBe(200);
+      expect(createCampaign).toHaveBeenCalledWith(expect.objectContaining({ urlsInput: 'https://x.com/a/status/1' }));
+    });
+
+    it('rejects invalid maxCommentsTotal values', async () => {
+      const invalidValues = [
+        0, -1, 1000001, 5.5, '100', null
+      ];
+
+      for (const value of invalidValues) {
+        const response = await POST(new Request('http://localhost/api/admin/campaigns', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ campaignType: 'manual', urlsInput: 'https://x.com/a/status/1', maxCommentsTotal: value })
+        }));
+        expect(response.status).toBe(400);
+        const data = await response.json();
+        expect(data.error).toBe('El máximo de comentarios debe ser un entero entre 1 y 1.000.000.');
+      }
+    });
+  });
 });

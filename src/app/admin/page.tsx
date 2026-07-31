@@ -42,7 +42,14 @@ export interface CampaignSummary {
   pendingProcessingJobsCount: number;
   failedJobsCount: number;
   hasUnresolvedFailedCycle: boolean;
+  aiRecordedCost: number;
+  xRecordedCost: number;
   recordedCost: number;
+  costIsComplete: boolean;
+  unknownAiCostCalls: number;
+  unknownXCostCalls: number;
+  maxCommentsTotal?: number;
+  limitReached: boolean;
   createdAt: string;
 }
 
@@ -72,6 +79,11 @@ interface CampaignPreview {
   estimated_cost: string | number | null;
   error_message: string | null;
   created_at: string;
+}
+
+function safeFiniteNumber(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function CampaignCardItem({
@@ -459,7 +471,14 @@ function CampaignCardItem({
         </div>
         <div className="stat-item">
           <span className="stat-label">Generados</span>
-          <span className="stat-value">{c.validGeneratedCount}</span>
+          <span className="stat-value">
+            {c.validGeneratedCount}
+            {c.maxCommentsTotal !== undefined && c.maxCommentsTotal !== null && (
+              <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                {' / '}{c.maxCommentsTotal}
+              </span>
+            )}
+          </span>
         </div>
         <div className="stat-item">
           <span className="stat-label">Disponibles</span>
@@ -483,9 +502,19 @@ function CampaignCardItem({
             {c.failedJobsCount}
           </span>
         </div>
-        <div className="stat-item">
-          <span className="stat-label">Coste registrado</span>
-          <span className="stat-value">${c.recordedCost.toFixed(8)}</span>
+        <div className="stat-item" style={{ gridColumn: '1 / -1' }}>
+          <span className="stat-label">Costo acumulado</span>
+          <span className="stat-value">
+            ${safeFiniteNumber(c.recordedCost).toFixed(3)}
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginLeft: '8px' }}>
+              (IA: ${safeFiniteNumber(c.aiRecordedCost).toFixed(3)} / X API: ${safeFiniteNumber(c.xRecordedCost).toFixed(3)})
+            </span>
+          </span>
+          {!c.costIsComplete && (
+            <span style={{ fontSize: '0.75rem', color: 'var(--warning-color)', display: 'block' }}>
+              Importe parcial (faltan {c.unknownAiCostCalls} IA, {c.unknownXCostCalls} X)
+            </span>
+          )}
         </div>
       </div>
 
@@ -621,6 +650,7 @@ export default function AdminDashboardPage() {
   const [campaignPage, setCampaignPage] = useState(1);
   const [totalCampaigns, setTotalCampaigns] = useState(0);
   const [totalCampaignPages, setTotalCampaignPages] = useState(1);
+  const [globalCost, setGlobalCost] = useState({ aiCost: 0, xCost: 0, totalCost: 0, costIsComplete: true, unknownAiCostCalls: 0, unknownXCostCalls: 0 });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -633,6 +663,7 @@ export default function AdminDashboardPage() {
   const [urlsInput, setUrlsInput] = useState('');
   const [accountsInput, setAccountsInput] = useState('');
   const [postActiveLifetimeHours, setPostActiveLifetimeHours] = useState('24');
+  const [maxCommentsTotalInput, setMaxCommentsTotalInput] = useState('');
   const [direction, setDirection] = useState('');
   const [creating, setCreating] = useState(false);
   const [generatingPreview, setGeneratingPreview] = useState(false);
@@ -659,6 +690,12 @@ export default function AdminDashboardPage() {
         return;
       }
       const data = await res.json();
+      const costRes = await fetch('/api/admin/metrics/costs').catch(() => null);
+      if (costRes && costRes.ok) {
+        const costData = await costRes.json();
+        setGlobalCost(prev => ({ ...prev, ...costData }));
+      }
+
       if (res.ok) {
         setCampaigns(data.items || []);
         setCampaignPage(data.page || requestedPage);
@@ -715,6 +752,17 @@ export default function AdminDashboardPage() {
 
     try {
       const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, displayName, modelKey };
+      const trimmedMax = maxCommentsTotalInput.trim();
+      if (trimmedMax !== '') {
+        const parsedMaxTotal = Number(trimmedMax);
+        if (!Number.isInteger(parsedMaxTotal) || parsedMaxTotal < 1 || parsedMaxTotal > 1000000) {
+          setError('El máximo de comentarios debe ser un entero entre 1 y 1.000.000.');
+          setCreating(false);
+          return;
+        }
+        payload.maxCommentsTotal = parsedMaxTotal;
+      }
+
       if (campaignTypeToCreate === 'manual') {
         payload.urlsInput = urlsInput;
       } else {
@@ -743,6 +791,7 @@ export default function AdminDashboardPage() {
       setUrlsInput('');
       setAccountsInput('');
       setDirection('');
+      setMaxCommentsTotalInput('');
       await fetchCampaigns(1);
     } catch {
       setError('Error al enviar la petición de creación.');
@@ -869,13 +918,23 @@ export default function AdminDashboardPage() {
       {/* Admin Header */}
       <header className="admin-header">
         <h1 className="admin-title">Panel Administrativo</h1>
-        <button
-          onClick={handleLogout}
-          className="btn-admin btn-secondary"
-          type="button"
-        >
-          Cerrar sesión
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', textAlign: 'right' }}>
+            <span style={{ fontSize: '1rem', fontWeight: 'bold', color: 'var(--color-primary)' }}>
+              Costo en los últimos 30 días: ${safeFiniteNumber(globalCost.totalCost).toFixed(3)}
+            </span>
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+              IA: ${safeFiniteNumber(globalCost.aiCost).toFixed(3)} | X API: ${safeFiniteNumber(globalCost.xCost).toFixed(3)}
+            </span>
+          </div>
+          <button
+            onClick={handleLogout}
+            className="btn-admin btn-secondary"
+            type="button"
+          >
+            Cerrar sesión
+          </button>
+        </div>
       </header>
 
       {/* Admin Main Body */}
@@ -889,7 +948,7 @@ export default function AdminDashboardPage() {
         {/* Create Campaign Card */}
         <section className="admin-card">
           <h2 className="admin-card-header">Crear Nueva Campaña</h2>
-          <form onSubmit={handleCreateCampaign}>
+          <form onSubmit={handleCreateCampaign} noValidate>
             <div className="form-group"><label className="form-label">Nombre de campaña</label><input className="form-textarea" value={displayName} maxLength={120} onChange={(e) => setDisplayName(e.target.value)} /></div>
             <div className="form-group"><label className="form-label">Modelo</label><select className="form-textarea" value={modelKey} onChange={(e) => setModelKey(e.target.value)}>{models.map(model => <option key={model.key} value={model.key} disabled={!model.enabled || !model.configured}>{model.displayName} — Entrada ${model.inputPricePerMillion} · salida ${model.outputPricePerMillion} / 1M tokens{!model.configured ? ' · No configurado' : ''}</option>)}</select></div>
             <div className="form-group">
@@ -965,6 +1024,26 @@ export default function AdminDashboardPage() {
                 </div>
               </>
             )}
+
+            <div className="form-group">
+              <label htmlFor="max-comments-total-input" className="form-label">
+                Máximo de comentarios (opcional)
+              </label>
+              <input
+                id="max-comments-total-input"
+                type="number"
+                min="1" max="1000000" step="1"
+                className="form-textarea"
+                style={{ minHeight: 'auto', padding: '8px' }}
+                value={maxCommentsTotalInput}
+                onChange={(e) => setMaxCommentsTotalInput(e.target.value)}
+                placeholder="Ej. 1000"
+                disabled={creating}
+              />
+              <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                Déjalo vacío para que la campaña no tenga un límite total de comentarios.
+              </p>
+            </div>
 
             <div className="form-group">
               <label htmlFor="direction-input" className="form-label">

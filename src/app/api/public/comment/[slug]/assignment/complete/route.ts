@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { validateSameOrigin } from '@/lib/auth';
 import { getOrCreateVisitorIdentity } from '@/lib/visitor';
 import { withTransaction } from '@/lib/db';
+import { triggerReplenishmentIfNeeded } from '@/lib/services';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -20,7 +21,7 @@ export async function POST(
 
   try {
     const { slug } = await params;
-    
+
     // Parse body for assignmentId
     const body = await req.json().catch(() => ({}));
     const assignmentId = body.assignmentId;
@@ -35,7 +36,7 @@ export async function POST(
     const visitor = await getOrCreateVisitorIdentity();
 
     // 3. All logic inside a single transaction
-    const result = await withTransaction<{ status: 'success'; canonicalUrl: string } | { status: 'error' } | { status: 'expired' }>(
+    const result = await withTransaction<{ status: 'success'; canonicalUrl: string; campaignId: string } | { status: 'error' } | { status: 'expired' }>(
       async (client) => {
         // Fetch and lock campaign FOR SHARE
         const campaignRows = await client.query<{ id: string; is_active: boolean }>(
@@ -54,11 +55,11 @@ export async function POST(
           `SELECT id FROM visitors WHERE visitor_hash = $1`,
           [visitor.visitorHash]
         );
-        
+
         if (visitorRows.rows.length === 0) {
           return { status: 'error' };
         }
-        
+
         const visitorId = visitorRows.rows[0].id;
 
         // Lock the visitor campaign state FOR UPDATE
@@ -91,7 +92,7 @@ export async function POST(
 
         // Check if click already recorded for this assignment, campaign, visitor
         const clickRes = await client.query(
-          `SELECT 1 FROM assignment_post_clicks 
+          `SELECT 1 FROM assignment_post_clicks
            WHERE assignment_id = $1 AND campaign_id = $2 AND visitor_id = $3`,
           [assignmentId, campaignId, visitorId]
         );
@@ -99,7 +100,7 @@ export async function POST(
         if (clickRes.rows.length > 0) {
           // Idempotent success - already recorded
           // Note: we return success even if campaign was deactivated after first click, as required by "permitir este éxito aunque la campaña haya sido desactivada".
-          return { status: 'success', canonicalUrl };
+          return { status: 'success', canonicalUrl, campaignId };
         }
 
         // It is a new click. Require campaign to be active.
@@ -109,7 +110,7 @@ export async function POST(
 
         // Require active_assignment_id to be EXACTLY this assignmentId
         if (stateRes.rows[0].active_assignment_id !== assignmentId) {
-          return { status: 'error' }; 
+          return { status: 'error' };
         }
 
         // Insert click (immutable record)
@@ -127,12 +128,12 @@ export async function POST(
            RETURNING 1`,
           [campaignId, visitorId, assignmentId]
         );
-        
+
         if (updateRes.rows.length !== 1) {
           throw new Error('Failed to update active assignment state');
         }
 
-        return { status: 'success', canonicalUrl };
+        return { status: 'success', canonicalUrl, campaignId };
       }
     );
 
@@ -148,6 +149,10 @@ export async function POST(
         { status: 'error', message: 'Please try again' },
         { status: 400, headers: { 'Cache-Control': 'no-store' } }
       );
+    }
+
+    if (result.campaignId) {
+      triggerReplenishmentIfNeeded(result.campaignId).catch(() => undefined);
     }
 
     return NextResponse.json(

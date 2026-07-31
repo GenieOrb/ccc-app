@@ -4,7 +4,7 @@ const { queryDb, withTransaction, normalizeXAccounts, generateSecureSlug, genera
   queryDb: vi.fn(), withTransaction: vi.fn(), normalizeXAccounts: vi.fn(), generateSecureSlug: vi.fn(), generateDeterministicSlotPlans: vi.fn(), processPerpetualCampaigns: vi.fn(),
 }));
 vi.mock('./db', () => ({ queryDb, withTransaction }));
-vi.mock('./x-api', () => ({ parseMultipleXUrls: vi.fn(), fetchXPosts: vi.fn() }));
+vi.mock('./x-api', () => ({ parseMultipleXUrls: vi.fn(), fetchXPosts: vi.fn(), resolveXUsername: vi.fn().mockResolvedValue('x-123') }));
 vi.mock('./x-accounts', () => ({ normalizeXAccounts }));
 vi.mock('./openai', () => ({ checkCampaignSafety: vi.fn(), generateSingleComment: vi.fn() }));
 vi.mock('./crypto', () => ({ generateSecureSlug }));
@@ -21,8 +21,8 @@ describe('toggleCampaignStatus perpetual activation recovery', () => {
       const result = await operation({
         query: vi.fn(async (sql: string) => {
           if (sql.includes('SELECT is_active, campaign_type')) return { rows: [{ is_active: false, campaign_type: 'perpetual' }] };
-          if (sql.includes('SELECT COUNT(*) FROM campaign_accounts')) return { rows: [{ count: '1' }] };
-          if (sql.includes('UPDATE campaign_accounts') || sql.includes('UPDATE campaigns SET is_active = true')) return { rows: [] };
+          if (sql.includes('FROM campaign_accounts')) return { rows: [{ count: '1' }] };
+          if (sql.includes('UPDATE campaign_accounts') || sql.includes('UPDATE campaigns SET is_active')) return { rows: [] };
           throw new Error(`Unexpected SQL in test: ${sql}`);
         }),
       });
@@ -34,7 +34,7 @@ describe('toggleCampaignStatus perpetual activation recovery', () => {
       return { accountsProcessed: 1, postsDetected: 1, postsImported: 1, postsRejected: 0, postsExpired: 0, cyclesCreated: 1, errors: [] };
     });
 
-    await expect(toggleCampaignStatus('campaign-1')).resolves.toBe(true);
+    await expect(toggleCampaignStatus('campaign-1', true)).resolves.toBe(true);
     expect(processPerpetualCampaigns).toHaveBeenCalledWith({ campaignId: 'campaign-1', timeBudgetMs: 30_000 });
   });
 
@@ -48,11 +48,12 @@ describe('toggleCampaignStatus perpetual activation recovery', () => {
           if (sql.includes('SELECT is_active, campaign_type')) return { rows: [campaign] };
           if (sql.includes('COUNT(*) AS initial_cycle_count')) return { rows: [{ initial_cycle_count: '1', incomplete_cycle_count: '0', valid_produced_count: '1', target_count: '1' }] };
           if (sql.includes('FROM suggestions')) return { rows: [{ avail_count: '1' }] };
+          if (sql.includes('FROM campaign_posts')) return { rows: [{ count: '1' }] };
           if (sql.includes('UPDATE campaigns SET is_active')) return { rows: [] };
           throw new Error(`Unexpected SQL in test: ${sql}`);
         }),
       }));
-      await toggleCampaignStatus('campaign-1');
+      await toggleCampaignStatus('campaign-1', true);
     }
 
     expect(processPerpetualCampaigns).not.toHaveBeenCalled();
@@ -71,6 +72,9 @@ describe('createPerpetualCampaign initial synchronization', () => {
           accountInsertSql = sql;
           return { rows: [{ id: 'account-1' }] };
         }
+        if (sql.includes('UPDATE generation_api_calls') || sql.includes('UPDATE x_api_calls')) {
+          return { rows: [] };
+        }
         throw new Error(`Unexpected SQL in test: ${sql}`);
       });
       return operation({ query });
@@ -83,7 +87,7 @@ describe('createPerpetualCampaign initial synchronization', () => {
     await vi.waitFor(() => expect(processPerpetualCampaigns).toHaveBeenCalledTimes(1));
     expect(settled).toBe(false);
     expect(accountInsertSql.replace(/\s+/g, ' ').trim()).toMatch(
-      /INSERT INTO campaign_accounts \( campaign_id, username, username_normalized \) VALUES \(\$1, \$2, \$3\) RETURNING id$/,
+      /INSERT INTO campaign_accounts \( campaign_id, username, username_normalized, x_user_id, monitoring_started_at \) VALUES \(\$1, \$2, \$3, \$4, NOW\(\)\) RETURNING id$/,
     );
     expect(processPerpetualCampaigns).toHaveBeenCalledWith({ campaignId: 'campaign-1', accountIds: ['account-1'], timeBudgetMs: 30_000 });
 
@@ -212,8 +216,8 @@ describe('triggerReplenishmentIfNeeded for perpetual campaigns', () => {
     await triggerReplenishmentIfNeeded('campaign-1');
 
     const postLockIndex = queryOrder.findIndex((sql) => sql.includes('FROM campaign_posts WHERE id = $1 FOR UPDATE'));
-    const availabilityIndex = queryOrder.findIndex((sql) => sql.includes('FROM suggestions'));
-    const activeCycleIndex = queryOrder.findIndex((sql) => sql.includes("status IN ('pending', 'processing')"));
+    const availabilityIndex = queryOrder.findIndex((sql) => sql.includes('FROM suggestions') && sql.includes('campaign_post_id'));
+    const activeCycleIndex = queryOrder.findIndex((sql) => sql.includes('FROM generation_cycles'));
     const failedCycleIndex = queryOrder.findIndex((sql) => sql.includes("status = 'failed'"));
     expect(postLockIndex).toBeGreaterThan(-1);
     expect(postLockIndex).toBeLessThan(availabilityIndex);

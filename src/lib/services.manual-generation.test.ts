@@ -75,7 +75,7 @@ describe('manual campaign generation inventory', () => {
     await createCampaign({ urlsInput: 'two posts' });
 
     const campaignInsert = queries.find(({ sql }) => sql.includes('INSERT INTO campaigns'))!;
-    expect(campaignInsert.sql.replace(/\s+/g, ' ')).toContain("NULL, true, true");
+    expect(campaignInsert.sql.replace(/\s+/g, ' ')).toContain("true, true");
     const cycles = queries.filter(({ sql }) => sql.includes('INSERT INTO generation_cycles'));
     expect(cycles).toHaveLength(2);
     expect(cycles.map(({ params }) => params?.slice(0, 2))).toEqual([
@@ -85,7 +85,7 @@ describe('manual campaign generation inventory', () => {
   });
 
   it('replenishes only the depleted manual post with ten jobs', async () => {
-    queryDb.mockResolvedValueOnce([{ campaign_type: 'manual', replenishment_threshold: 5, replenishment_size: 10, model_key: 'test-model' }]);
+    queryDb.mockResolvedValueOnce([{ campaign_type: 'manual', replenishment_threshold: 5, replenishment_size: 10, model_key: 'test-model', max_comments_total: null }]);
     const queries: Array<{ sql: string; params?: unknown[] }> = [];
     withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
       query: vi.fn(async (sql: string, params?: unknown[]) => {
@@ -123,11 +123,12 @@ describe('manual campaign generation inventory', () => {
       query: vi.fn(async (sql: string) => {
         if (sql.includes('FROM campaigns')) return { rows: [{ is_active: false, campaign_type: 'manual' }] };
         if (sql.includes('SELECT status')) return { rows: [{ status: 'completed', target_count: 30, valid_produced_count: 30 }] };
+        if (sql.includes('FROM campaign_posts')) return { rows: [{ count: '1' }] };
         if (sql.includes('FROM generation_cycles')) return { rows: [{ initial_cycle_count: '2', incomplete_cycle_count: '1', valid_produced_count: '30', target_count: '60' }] };
         return { rows: [] };
       }),
     }));
 
-    await expect(toggleCampaignStatus('campaign-1')).rejects.toThrow('ciclo inicial inexistente o incompleto');
+    await expect(toggleCampaignStatus('campaign-1', true)).rejects.toThrow('ciclo inicial inexistente o incompleto');
   });
 });

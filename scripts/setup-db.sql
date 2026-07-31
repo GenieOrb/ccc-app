@@ -37,6 +37,25 @@ BEGIN
 END $$;
 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS campaign_type TEXT NOT NULL DEFAULT 'manual';
 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS post_active_lifetime_hours INTEGER;
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS max_comments_total INT;
+ALTER TABLE campaigns ALTER COLUMN max_comments_total DROP DEFAULT;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'chk_campaign_max_comments_total'
+          AND conrelid = 'campaigns'::regclass
+    ) THEN
+        ALTER TABLE campaigns
+        ADD CONSTRAINT chk_campaign_max_comments_total
+        CHECK (
+            max_comments_total IS NULL
+            OR max_comments_total BETWEEN 1 AND 1000000
+        );
+    END IF;
+END $$;
 
 DO $$
 BEGIN
@@ -534,26 +553,57 @@ CREATE TABLE IF NOT EXISTS generation_api_calls (
   input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER,
   input_price_per_million NUMERIC(12,6), cached_input_price_per_million NUMERIC(12,6), output_price_per_million NUMERIC(12,6),
   currency TEXT NOT NULL DEFAULT 'USD', estimated_cost NUMERIC(16,8),
+  attribution_key UUID,
   failure_kind TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), finished_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS generation_api_calls_campaign_idx ON generation_api_calls (campaign_id, created_at DESC);
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS attribution_key UUID;
+CREATE INDEX IF NOT EXISTS generation_api_calls_attribution_idx ON generation_api_calls (attribution_key) WHERE campaign_id IS NULL;
 ALTER TABLE generation_api_calls ALTER COLUMN campaign_id DROP NOT NULL;
 ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS campaign_account_id UUID REFERENCES campaign_accounts(id) ON DELETE RESTRICT;
 CREATE INDEX IF NOT EXISTS generation_api_calls_campaign_account_idx ON generation_api_calls (campaign_account_id, created_at DESC);
 
 -- X is an independently billed/limited provider.  Its calls must never be
 -- represented as AI USD usage: operation and attribution are recorded alone.
+CREATE TABLE IF NOT EXISTS x_api_billable_resources (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  resource_type TEXT NOT NULL CHECK (resource_type IN ('post', 'user')),
+  resource_id TEXT NOT NULL,
+  billing_utc_date DATE NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT unique_x_billable_resource UNIQUE (resource_type, resource_id, billing_utc_date)
+);
+
 CREATE TABLE IF NOT EXISTS x_api_calls (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   call_key TEXT NOT NULL UNIQUE,
   operation TEXT NOT NULL CHECK (operation IN ('tweet_lookup','user_lookup','timeline_lookup')),
   campaign_id UUID REFERENCES campaigns(id) ON DELETE RESTRICT,
   campaign_account_id UUID REFERENCES campaign_accounts(id) ON DELETE RESTRICT,
+  post_resources_count INT NOT NULL DEFAULT 0,
+  user_resources_count INT NOT NULL DEFAULT 0,
+  post_unit_price NUMERIC(12,6),
+  user_unit_price NUMERIC(12,6),
+  currency TEXT,
+  estimated_cost NUMERIC(16,8),
+  pricing_effective_at DATE,
+  cost_complete BOOLEAN NOT NULL DEFAULT true,
+  attribution_key UUID,
   status TEXT NOT NULL CHECK (status IN ('started','succeeded','failed')),
   http_status INTEGER, failure_kind TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), finished_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS x_api_calls_campaign_idx ON x_api_calls (campaign_id, created_at DESC);
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS attribution_key UUID;
+CREATE INDEX IF NOT EXISTS x_api_calls_attribution_idx ON x_api_calls (attribution_key) WHERE campaign_id IS NULL;
+
+-- Remove old columns if any exist (idempotent setup handles drops cleanly for new fields in test envs, but in production we'd use ADD COLUMN. We'll add them here just in case).
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS post_resources_count INT NOT NULL DEFAULT 0;
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS user_resources_count INT NOT NULL DEFAULT 0;
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS post_unit_price NUMERIC(12,6);
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS user_unit_price NUMERIC(12,6);
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS pricing_effective_at DATE;
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS cost_complete BOOLEAN NOT NULL DEFAULT true;
 
 CREATE TABLE IF NOT EXISTS campaign_previews (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(), campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE RESTRICT,

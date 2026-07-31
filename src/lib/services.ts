@@ -1,7 +1,7 @@
 import 'server-only';
 import { randomUUID } from 'node:crypto';
 import { queryDb, withTransaction } from './db';
-import { parseMultipleXUrls, fetchXPosts } from './x-api';
+import { parseMultipleXUrls, fetchXPosts, resolveXUsername } from './x-api';
 import { normalizeXAccounts } from './x-accounts';
 import { checkCampaignSafety } from './openai';
 import { generateSecureSlug } from './crypto';
@@ -15,6 +15,20 @@ function resolveCampaignModel(modelKey?: string) {
   if (!model || !model.enabled) throw new Error('Modelo no configurado.');
   if (!isProviderConfigured(model.provider)) throw new Error('El proveedor del modelo seleccionado no está configurado.');
   return model;
+}
+
+function resolveMaxCommentsTotal(value?: number): number | null {
+  if (value === undefined) return null;
+
+  if (
+    !Number.isInteger(value) ||
+    value < 1 ||
+    value > 1000000
+  ) {
+    throw new Error('El máximo de comentarios debe ser un entero entre 1 y 1.000.000.');
+  }
+
+  return value;
 }
 
 export interface CampaignSummary {
@@ -38,8 +52,15 @@ export interface CampaignSummary {
   pendingProcessingJobsCount: number;
   failedJobsCount: number;
   hasUnresolvedFailedCycle: boolean;
+  aiRecordedCost: number;
+  xRecordedCost: number;
   recordedCost: number;
+  costIsComplete: boolean;
+  unknownAiCostCalls: number;
+  unknownXCostCalls: number;
   campaignType: 'manual' | 'perpetual';
+  maxCommentsTotal?: number;
+  limitReached: boolean;
   postActiveLifetimeHours?: number;
   xAccounts: {
     id: string;
@@ -85,6 +106,7 @@ export async function getCampaignsPage(
     internal_number: number;
     slug: string;
     campaign_type: 'manual' | 'perpetual';
+    max_comments_total: number | null;
     post_active_lifetime_hours: number | null;
     direction: string | null;
     display_name: string | null;
@@ -96,7 +118,7 @@ export async function getCampaignsPage(
     initial_size: number;
     created_at: Date;
   }>(
-    `SELECT id, internal_number, slug, campaign_type, post_active_lifetime_hours, direction, display_name, model_key, is_active, safety_allowed, safety_category, safety_reason, initial_size, created_at
+    `SELECT id, internal_number, slug, campaign_type, max_comments_total, post_active_lifetime_hours, direction, display_name, model_key, is_active, safety_allowed, safety_category, safety_reason, initial_size, created_at
      FROM campaigns
      ORDER BY internal_number DESC
      LIMIT $1 OFFSET $2`,
@@ -119,9 +141,12 @@ export async function getCampaignsPage(
       pending_processing_jobs: string;
       failed_jobs: string;
       has_failed_cycle: boolean;
-      recorded_cost: string | null;
+      ai_cost: string | null;
+      x_cost: string | null;
+      unknown_ai: string;
+      unknown_x: string;
     }>(
-      `SELECT 
+      `SELECT
          (SELECT COUNT(*) FROM suggestions WHERE campaign_id = $1) as valid_generated,
          (SELECT COUNT(*) FROM suggestions WHERE campaign_id = $1 AND status = 'available') as available,
          (SELECT COUNT(*) FROM suggestions WHERE campaign_id = $1 AND status = 'assigned') as assigned,
@@ -129,8 +154,10 @@ export async function getCampaignsPage(
          (SELECT COUNT(*) FROM generation_jobs WHERE campaign_id = $1 AND status IN ('pending', 'processing')) as pending_processing_jobs,
          (SELECT COUNT(*) FROM generation_jobs WHERE campaign_id = $1 AND status = 'failed') as failed_jobs,
          EXISTS (SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND status = 'failed') as has_failed_cycle,
-         COALESCE((SELECT SUM(estimated_cost) FROM generation_usage_metrics WHERE campaign_id = $1 AND estimated_cost IS NOT NULL), 0)
-         + COALESCE((SELECT SUM(estimated_cost) FROM generation_api_calls WHERE campaign_id = $1 AND estimated_cost IS NOT NULL), 0) as recorded_cost`,
+         (SELECT SUM(estimated_cost) FROM generation_api_calls WHERE campaign_id = $1 AND estimated_cost IS NOT NULL AND status = 'succeeded') as ai_cost,
+         (SELECT SUM(estimated_cost) FROM x_api_calls WHERE campaign_id = $1 AND estimated_cost IS NOT NULL AND status = 'succeeded') as x_cost,
+         (SELECT COUNT(*) FROM generation_api_calls WHERE campaign_id = $1 AND estimated_cost IS NULL AND status = 'succeeded') as unknown_ai,
+         (SELECT COUNT(*) FROM x_api_calls WHERE campaign_id = $1 AND estimated_cost IS NULL AND status = 'succeeded') as unknown_x`,
       [c.id]
     );
 
@@ -142,7 +169,10 @@ export async function getCampaignsPage(
       pending_processing_jobs: '0',
       failed_jobs: '0',
       has_failed_cycle: false,
-      recorded_cost: '0',
+      ai_cost: '0',
+      x_cost: '0',
+      unknown_ai: '0',
+      unknown_x: '0',
     };
 
     const validGen = parseInt(countData.valid_generated, 10);
@@ -151,12 +181,21 @@ export async function getCampaignsPage(
     const withdrawn = parseInt(countData.withdrawn || '0', 10);
     const pendProcJobs = parseInt(countData.pending_processing_jobs, 10);
     const failJobs = parseInt(countData.failed_jobs, 10);
-    const recordedCost = Number(countData.recorded_cost) || 0;
+
+    const aiRecordedCost = isFinite(Number(countData.ai_cost)) ? Number(countData.ai_cost) || 0 : 0;
+    const xRecordedCost = isFinite(Number(countData.x_cost)) ? Number(countData.x_cost) || 0 : 0;
+    const unknownAiCostCalls = parseInt(countData.unknown_ai, 10);
+    const unknownXCostCalls = parseInt(countData.unknown_x, 10);
+    const recordedCost = aiRecordedCost + xRecordedCost;
+    const costIsComplete = unknownAiCostCalls === 0 && unknownXCostCalls === 0;
 
     const internalId = `Campaña ${String(c.internal_number).padStart(3, '0')}`;
     const publicUrl = `${appBaseUrl.replace(/\/+$/, '')}/comment/${c.slug}`;
 
-    const progress = Math.min(100, Math.round((validGen / Math.max(1, c.initial_size)) * 100));
+    const limitReached = c.max_comments_total !== null && (validGen + pendProcJobs) >= c.max_comments_total;
+    const progress = c.max_comments_total !== null
+      ? Math.min(100, Math.round((validGen / c.max_comments_total) * 100))
+      : Math.min(100, Math.round((validGen / Math.max(1, c.initial_size)) * 100));
 
     const accounts = await queryDb<{
       id: string;
@@ -193,6 +232,7 @@ export async function getCampaignsPage(
       internalId,
       slug: c.slug,
       campaignType: c.campaign_type,
+      maxCommentsTotal: c.max_comments_total ?? undefined,
       postActiveLifetimeHours: c.post_active_lifetime_hours ?? undefined,
       publicUrl,
       direction: c.direction || undefined,
@@ -225,7 +265,13 @@ export async function getCampaignsPage(
       pendingProcessingJobsCount: pendProcJobs,
       failedJobsCount: failJobs,
       hasUnresolvedFailedCycle: countData.has_failed_cycle,
+      aiRecordedCost,
+      xRecordedCost,
       recordedCost,
+      costIsComplete,
+      unknownAiCostCalls,
+      unknownXCostCalls,
+      limitReached,
       withdrawnCount: withdrawn,
       createdAt: new Date(c.created_at).toISOString(),
     });
@@ -246,20 +292,24 @@ export async function createCampaign(params: {
   direction?: string;
   displayName?: string;
   modelKey?: string;
+  maxCommentsTotal?: number;
   brandVariants?: { value: string; percentage: number }[];
 }): Promise<{ id: string; slug: string }> {
+  const attributionKey = randomUUID();
+
   // 1. Validate & deduplicate X URLs
   const extractedUrls = parseMultipleXUrls(params.urlsInput);
   const model = resolveCampaignModel(params.modelKey);
   const displayName = params.displayName?.trim() || null;
   if (displayName && displayName.length > 120) throw new Error('El nombre no puede superar 120 caracteres.');
+  const maxCommentsTotal = resolveMaxCommentsTotal(params.maxCommentsTotal);
 
   // 2. Fetch posts from X API
-  const fetchedPosts = await fetchXPosts(extractedUrls);
+  const fetchedPosts = await fetchXPosts(extractedUrls, { attributionKey });
 
   // 3. Safety Preflight via OpenAI
   const postsTexts = fetchedPosts.map((fp) => fp.textContent);
-  const safetyResult = await checkCampaignSafety(postsTexts, params.direction);
+  const safetyResult = await checkCampaignSafety(postsTexts, params.direction, { attributionKey });
 
   if (!safetyResult.allowed) {
     throw new Error(
@@ -275,12 +325,12 @@ export async function createCampaign(params: {
     // Insert Campaign
     const campRes = await client.query<{ id: string }>(
       `INSERT INTO campaigns (
-         slug, campaign_type, direction, post_active_lifetime_hours, is_active, safety_allowed, safety_category, safety_reason,
+         slug, campaign_type, direction, post_active_lifetime_hours, max_comments_total, is_active, safety_allowed, safety_category, safety_reason,
          initial_size, replenishment_threshold, replenishment_size, display_name, model_key, brand_variants
        ) VALUES (
-         $1, 'manual', $2, NULL, true, true, $3, $4, 30, 5, 10, $5, $6, $7::jsonb
+         $1, 'manual', $2, NULL, $3, true, true, $4, $5, 30, 5, 10, $6, $7, $8::jsonb
        ) RETURNING id`,
-      [slug, params.direction || null, safetyResult.category, safetyResult.reason, displayName, model.key, JSON.stringify(params.brandVariants || [])]
+      [slug, params.direction || null, maxCommentsTotal, safetyResult.category, safetyResult.reason, displayName, model.key, JSON.stringify(params.brandVariants || [])]
     );
     const campaignId = campRes.rows[0].id;
 
@@ -340,6 +390,9 @@ export async function createCampaign(params: {
       }
     }
 
+    await client.query(`UPDATE generation_api_calls SET campaign_id = $1 WHERE attribution_key = $2 AND campaign_id IS NULL`, [campaignId, attributionKey]);
+    await client.query(`UPDATE x_api_calls SET campaign_id = $1 WHERE attribution_key = $2 AND campaign_id IS NULL`, [campaignId, attributionKey]);
+
     return { id: campaignId, slug };
   });
 
@@ -365,6 +418,40 @@ export async function toggleCampaignStatus(campaignId: string, desiredStatus: bo
 
     if (desiredStatus) {
       if (campaignType === 'manual') {
+        const cycleRes = await client.query<{
+          initial_cycle_count: string;
+          incomplete_cycle_count: string;
+          valid_produced_count: string;
+          target_count: string;
+        }>(
+          `SELECT
+             COUNT(*) AS initial_cycle_count,
+             COUNT(*) FILTER (WHERE status <> 'completed') AS incomplete_cycle_count,
+             COALESCE(SUM(valid_produced_count), 0) AS valid_produced_count,
+             COALESCE(SUM(target_count), 0) AS target_count
+           FROM generation_cycles
+           WHERE campaign_id = $1 AND cycle_type = 'initial'`,
+          [campaignId]
+        );
+
+        const cycle = cycleRes.rows[0];
+        if (!cycle || Number(cycle.initial_cycle_count) === 0 || Number(cycle.incomplete_cycle_count) > 0) {
+          throw new Error('No se puede activar: ciclo inicial inexistente o incompleto.');
+        }
+
+        if (Number(cycle.valid_produced_count) < Number(cycle.target_count)) {
+          throw new Error('No se puede activar: ciclo inicial sin haber producido el objetivo.');
+        }
+
+        const availRes = await client.query<{ avail_count: string }>(
+          `SELECT COUNT(*) as avail_count FROM suggestions
+           WHERE campaign_id = $1 AND assigned_to_session_id IS NULL AND valid_generated = true`,
+          [campaignId]
+        );
+        if (parseInt(availRes.rows[0]?.avail_count || '0', 10) < 1) {
+          throw new Error('No se puede activar: debe haber al menos un comentario disponible en el ciclo inicial.');
+        }
+
         const postRes = await client.query<{ count: string }>(
           `SELECT COUNT(*) as count FROM campaign_posts WHERE campaign_id = $1 AND retired_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())`,
           [campaignId]
@@ -379,7 +466,7 @@ export async function toggleCampaignStatus(campaignId: string, desiredStatus: bo
           [campaignId]
         );
         const activeAccountsCount = parseInt(accountsRes.rows[0]?.count || '0', 10);
-        
+
         if (activeAccountsCount < 1) {
           throw new Error('No se puede activar: debe tener al menos una cuenta de X activa.');
         }
@@ -433,11 +520,11 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
 
     // Find a cycle that has failed jobs, prioritizing 'initial' over others, oldest first.
     const cycleRes = await client.query<{ id: string }>(
-      `SELECT id 
-       FROM generation_cycles 
-       WHERE campaign_id = $1 
+      `SELECT id
+       FROM generation_cycles
+       WHERE campaign_id = $1
          AND EXISTS (
-           SELECT 1 FROM generation_jobs 
+           SELECT 1 FROM generation_jobs
            WHERE cycle_id = generation_cycles.id AND status = 'failed'
          )
        ORDER BY CASE WHEN cycle_type = 'initial' THEN 0 ELSE 1 END ASC, created_at ASC
@@ -452,7 +539,7 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
 
     // Reset all failed jobs in cycle to pending
     await client.query(
-      `UPDATE generation_jobs 
+      `UPDATE generation_jobs
        SET status = 'pending',
            attempts_count = 0,
            error_message = NULL,
@@ -466,7 +553,7 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
 
     // Reset cycle status to processing
     await client.query(
-      `UPDATE generation_cycles 
+      `UPDATE generation_cycles
        SET status = 'processing',
            error_message = NULL,
            finished_at = NULL
@@ -479,8 +566,8 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
 
 export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<void> {
   // Determine campaign type first outside transaction for fast paths
-  const campTypeRes = await queryDb<{ campaign_type: string, replenishment_threshold: number, replenishment_size: number, model_key: string, brand_variants: unknown }>(
-    `SELECT campaign_type, replenishment_threshold, replenishment_size, model_key, brand_variants FROM campaigns WHERE id = $1 AND is_active = true`,
+  const campTypeRes = await queryDb<{ campaign_type: string, replenishment_threshold: number, replenishment_size: number, model_key: string, max_comments_total: number | null, brand_variants: unknown }>(
+    `SELECT campaign_type, replenishment_threshold, replenishment_size, model_key, max_comments_total, brand_variants FROM campaigns WHERE id = $1 AND is_active = true`,
     [campaignId]
   );
   if (campTypeRes.length === 0) return;
@@ -494,6 +581,19 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
       await withTransaction(async (client) => {
         const campaignLock = await client.query(`SELECT 1 FROM campaigns WHERE id = $1 AND is_active = true FOR UPDATE`, [campaignId]);
         if (campaignLock.rows.length === 0) return;
+
+        let remainingCapacity: number | null = null;
+        if (campaignInfo.max_comments_total !== null) {
+          const usageRes = await client.query<{ current_total: string }>(
+            `SELECT
+               (SELECT COUNT(*) FROM suggestions WHERE campaign_id = $1) +
+               (SELECT COUNT(*) FROM generation_jobs WHERE campaign_id = $1 AND status IN ('pending', 'processing'))
+             AS current_total`,
+            [campaignId]
+          );
+          remainingCapacity = campaignInfo.max_comments_total - parseInt(usageRes.rows[0].current_total, 10);
+          if (remainingCapacity <= 0) return;
+        }
         const postRows = await client.query<{ id: string }>(
           `SELECT id FROM campaign_posts WHERE campaign_id = $1 AND retired_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()) ORDER BY created_at ASC`,
           [campaignId]
@@ -512,17 +612,25 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
           if (checkRes.rows.length > 0) continue;
 
           await client.query(`SELECT 1 FROM campaign_posts WHERE id = $1 FOR UPDATE`, [postId]);
+
+          let actualRepSize = repSize;
+          if (remainingCapacity !== null) {
+            actualRepSize = Math.min(repSize, remainingCapacity);
+            if (actualRepSize <= 0) break;
+          }
+
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const slotPlans = generateDeterministicSlotPlans([postId], repSize, (campaignInfo.brand_variants as any) || []);
+          const slotPlans = generateDeterministicSlotPlans([postId], actualRepSize, (campaignInfo.brand_variants as any) || []);
           const cycleRes = await client.query<{ id: string }>(
             `INSERT INTO generation_cycles (
               campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name, prompt_version
            ) VALUES (
               $1, $2, 'replenishment', $3, 'pending', $4, $5, 1
            ) RETURNING id`,
-            [campaignId, postId, repSize, model.key, model.apiModel]
+            [campaignId, postId, actualRepSize, model.key, model.apiModel]
           );
           const cycleId = cycleRes.rows[0].id;
+          if (remainingCapacity !== null) remainingCapacity -= actualRepSize;
 
           for (const plan of slotPlans) {
             await client.query(
@@ -558,6 +666,19 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
       );
       if (postRows.rows.length === 0) return;
       const campaignPostIds = postRows.rows.map((p) => p.id);
+
+      let remainingCapacity: number | null = null;
+      if (campaignInfo.max_comments_total !== null) {
+        const usageRes = await client.query<{ current_total: string }>(
+          `SELECT
+             (SELECT COUNT(*) FROM suggestions WHERE campaign_id = $1) +
+             (SELECT COUNT(*) FROM generation_jobs WHERE campaign_id = $1 AND status IN ('pending', 'processing'))
+           AS current_total`,
+          [campaignId]
+        );
+        remainingCapacity = campaignInfo.max_comments_total - parseInt(usageRes.rows[0].current_total, 10);
+        if (remainingCapacity <= 0) return;
+      }
 
       for (const postId of campaignPostIds) {
         // Maintain campaign -> post -> cycle locking for concurrent replenishment.
@@ -614,8 +735,14 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
           continue;
         }
 
+        let actualRepSize = repSize;
+        if (remainingCapacity !== null) {
+          actualRepSize = Math.min(repSize, remainingCapacity);
+          if (actualRepSize <= 0) break;
+        }
+
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const slotPlans = generateDeterministicSlotPlans([postId], repSize, (campaignInfo.brand_variants as any) || []);
+        const slotPlans = generateDeterministicSlotPlans([postId], actualRepSize, (campaignInfo.brand_variants as any) || []);
         if (slotPlans.length === 0) continue;
 
         const cycleRes = await client.query<{ id: string }>(
@@ -624,9 +751,10 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
            ) VALUES (
               $1, $2, 'replenishment', $3, 'pending', $4, $5, 1
            ) RETURNING id`,
-           [campaignId, postId, repSize, model.key, model.apiModel]
+           [campaignId, postId, actualRepSize, model.key, model.apiModel]
         );
         const cycleId = cycleRes.rows[0].id;
+        if (remainingCapacity !== null) remainingCapacity -= actualRepSize;
 
         for (const plan of slotPlans) {
           await client.query(
@@ -668,7 +796,7 @@ export type AssignmentResponse =
   | { status: 'no_inventory' }
   | { status: 'rate_limited' };
 
-type InternalAssignmentResponse = 
+type InternalAssignmentResponse =
   | { status: 'success'; assignmentId: string; comment: string; postUrl: string; replyIntentUrl?: string; isNewAssignment?: boolean; campaignId?: string }
   | { status: 'expired' }
   | { status: 'unavailable' }
@@ -734,7 +862,7 @@ export async function assignCommentToVisitor(
          WHERE a.id = $1`,
         [activeAssignmentId]
       );
-      
+
       if (existingRes.rows.length > 0) {
         const row = existingRes.rows[0];
         let replyIntentUrl: string | undefined;
@@ -758,13 +886,13 @@ export async function assignCommentToVisitor(
     const unseenPostRes = await client.query<{ id: string }>(
       `SELECT cp.id
        FROM campaign_posts cp
-       WHERE cp.campaign_id = $1 
+       WHERE cp.campaign_id = $1
          AND cp.retired_at IS NULL
          AND (cp.expires_at IS NULL OR cp.expires_at > NOW())
          AND NOT EXISTS (
-           SELECT 1 FROM assignments a 
-           WHERE a.campaign_id = cp.campaign_id 
-             AND a.visitor_id = $2 
+           SELECT 1 FROM assignments a
+           WHERE a.campaign_id = cp.campaign_id
+             AND a.visitor_id = $2
              AND a.campaign_post_id = cp.id
          )
        LIMIT 1`,
@@ -790,9 +918,9 @@ export async function assignCommentToVisitor(
        WHERE s.campaign_id = $1 AND s.status = 'available' AND p.retired_at IS NULL
        AND (p.expires_at IS NULL OR p.expires_at > NOW())
        AND NOT EXISTS (
-           SELECT 1 FROM assignments a 
-           WHERE a.campaign_id = s.campaign_id 
-             AND a.visitor_id = $2 
+           SELECT 1 FROM assignments a
+           WHERE a.campaign_id = s.campaign_id
+             AND a.visitor_id = $2
              AND a.campaign_post_id = s.campaign_post_id
        )
        ORDER BY p.posted_at DESC NULLS LAST, p.created_at DESC, s.delivery_order ASC, s.created_at ASC
@@ -881,7 +1009,7 @@ export async function assignCommentToVisitor(
       replyIntentUrl: txResult.replyIntentUrl,
     };
   }
-  
+
   if (txResult.status === 'no_inventory') {
     const queued = await queryDb<{ count: string }>(`SELECT COUNT(*) AS count FROM generation_jobs j JOIN campaign_posts p ON p.id=j.campaign_post_id WHERE j.campaign_id = $1 AND j.status IN ('pending','processing') AND p.retired_at IS NULL AND (p.expires_at IS NULL OR p.expires_at > NOW())`, [txResult.campaignId]);
     if (Number(queued[0]?.count || 0) > 0) return { status: 'generating', retryAfterMs: 2500 };
@@ -895,17 +1023,30 @@ export async function createPerpetualCampaign(params: {
   accountsInput: string;
   direction?: string;
   postActiveLifetimeHours: number;
+  maxCommentsTotal?: number;
   displayName?: string;
   modelKey?: string;
   brandVariants?: { value: string; percentage: number }[];
 }): Promise<{ id: string; slug: string; initialSync: PerpetualMonitorSummary }> {
+  const attributionKey = randomUUID();
   const normalizedAccounts = normalizeXAccounts(params.accountsInput);
   const model = resolveCampaignModel(params.modelKey);
   const displayName = params.displayName?.trim() || null;
   if (displayName && displayName.length > 120) throw new Error('El nombre no puede superar 120 caracteres.');
+  const maxCommentsTotal = resolveMaxCommentsTotal(params.maxCommentsTotal);
 
   if (params.postActiveLifetimeHours < 1 || params.postActiveLifetimeHours > 720 || !Number.isInteger(params.postActiveLifetimeHours)) {
     throw new Error('La duración de los posts debe ser un número entero entre 1 y 720 horas.');
+  }
+
+  const resolvedAccounts: Array<{
+    username: string;
+    username_normalized: string;
+    xUserId: string;
+  }> = [];
+  for (const acc of normalizedAccounts) {
+    const xUserId = await resolveXUsername(acc.username_normalized, { attributionKey });
+    resolvedAccounts.push({ ...acc, xUserId });
   }
 
   const slug = generateSecureSlug(16);
@@ -914,26 +1055,29 @@ export async function createPerpetualCampaign(params: {
     // Insert Campaign
     const campRes = await client.query<{ id: string }>(
       `INSERT INTO campaigns (
-         slug, campaign_type, direction, post_active_lifetime_hours, is_active, safety_allowed,
+         slug, campaign_type, direction, post_active_lifetime_hours, max_comments_total, is_active, safety_allowed,
          initial_size, replenishment_threshold, replenishment_size, display_name, model_key, brand_variants
        ) VALUES (
-         $1, 'perpetual', $2, $3, true, true, 30, 5, 10, $4, $5, $6::jsonb
+         $1, 'perpetual', $2, $3, $4, true, true, 30, 5, 10, $5, $6, $7::jsonb
        ) RETURNING id`,
-      [slug, params.direction || null, params.postActiveLifetimeHours, displayName, model.key, JSON.stringify(params.brandVariants || [])]
+      [slug, params.direction || null, params.postActiveLifetimeHours, maxCommentsTotal, displayName, model.key, JSON.stringify(params.brandVariants || [])]
     );
     const campaignId = campRes.rows[0].id;
 
     const accountIds: string[] = [];
-    for (const acc of normalizedAccounts) {
+    for (const acc of resolvedAccounts) {
       const accountRes = await client.query<{ id: string }>(
         `INSERT INTO campaign_accounts (
-           campaign_id, username, username_normalized
-         ) VALUES ($1, $2, $3)
+           campaign_id, username, username_normalized, x_user_id, monitoring_started_at
+         ) VALUES ($1, $2, $3, $4, NOW())
          RETURNING id`,
-        [campaignId, acc.username, acc.username_normalized]
+        [campaignId, acc.username, acc.username_normalized, acc.xUserId]
       );
       accountIds.push(accountRes.rows[0].id);
     }
+
+    await client.query(`UPDATE generation_api_calls SET campaign_id = $1 WHERE attribution_key = $2 AND campaign_id IS NULL`, [campaignId, attributionKey]);
+    await client.query(`UPDATE x_api_calls SET campaign_id = $1 WHERE attribution_key = $2 AND campaign_id IS NULL`, [campaignId, attributionKey]);
 
     return { id: campaignId, slug, accountIds };
   });
@@ -1058,7 +1202,7 @@ export async function addAccountsToCampaign(campaignId: string, accountsInput: s
     for (const acc of normalizedAccounts) {
       // Check if it already exists and is active
       const existingRes = await client.query<{ id: string }>(
-        `SELECT id FROM campaign_accounts 
+        `SELECT id FROM campaign_accounts
          WHERE campaign_id = $1 AND username_normalized = $2 AND removed_at IS NULL`,
         [campaignId, acc.username_normalized]
       );
@@ -1105,9 +1249,9 @@ export async function removeAccountFromCampaign(campaignId: string, accountId: s
     }
 
     const updateRes = await client.query(
-      `UPDATE campaign_accounts 
-       SET removed_at = NOW() 
-       WHERE id = $1 AND campaign_id = $2 AND removed_at IS NULL 
+      `UPDATE campaign_accounts
+       SET removed_at = NOW()
+       WHERE id = $1 AND campaign_id = $2 AND removed_at IS NULL
        RETURNING id`,
       [accountId, campaignId]
     );
@@ -1146,7 +1290,7 @@ export async function updateCampaignDuration(campaignId: string, postActiveLifet
 
     // Recalcular expiración
     await client.query(
-      `UPDATE campaign_posts 
+      `UPDATE campaign_posts
        SET expires_at = COALESCE(posted_at, created_at) + interval '1 hour' * $1
        WHERE campaign_id = $2 AND retired_at IS NULL`,
       [postActiveLifetimeHours, campaignId]
@@ -1154,8 +1298,8 @@ export async function updateCampaignDuration(campaignId: string, postActiveLifet
 
     // Retirar instantáneamente los que quedaron expirados
     const retired = await client.query<{ id: string }>(
-      `UPDATE campaign_posts 
-       SET retired_at = NOW() 
+      `UPDATE campaign_posts
+       SET retired_at = NOW()
        WHERE campaign_id = $1 AND retired_at IS NULL AND expires_at <= NOW()`,
       [campaignId]
     );

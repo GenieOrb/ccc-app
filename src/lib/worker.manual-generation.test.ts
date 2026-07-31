@@ -19,7 +19,7 @@ describe('manual generation queue gating', () => {
       query: vi.fn(async (sql: string) => { queries.push(sql); return { rows: [] }; }),
     }));
 
-    await processBackgroundQueue('worker-test', MIN_WORKER_JOB_BUDGET_MS);
+    await processBackgroundQueue('worker-test', MIN_WORKER_JOB_BUDGET_MS * 2);
 
     const claimQuery = queries[0].replace(/\s+/g, ' ');
     expect(claimQuery).toMatch(/\( c\.is_active = true OR \(c\.campaign_type = 'manual' AND cy\.cycle_type = 'initial'\) \)/);

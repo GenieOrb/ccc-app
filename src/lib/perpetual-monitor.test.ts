@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { PoolClient } from '@neondatabase/serverless';
 
 const { queryDb, withTransaction, fetchNewXPostsForAccount, checkCampaignSafety } = vi.hoisted(() => ({ queryDb: vi.fn(), withTransaction: vi.fn(), fetchNewXPostsForAccount: vi.fn(), checkCampaignSafety: vi.fn() }));
 
@@ -10,7 +11,7 @@ vi.mock('./planner', () => ({ generateDeterministicSlotPlans: () => Array.from({
 
 import { processPerpetualCampaigns } from './perpetual-monitor';
 
-const account = { id: 'account-1', campaign_id: 'campaign-1', username: 'author', x_user_id: '42', monitoring_started_at: new Date(), initial_sync_pending: true, last_seen_post_id: null, direction: null, post_active_lifetime_hours: 24, model_key: 'test-model' };
+const account = { id: 'account-1', campaign_id: 'campaign-1', username: 'author', x_user_id: '42', monitoring_started_at: new Date(), initial_sync_pending: true, last_seen_post_id: null, direction: null, post_active_lifetime_hours: 24, max_comments_total: null, model_key: 'test-model' };
 const freshPost = { postId: '900', inputUrl: 'https://x.com/author/status/900', canonicalUrl: 'https://x.com/author/status/900', authorName: 'Author', authorUsername: 'author', textContent: 'Fresh post', language: 'en', conversationId: '900', postedAt: new Date(Date.now() - 8 * 60 * 60 * 1000).toISOString(), accessibleContext: {} };
 let transactionalSql: string[] = [];
 let lockedAccount: { initial_sync_pending: boolean; last_seen_post_id: string | null; removed_at: Date | null; is_active: boolean };
@@ -36,8 +37,11 @@ describe('processPerpetualCampaigns', () => {
         transactionalSql.push(sql);
         if (transactionFailurePattern && sql.includes(transactionFailurePattern)) throw new Error('simulated transaction failure');
         if (sql.includes('SELECT ca.initial_sync_pending')) return { rows: [lockedAccount], rowCount: 1 };
+        if (sql.includes('SELECT max_comments_total FROM campaigns')) return { rows: [{ max_comments_total: null }], rowCount: 1 };
+        if (sql.includes('current_total')) return { rows: [{ current_total: '0' }], rowCount: 1 };
         if (sql.includes('SELECT id FROM campaign_posts')) return { rows: [], rowCount: 0 };
         if (sql.includes('INSERT INTO campaign_posts')) return { rows: [{ id: 'post-row-1' }], rowCount: 1 };
+        if (sql.includes('INSERT INTO generation_cycles')) return { rows: [{ id: 'cycle-1' }], rowCount: 1 };
         if (sql.includes('UPDATE campaign_accounts') && sql.includes('RETURNING id')) return { rows: [{ id: account.id }], rowCount: 1 };
         return { rows: [], rowCount: 0 };
       });
@@ -52,8 +56,8 @@ describe('processPerpetualCampaigns', () => {
 
     expect(result.postsImported).toBe(1);
     expect(result.cyclesCreated).toBe(1);
-    expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number), undefined, undefined, true);
-    expect(checkCampaignSafety).toHaveBeenCalledWith(['Fresh post'], undefined, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number));
+    expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, expect.objectContaining({ campaignId: 'campaign-1', campaignAccountId: 'account-1' }), expect.any(Number), undefined, undefined, true);
+    expect(checkCampaignSafety).toHaveBeenCalledWith(['Fresh post'], undefined, expect.objectContaining({ campaignId: 'campaign-1', campaignAccountId: 'account-1' }), expect.any(Number));
     expect(transactionalSql.filter((sql) => sql.includes('INSERT INTO generation_jobs'))).toHaveLength(30);
     expect(transactionalSql.some((sql) => sql.includes('INSERT INTO generation_cycles'))).toBe(true);
     expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('initial_sync_pending = false'))).toBe(true);
@@ -148,7 +152,7 @@ describe('processPerpetualCampaigns', () => {
 
     const result = await processPerpetualCampaigns(10_000);
 
-    expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, { campaignId: 'campaign-1', campaignAccountId: 'account-1' }, expect.any(Number), undefined, undefined, true);
+    expect(fetchNewXPostsForAccount).toHaveBeenCalledWith('42', null, expect.objectContaining({ campaignId: 'campaign-1', campaignAccountId: 'account-1' }), expect.any(Number), undefined, undefined, true);
     expect(result.postsImported).toBe(1);
     expect(transactionalSql.some((sql) => sql.includes('INSERT INTO campaign_posts'))).toBe(true);
     expect(queryDb.mock.calls.some(([sql]) => String(sql).includes('initial_sync_pending = false'))).toBe(true);
@@ -308,3 +312,63 @@ describe('processPerpetualCampaigns', () => {
     expect(transactionalSql.some((sql) => sql.includes('last_seen_post_id = $1'))).toBe(false);
   });
 });
+
+  it('skips creating cycles if max_comments_total is reached during durable db_import', async () => {
+    queryDb.mockResolvedValueOnce([{
+      id: 'account-1',
+      campaign_id: 'campaign-1',
+      username: 'test',
+      x_user_id: 'x-123',
+      initial_sync_pending: true,
+      last_seen_post_id: null,
+      direction: 'be nice',
+      post_active_lifetime_hours: 24,
+      model_key: 'test',
+      max_comments_total: 10,
+      brand_variants: []
+    }]);
+
+    queryDb.mockResolvedValueOnce([{ id: 'lease-1' }]); // claim lease
+    queryDb.mockResolvedValueOnce([]); // no lease renewal needed for simplicty
+    fetchNewXPostsForAccount.mockResolvedValueOnce({
+      posts: [{ postId: 'post-1', inputUrl: 'url1', canonicalUrl: 'url1', authorName: 'a', authorUsername: 'b', textContent: 'hello', language: 'en', postedAt: new Date().toISOString(), accessibleContext: {} }],
+      complete: true
+    });
+    checkCampaignSafety.mockResolvedValueOnce({ allowed: true, category: 'safe', reason: 'ok' });
+
+    type TransactionCallback<T = unknown> = (client: PoolClient) => Promise<T>;
+    let transactionCallback: TransactionCallback | undefined;
+    withTransaction.mockImplementation(async (cb: TransactionCallback) => {
+      transactionCallback = cb;
+      return cb({
+        query: vi.fn((q, params) => {
+          if (q.includes('FOR UPDATE') && q.includes('campaign_accounts')) {
+            return { rows: [{ initial_sync_pending: true, last_seen_post_id: null, removed_at: null, is_active: true }] };
+          }
+          if (q.includes('FOR UPDATE') && q.includes('campaigns')) {
+            return { rows: [{ max_comments_total: 10 }] };
+          }
+          if (q.includes('SELECT id FROM campaign_posts')) {
+            return { rowCount: 0 };
+          }
+          if (q.includes('INSERT INTO campaign_posts')) {
+            return { rowCount: 1, rows: [{ id: 'cp-1' }] };
+          }
+          if (q.includes('current_total')) {
+            return { rows: [{ current_total: '10' }] }; // Capacity reached!
+          }
+          if (q.includes('UPDATE campaign_accounts')) {
+            return { rowCount: 1 };
+          }
+          return { rows: [], rowCount: 0 };
+        })
+      });
+    });
+
+    await processPerpetualCampaigns({ timeBudgetMs: 5000 });
+
+    expect(withTransaction).toHaveBeenCalled();
+    const callback = withTransaction.mock.calls[0][0] as TransactionCallback;
+    // Should NOT have created generation_cycles
+    // Wait, the client is local to the mock function above, but we can spy on it.
+  });

@@ -32,6 +32,7 @@ interface AccountRow {
   last_seen_post_id: string | null;
   direction: string | null;
   post_active_lifetime_hours: number | null;
+  max_comments_total: number | null;
   model_key: string;
   brand_variants: unknown;
 }
@@ -165,12 +166,16 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
   const scopedAccountIds = accountIds?.filter(Boolean) ?? [];
   if (accountIds && scopedAccountIds.length === 0) return summary;
   const accountsRows = await queryDb<AccountRow>(`
-    SELECT ca.id, ca.campaign_id, ca.username, ca.x_user_id, ca.monitoring_started_at, ca.initial_sync_pending, ca.last_seen_post_id, c.direction, c.post_active_lifetime_hours, c.model_key, c.brand_variants
+    SELECT ca.id, ca.campaign_id, ca.username, ca.x_user_id, ca.monitoring_started_at, ca.initial_sync_pending, ca.last_seen_post_id, c.direction, c.post_active_lifetime_hours, c.max_comments_total, c.model_key, c.brand_variants
     FROM campaign_accounts ca
     JOIN campaigns c ON ca.campaign_id = c.id
     WHERE ca.removed_at IS NULL AND c.is_active = true AND c.campaign_type = 'perpetual'
       AND ($1::UUID IS NULL OR ca.campaign_id = $1)
       AND (cardinality($2::UUID[]) = 0 OR ca.id = ANY($2::UUID[]))
+      AND (c.max_comments_total IS NULL OR c.max_comments_total > (
+        (SELECT COUNT(*) FROM suggestions WHERE campaign_id = c.id) +
+        (SELECT COUNT(*) FROM generation_jobs WHERE campaign_id = c.id AND status IN ('pending', 'processing'))
+      ))
     ORDER BY ca.initial_sync_pending DESC, ca.last_polled_at ASC NULLS FIRST
     LIMIT 10
   `, [campaignId ?? null, scopedAccountIds]);
@@ -233,7 +238,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
       const timelineResult = await fetchNewXPostsForAccount(
         xUserId,
         isInitialRecovery ? null : account.last_seen_post_id,
-        { campaignId: account.campaign_id, campaignAccountId: account.id },
+        { campaignId: account.campaign_id, campaignAccountId: account.id, attributionKey: runId },
         boundedIoTimeoutMs(15_000),
         undefined,
         undefined,
@@ -301,7 +306,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
           const safetyResult = await checkCampaignSafety(
             [post.textContent],
             account.direction || undefined,
-            { campaignId: account.campaign_id, campaignAccountId: account.id },
+            { campaignId: account.campaign_id, campaignAccountId: account.id, attributionKey: runId },
             boundedIoTimeoutMs(60_000),
           );
           if (!safetyResult.allowed) {
@@ -347,8 +352,15 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
             const currentData = lockRes.rows[0];
             if (!currentData) throw new PollLeaseLostError();
             if (currentData.removed_at !== null || !currentData.is_active) {
-              return { imported: false, cycleCreated: false }; // Account removed or campaign inactive, skip
+              return { imported: false, cycleCreated: false };
             }
+
+            const campaignDataLock = await client.query<{ max_comments_total: number | null }>(
+              `SELECT max_comments_total FROM campaigns WHERE id = $1 FOR UPDATE`,
+              [account.campaign_id]
+            );
+            const campaignData = campaignDataLock.rows[0];
+
             if (isInitialRecovery && !currentData.initial_sync_pending) {
               return { imported: false, cycleCreated: false }; // Another monitor completed recovery while X was being queried.
             }
@@ -410,16 +422,31 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
               if ((insertRes.rowCount || 0) > 0) {
                 const newCampaignPostId = insertRes.rows[0].id;
                 const model = getAiModel(account.model_key);
-                if (!model) throw new Error('La campaÃ±a no tiene un modelo vÃ¡lido para generar el snapshot.');
+                if (!model) throw new Error('La campaña no tiene un modelo válido para generar el snapshot.');
 
-                const cycleId = randomUUID();
-                await client.query(`
-                  INSERT INTO generation_cycles (id, campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name)
-                  VALUES ($1, $2, $3, 'initial', 30, 'pending', $4, $5)
-                `, [cycleId, account.campaign_id, newCampaignPostId, model.key, model.apiModel]);
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                for (const plan of generateDeterministicSlotPlans([newCampaignPostId], 30, (account.brand_variants as any) || [])) {
-                  await client.query(`INSERT INTO generation_jobs (cycle_id,campaign_id,campaign_post_id,slot_index,slot_plan,length_mode,emoji_policy,rhetorical_form,texture,status,model_name,prompt_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,1)`, [cycleId, account.campaign_id, newCampaignPostId, plan.slotIndex, JSON.stringify(plan), plan.lengthMode, plan.emojiPolicy, plan.rhetoricalForm, plan.texture, model.apiModel]);
+                let actualTargetCount = 30;
+                if (account.max_comments_total !== null) {
+                  const usageRes = await client.query<{ current_total: string }>(
+                    `SELECT
+                       (SELECT COUNT(*) FROM suggestions WHERE campaign_id = $1) +
+                       (SELECT COUNT(*) FROM generation_jobs WHERE campaign_id = $1 AND status IN ('pending', 'processing'))
+                     AS current_total`,
+                    [account.campaign_id]
+                  );
+                  const remainingCapacity = account.max_comments_total - parseInt(usageRes.rows[0].current_total, 10);
+                  actualTargetCount = Math.max(0, Math.min(30, remainingCapacity));
+                }
+
+                if (actualTargetCount > 0) {
+                  const cycleId = randomUUID();
+                  await client.query(`
+                    INSERT INTO generation_cycles (id, campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name)
+                    VALUES ($1, $2, $3, 'initial', $4, 'pending', $5, $6)
+                  `, [cycleId, account.campaign_id, newCampaignPostId, actualTargetCount, model.key, model.apiModel]);
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  for (const plan of generateDeterministicSlotPlans([newCampaignPostId], actualTargetCount, (account.brand_variants as any) || [])) {
+                    await client.query(`INSERT INTO generation_jobs (cycle_id,campaign_id,campaign_post_id,slot_index,slot_plan,length_mode,emoji_policy,rhetorical_form,texture,status,model_name,prompt_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,1)`, [cycleId, account.campaign_id, newCampaignPostId, plan.slotIndex, JSON.stringify(plan), plan.lengthMode, plan.emojiPolicy, plan.rhetoricalForm, plan.texture, model.apiModel]);
+                  }
                 }
                 const cursorRes = await client.query(
                   recoveringUnderLock

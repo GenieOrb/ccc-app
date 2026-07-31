@@ -75,6 +75,12 @@ describe('bounded provider requests', () => {
         texture: 'plain',
         deliveryOrder: 0,
         assignedPostId: 'post-1',
+        emotionalTone: 'neutral',
+        expressionMode: 'direct',
+        punctuationMode: 'standard',
+        capitalizationMode: 'standard',
+        syntaxMode: 'standard',
+        firstPersonSubfamily: 'none'
       },
       recentComments: [],
       timeoutMs: 654,

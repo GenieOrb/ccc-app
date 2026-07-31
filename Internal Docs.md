@@ -13,6 +13,7 @@ El panel administrativo se encuentra en español:
 El formulario de creación solicita exclusivamente:
 1. `URLs de los posts de X` (una o varias URLs).
 2. `Dirección de los comentarios (opcional)` (texto libre con instrucciones de tono o enfoque).
+3. `Máximo total de comentarios (opcional)` (límite duro de inventario).
 
 No existen campos para nombre, idioma, cantidad, modelo, temperatura ni estilos avanzados.
 
@@ -95,9 +96,18 @@ Antes de aceptar un comentario generado:
 - Cuando el inventario disponible desciende a 20 o menos:
   - La comprobación y posible reposición se lanza asíncronamente de forma separada *después* de haber completado y cerrado la transacción de asignación o de retirar administrativamente una sugerencia, para evitar tiempos de respuesta lentos.
   - Se crea automáticamente un ciclo de reposición de 50 slots utilizando el snapshot actual de posts vigentes de la campaña.
+  - La reposición respeta en todo momento la capacidad máxima configurada en la campaña (`max_comments_total`), la cual es un límite global opcional. Si este campo se deja vacío (`NULL`), la campaña no tiene límite y puede generar comentarios perpetuamente. Cuando existe un límite y queda capacidad parcial, se generan exactamente los slots restantes; cuando se agota el inventario máximo configurado, cesan los ciclos de generación y el polling de nuevos posts.
   - La base de datos impide más de un ciclo activo por campaña mediante un bloqueo transaccional a nivel de fila sobre la propia campaña (`SELECT 1 FROM campaigns FOR UPDATE`). Esto provee una garantía real contra carreras concurrentes (ej. entre ediciones de posts y disparos de reposición).
 
-## 11. Disparadores del Worker
+## 11. Costes y Facturación (IA y X)
+- Todas las interacciones de X API (consultas de usuarios, posts o cronologías paginadas) y las llamadas a la IA (preflight, generación de posts, reescrituras correctoras) son rastreadas para calcular costes.
+- En la creación de campañas (manuales y perpetuas) se utiliza una clave de atribución asíncrona (`attribution_key`) que asocia todas las llamadas previas (preflight, lookups) a la ID de la campaña de manera atómica sin bloquear el procesamiento.
+- Tabla `x_api_calls`: Registra cada llamada a X. La inserción deduplica internamente mediante los recursos de X y un UNIQUE INDEX en `x_api_billable_resources` (`resource_type`, `resource_id`, `billing_utc_date`) para calcular el coste únicamente para nuevos datos que deban pagarse. Costes fijos configurados: 0.005 USD para `user` y 0.010 USD para `post`.
+- Tabla `generation_api_calls`: Registra cada invocación de IA, preflight incluido. Conserva proveedor, API model, y la tarifa configurada en ese momento (snapshot del modelo) que se utiliza para calcular el coste estimado una vez concluido el ciclo.
+- Panel de Administración Global: En la parte superior del dashboard principal se expone en tiempo real un banner global de `Costo en los últimos 30 días: $X` a nivel de aplicación.
+- Costes por Campaña: En el detalle individual de cada campaña se visualizan sus propios consumos de IA, de X y los totales de ambas redes atribuibles desde el inicio de los tiempos.
+
+## 12. Disparadores del Worker
 - Creación de campaña o reposición arranca el worker en segundo plano mediante `after()` o ejecución asíncrona no bloqueante.
 - Polling administrativo automático desde la interfaz de `/admin` mientras existan trabajos pendientes.
 - Endpoint de disparo externo: `POST /api/internal/generation/process` protegido por `Authorization: Bearer {INTERNAL_PROCESS_SECRET}`.
@@ -220,6 +230,7 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 * Usa cuentas de X.
 * Duración de posts entre 1 y 720 horas.
 * Slug y URL pública permanentes.
+* Adopción del límite de `max_comments_total`. Cuando se agota la capacidad en una campaña de tipo perpetua, se mantiene la limpieza y expiración global, pero no se realiza polling a la API de X destinado únicamente a descubrir nuevos posts, ahorrando cuota.
 * La creación de la campaña y el alta de una cuenta esperan una recuperación inicial acotada y posterior al commit.
 * Esa recuperación puede importar como máximo el post existente elegible más reciente de la cuenta; no crea un backfill histórico sin límite.
 * Después de la recuperación inicial, el cron incorpora los posts futuros mediante la sincronización de la cronología paginada, sin perder publicaciones entre páginas.

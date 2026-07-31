@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { isAdminAuthenticated, validateSameOrigin } from '@/lib/auth';
 import { getCampaignsPage, createCampaign, createPerpetualCampaign } from '@/lib/services';
 import { getConfig } from '@/lib/config';
+import { queryDb } from '@/lib/db';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -29,6 +30,7 @@ export async function GET(req: Request) {
       );
     }
     const campaigns = await getCampaignsPage(config.appBaseUrl, page, CAMPAIGNS_PAGE_SIZE);
+
     return NextResponse.json(
       campaigns,
       { headers: { 'Cache-Control': 'no-store' } }
@@ -77,8 +79,17 @@ export async function POST(req: Request) {
         );
       }
 
-      const { urlsInput, direction, displayName, modelKey, brandVariants } = body;
-      
+      const { urlsInput, direction, displayName, modelKey, brandVariants, maxCommentsTotal } = body;
+
+      if (maxCommentsTotal !== undefined) {
+        if (!Number.isInteger(maxCommentsTotal) || maxCommentsTotal < 1 || maxCommentsTotal > 1000000) {
+          return NextResponse.json(
+            { error: 'El máximo de comentarios debe ser un entero entre 1 y 1.000.000.' },
+            { status: 400, headers: { 'Cache-Control': 'no-store' } }
+          );
+        }
+      }
+
       if (!urlsInput || typeof urlsInput !== 'string') {
         return NextResponse.json(
           { error: 'Debes proporcionar las URLs de los posts de X.' },
@@ -96,7 +107,7 @@ export async function POST(req: Request) {
       if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length > 120)) return NextResponse.json({ error: 'Nombre de campaña no válido.' }, { status: 400 });
       if (modelKey !== undefined && typeof modelKey !== 'string') return NextResponse.json({ error: 'Modelo no válido.' }, { status: 400 });
       if (brandVariants !== undefined && !Array.isArray(brandVariants)) return NextResponse.json({ error: 'Variantes de marca no válidas.' }, { status: 400 });
-      const created = await createCampaign({ urlsInput, direction, displayName, modelKey, brandVariants });
+      const created = await createCampaign({ urlsInput, direction, displayName, modelKey, brandVariants, maxCommentsTotal });
 
       return NextResponse.json(
         { success: true, campaign: { ...created, campaignType: 'manual' } },
@@ -110,8 +121,17 @@ export async function POST(req: Request) {
         );
       }
 
-      const { accountsInput, direction, postActiveLifetimeHours, displayName, modelKey, brandVariants } = body;
-      
+      const { accountsInput, direction, postActiveLifetimeHours, displayName, modelKey, brandVariants, maxCommentsTotal } = body;
+
+      if (maxCommentsTotal !== undefined) {
+        if (!Number.isInteger(maxCommentsTotal) || maxCommentsTotal < 1 || maxCommentsTotal > 1000000) {
+          return NextResponse.json(
+            { error: 'El máximo de comentarios debe ser un entero entre 1 y 1.000.000.' },
+            { status: 400, headers: { 'Cache-Control': 'no-store' } }
+          );
+        }
+      }
+
       if (!accountsInput || typeof accountsInput !== 'string') {
         return NextResponse.json(
           { error: 'Debes proporcionar las cuentas de X.' },
@@ -136,7 +156,7 @@ export async function POST(req: Request) {
       if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length > 120)) return NextResponse.json({ error: 'Nombre de campaña no válido.' }, { status: 400 });
       if (modelKey !== undefined && typeof modelKey !== 'string') return NextResponse.json({ error: 'Modelo no válido.' }, { status: 400 });
       if (brandVariants !== undefined && !Array.isArray(brandVariants)) return NextResponse.json({ error: 'Variantes de marca no válidas.' }, { status: 400 });
-      const created = await createPerpetualCampaign({ accountsInput, direction, postActiveLifetimeHours, displayName, modelKey, brandVariants });
+      const created = await createPerpetualCampaign({ accountsInput, direction, postActiveLifetimeHours, displayName, modelKey, brandVariants, maxCommentsTotal });
 
       return NextResponse.json(
         { success: true, campaign: { id: created.id, slug: created.slug, campaignType: 'perpetual' }, initialSync: created.initialSync },

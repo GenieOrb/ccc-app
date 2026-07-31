@@ -10,10 +10,20 @@ const campaign = {
   displayName: 'Campaña de prueba', modelKey: 'gpt-5.4', isActive: true, safetyAllowed: true, xPosts: [], campaignType: 'manual', xAccounts: [],
   generationProgress: 0, validGeneratedCount: 0, availableCount: 0, assignedCount: 0, withdrawnCount: 0,
   pendingProcessingJobsCount: 0, failedJobsCount: 0, hasUnresolvedFailedCycle: false, createdAt: new Date().toISOString(),
-  recordedCost: 0.125,
+  recordedCost: 0.125, aiRecordedCost: 0.100, xRecordedCost: 0.025, costIsComplete: true, unknownAiCostCalls: 0, unknownXCostCalls: 0, limitReached: false, maxCommentsTotal: undefined,
 };
 
-function json(body: unknown, ok = true) { return { ok, status: ok ? 200 : 400, json: async () => body }; }
+function json(body: unknown, ok = true) {
+  return {
+    ok,
+    status: ok ? 200 : 400,
+    headers: new Headers({
+      'content-type': 'application/json',
+    }),
+    json: async () => body,
+    text: async () => JSON.stringify(body),
+  };
+}
 
 describe('administration campaign cards', () => {
   const fetchMock = vi.fn();
@@ -42,8 +52,18 @@ describe('administration campaign cards', () => {
 
   it('shows the campaign accumulated recorded cost', async () => {
     render(<AdminDashboardPage />);
-    expect(await screen.findByText('Coste registrado')).toBeTruthy();
-    expect(screen.getByText('$0.12500000')).toBeTruthy();
+
+    const label = await screen.findByText('Costo acumulado');
+    const costItem = label.closest('.stat-item');
+
+    expect(costItem).not.toBeNull();
+
+    const normalizedText =
+      costItem?.textContent?.replace(/\s+/g, ' ') ?? '';
+
+    expect(normalizedText).toContain('$0.125');
+    expect(normalizedText).toContain('IA: $0.100');
+    expect(normalizedText).toContain('X API: $0.025');
   });
 
   it('shows the latest synchronization checkpoint for a perpetual X account', async () => {
@@ -154,35 +174,205 @@ describe('administration campaign cards', () => {
     await waitFor(() => expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/admin/campaigns?page=1'))).toHaveLength(2));
   });
 
-  it('creates a campaign then generates and displays its seven-comment preview outside campaign cards', async () => {
-    const previewComments = Array.from({ length: 7 }, (_, index) => `Preview ${index + 1}`);
-    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
-      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
-      if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true, campaign: { id: 'new-campaign' } }));
-      if (input === '/api/admin/campaigns/new-campaign/preview' && init?.method === 'POST') return Promise.resolve(json({ success: true, preview: { postId: 'post-1', comments: previewComments } }));
-      if (input.includes('/api/admin/campaigns/campaign-1/suggestions')) return Promise.resolve(json({ suggestions: [{ id: 'suggestion-1', text: 'Comentario existente', status: 'available', postUrl: 'https://x.com/genieorb/status/1', postAuthor: 'genieorb', postIsRetired: false }], nextCursor: null }));
-      if (input.includes('/preview')) return Promise.resolve(json({ previews: [] }));
-      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
-      return Promise.resolve(json({}));
-    });
+  it('generates seven preview comments without creating a campaign', async () => {
+    const previewComments = Array.from(
+      { length: 7 },
+      (_, index) => `Preview ${index + 1}`
+    );
+
+    fetchMock.mockImplementation(
+      (input: string, init?: RequestInit) => {
+        if (input.includes('/api/admin/models')) {
+          return Promise.resolve(json({ models: [] }));
+        }
+
+        if (
+          input.includes('/preview') &&
+          init?.method === 'POST'
+        ) {
+          return Promise.resolve(
+            json({
+              success: true,
+              comments: previewComments,
+              preview: {
+                id: 'preview-1',
+                postId: 'post-1',
+                comments: previewComments,
+                createdAt: new Date().toISOString(),
+              },
+            })
+          );
+        }
+
+        if (
+          input.includes(
+            '/api/admin/campaigns/campaign-1/suggestions'
+          )
+        ) {
+          return Promise.resolve(
+            json({
+              suggestions: [],
+              nextCursor: null,
+            })
+          );
+        }
+
+        if (input.includes('/preview')) {
+          return Promise.resolve(
+            json({
+              previews: [],
+            })
+          );
+        }
+
+        if (input.includes('/api/admin/campaigns')) {
+          return Promise.resolve(
+            json({
+              items: [campaign],
+              page: 1,
+              total: 1,
+              totalPages: 1,
+            })
+          );
+        }
+
+        return Promise.resolve(json({}));
+      }
+    );
+
     render(<AdminDashboardPage />);
 
-    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
-    fireEvent.click(screen.getByRole('button', { name: /^generar preview$/i }));
+    fireEvent.change(
+      await screen.findByLabelText(/urls de los posts de x/i),
+      {
+        target: {
+          value: 'https://x.com/genieorb/status/123',
+        },
+      }
+    );
 
-    await waitFor(() => expect(screen.getByText('Preview 7')).toBeTruthy());
-    const mutationCalls = fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'POST');
-    expect(mutationCalls.map(([url]) => String(url))).toEqual(['/api/admin/campaigns', '/api/admin/campaigns/new-campaign/preview']);
-    expect(screen.getAllByText(/^Preview \d$/)).toHaveLength(7);
-    expect(screen.getAllByRole('button', { name: /^generar preview$/i })).toHaveLength(1);
+    fireEvent.click(
+      screen.getByRole('button', {
+        name: /^generar preview$/i,
+      })
+    );
 
-    fireEvent.click(await screen.findByRole('button', { name: /expandir/i }));
-    expect(screen.getAllByRole('button', { name: /^generar preview$/i })).toHaveLength(1);
-    fireEvent.click(await screen.findByRole('button', { name: /ver comentarios/i }));
-    const postLink = await screen.findByRole('link', { name: /abrir post de @genieorb/i });
-    expect(postLink.getAttribute('href')).toBe('https://x.com/genieorb/status/1');
-    expect(postLink.getAttribute('target')).toBe('_blank');
-    expect(postLink.getAttribute('rel')).toBe('noopener noreferrer');
-    expect(screen.queryByText(`Modelo: ${campaign.modelKey}`)).toBeNull();
+    expect(await screen.findByText('Preview 7')).toBeTruthy();
+
+    const mutationCalls = fetchMock.mock.calls.filter(
+      ([, init]) =>
+        (init as RequestInit | undefined)?.method === 'POST'
+    );
+
+    const mutationUrls = mutationCalls.map(
+      ([url]) => String(url)
+    );
+
+    expect(
+      mutationUrls.some((url) => url.includes('/preview'))
+    ).toBe(true);
+
+    expect(
+      mutationUrls.some(
+        (url) => url === '/api/admin/campaigns'
+      )
+    ).toBe(false);
+  });
+
+  describe('maxCommentsTotal optional field', () => {
+    it('is initially empty and not required', async () => {
+      render(<AdminDashboardPage />);
+      const maxInput = await screen.findByLabelText(/máximo de comentarios/i) as HTMLInputElement;
+      expect(maxInput.value).toBe('');
+      expect(maxInput.required).toBe(false);
+    });
+
+    it('submits without maxCommentsTotal when empty', async () => {
+      fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+        if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+        if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true }));
+        if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+        return Promise.resolve(json({}));
+      });
+      render(<AdminDashboardPage />);
+
+      fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
+        target: { value: 'https://x.com/genieorb/status/123' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
+
+      await waitFor(() => {
+        const postCall = fetchMock.mock.calls.find(([url, init]) => String(url) === '/api/admin/campaigns' && (init as RequestInit)?.method === 'POST');
+        expect(postCall).toBeTruthy();
+        const payload = JSON.parse((postCall?.[1] as RequestInit).body as string);
+        expect(payload).not.toHaveProperty('maxCommentsTotal');
+      });
+    });
+
+    it('submits with maxCommentsTotal when provided', async () => {
+      fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+        if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+        if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true }));
+        if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+        return Promise.resolve(json({}));
+      });
+      render(<AdminDashboardPage />);
+
+      fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
+        target: { value: 'https://x.com/genieorb/status/123' },
+      });
+      const maxInput = await screen.findByLabelText(/máximo de comentarios/i);
+      fireEvent.change(maxInput, { target: { value: '1000' } });
+      fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
+
+      await waitFor(() => {
+        const postCall = fetchMock.mock.calls.find(([url, init]) => String(url) === '/api/admin/campaigns' && (init as RequestInit)?.method === 'POST');
+        expect(postCall).toBeTruthy();
+        const payload = JSON.parse((postCall?.[1] as RequestInit).body as string);
+        expect(payload.maxCommentsTotal).toBe(1000);
+      });
+
+      // verifies it clears the field after creation
+      await waitFor(() => {
+        expect((screen.getByLabelText(/máximo de comentarios/i) as HTMLInputElement).value).toBe('');
+      });
+    });
+
+    it('shows error and does not submit with invalid maxCommentsTotal', async () => {
+      fetchMock.mockImplementation((input: string) => {
+        if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+        if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+        return Promise.resolve(json({}));
+      });
+      render(<AdminDashboardPage />);
+
+      fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
+        target: { value: 'https://x.com/genieorb/status/123' },
+      });
+      const maxInput = await screen.findByLabelText(/máximo de comentarios/i);
+
+      // Test decimal
+      fireEvent.change(maxInput, { target: { value: '10.5' } });
+      fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
+      await waitFor(() => expect(screen.getByText('El máximo de comentarios debe ser un entero entre 1 y 1.000.000.')).toBeTruthy());
+
+      // Test negative
+      fireEvent.change(maxInput, { target: { value: '-5' } });
+      fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
+      await waitFor(() => expect(screen.getByText('El máximo de comentarios debe ser un entero entre 1 y 1.000.000.')).toBeTruthy());
+
+      // Test zero
+      fireEvent.change(maxInput, { target: { value: '0' } });
+      fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
+      await waitFor(() => expect(screen.getByText('El máximo de comentarios debe ser un entero entre 1 y 1.000.000.')).toBeTruthy());
+
+      // Test over 1000000
+      fireEvent.change(maxInput, { target: { value: '1000001' } });
+      fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
+      await waitFor(() => expect(screen.getByText('El máximo de comentarios debe ser un entero entre 1 y 1.000.000.')).toBeTruthy());
+
+      const postCalls = fetchMock.mock.calls.filter(([url, init]) => String(url) === '/api/admin/campaigns' && (init as RequestInit)?.method === 'POST');
+      expect(postCalls).toHaveLength(0);
+    });
   });
 });

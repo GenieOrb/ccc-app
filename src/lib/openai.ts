@@ -47,7 +47,7 @@ export const SafetyPreflightSchema = z.object({
 });
 
 export type SafetyPreflightResult = z.infer<typeof SafetyPreflightSchema>;
-export interface PreflightLedgerAttribution { campaignId?: string; campaignPostId?: string; campaignAccountId?: string; }
+export interface PreflightLedgerAttribution { campaignId?: string; campaignPostId?: string; campaignAccountId?: string; attributionKey?: string; }
 
 function locallySanitizeCampaignSafety(postsText: string[], direction?: string): SafetyPreflightResult {
   // Used only when the independent OpenAI reviewer is unavailable. Input is
@@ -75,9 +75,9 @@ export async function checkCampaignSafety(
   // stored; no price or cost is inferred for OPENAI_MODEL here.
   const callKey = `preflight:${randomUUID()}`;
   await queryDb(
-    `INSERT INTO generation_api_calls (call_key,campaign_id,campaign_post_id,campaign_account_id,purpose,provider,model_key,api_model,status)
-     VALUES ($1,$2,$3,$4,'preflight','openai','openai-preflight',$5,'started')`,
-    [callKey, attribution?.campaignId ?? null, attribution?.campaignPostId ?? null, attribution?.campaignAccountId ?? null, config.openaiModel],
+    `INSERT INTO generation_api_calls (call_key,campaign_id,campaign_post_id,campaign_account_id,attribution_key,purpose,provider,model_key,api_model,status)
+     VALUES ($1,$2,$3,$4,$5,'preflight','openai','openai-preflight',$6,'started')`,
+    [callKey, attribution?.campaignId ?? null, attribution?.campaignPostId ?? null, attribution?.campaignAccountId ?? null, attribution?.attributionKey ?? null, config.openaiModel],
   );
 
   const combinedPosts = postsText

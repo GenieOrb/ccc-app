@@ -2,8 +2,9 @@ import 'server-only';
 import { randomUUID } from 'node:crypto';
 import { getConfig } from './config';
 import { queryDb } from './db';
+import { X_PRICING, getUtcDedupDate } from './x-pricing';
 
-export interface XCallAttribution { campaignId?: string; campaignAccountId?: string; }
+export interface XCallAttribution { campaignId?: string; campaignAccountId?: string; attributionKey?: string; }
 
 function boundedXTimeoutMs(requestedTimeoutMs: number | undefined, defaultTimeoutMs: number): number {
   if (requestedTimeoutMs === undefined) return defaultTimeoutMs;
@@ -14,17 +15,67 @@ function boundedXTimeoutMs(requestedTimeoutMs: number | undefined, defaultTimeou
 async function recordXCall(operation: 'tweet_lookup' | 'user_lookup' | 'timeline_lookup', attribution?: XCallAttribution) {
   const callKey = `x:${operation}:${randomUUID()}`;
   await queryDb(
-    `INSERT INTO x_api_calls (call_key,operation,campaign_id,campaign_account_id,status)
-     VALUES ($1,$2,$3,$4,'started')`,
-    [callKey, operation, attribution?.campaignId ?? null, attribution?.campaignAccountId ?? null],
+    `INSERT INTO x_api_calls (call_key,operation,campaign_id,campaign_account_id,attribution_key,status)
+     VALUES ($1,$2,$3,$4,$5,'started')`,
+    [callKey, operation, attribution?.campaignId ?? null, attribution?.campaignAccountId ?? null, attribution?.attributionKey ?? null],
   );
   return callKey;
 }
 
-async function finishXCall(callKey: string, status: 'succeeded' | 'failed', httpStatus?: number) {
+async function finishXCall(callKey: string, status: 'succeeded' | 'failed', operation: 'tweet_lookup' | 'user_lookup' | 'timeline_lookup', httpStatus?: number, apiResponse?: XApiResponse) {
+  let postCount = 0;
+  let userCount = 0;
+  let cost = 0;
+
+  if (status === 'succeeded' && apiResponse) {
+    const postIds = new Set<string>();
+    const userIds = new Set<string>();
+
+    if (apiResponse.data) {
+      if (operation === 'user_lookup') {
+        apiResponse.data.forEach((u: unknown) => { if (u && typeof u === 'object' && 'id' in u && typeof (u as { id: unknown }).id === 'string') userIds.add((u as { id: string }).id); });
+      } else {
+        apiResponse.data.forEach(t => t.id && postIds.add(t.id));
+      }
+    }
+
+    if (apiResponse.includes?.users) {
+      apiResponse.includes.users.forEach(u => u.id && userIds.add(u.id));
+    }
+    if (apiResponse.includes?.tweets) {
+      apiResponse.includes.tweets.forEach(t => t.id && postIds.add(t.id));
+    }
+
+    const utcDate = getUtcDedupDate();
+
+    for (const pid of postIds) {
+      const res = await queryDb<{ id: string }>(
+        `INSERT INTO x_api_billable_resources (resource_type, resource_id, billing_utc_date)
+         VALUES ('post', $1, $2) ON CONFLICT DO NOTHING RETURNING id`,
+        [pid, utcDate]
+      );
+      if (res.length > 0) postCount++;
+    }
+
+    for (const uid of userIds) {
+      const res = await queryDb<{ id: string }>(
+        `INSERT INTO x_api_billable_resources (resource_type, resource_id, billing_utc_date)
+         VALUES ('user', $1, $2) ON CONFLICT DO NOTHING RETURNING id`,
+        [uid, utcDate]
+      );
+      if (res.length > 0) userCount++;
+    }
+
+    cost = (postCount * X_PRICING.POST_READ_USD) + (userCount * X_PRICING.USER_READ_USD);
+  }
+
   await queryDb(
-    `UPDATE x_api_calls SET status=$2,http_status=$3,finished_at=NOW(),failure_kind=CASE WHEN $2='failed' THEN 'provider_error' ELSE NULL END WHERE call_key=$1`,
-    [callKey, status, httpStatus ?? null],
+    `UPDATE x_api_calls
+     SET status=$2, http_status=$3, post_resources_count=$4, user_resources_count=$5,
+         post_unit_price=$6, user_unit_price=$7, currency=$8, estimated_cost=$9,
+         pricing_effective_at=$10, finished_at=NOW(), failure_kind=CASE WHEN $2='failed' THEN 'provider_error' ELSE NULL END
+     WHERE call_key=$1`,
+    [callKey, status, httpStatus ?? null, postCount, userCount, X_PRICING.POST_READ_USD, X_PRICING.USER_READ_USD, X_PRICING.CURRENCY, cost, X_PRICING.EFFECTIVE_DATE],
   );
 }
 
@@ -224,7 +275,7 @@ export async function fetchXPosts(extractedUrls: ExtractedXUrl[], attribution?: 
     });
   } catch (err: unknown) {
     clearTimeout(timeoutId);
-    await finishXCall(callKey, 'failed');
+    await finishXCall(callKey, 'failed', 'tweet_lookup');
     if (err instanceof Error && err.name === 'AbortError') {
       throw new Error('La llamada a la API de X superó el tiempo límite de 15 segundos.');
     }
@@ -234,13 +285,13 @@ export async function fetchXPosts(extractedUrls: ExtractedXUrl[], attribution?: 
   }
 
   if (!response.ok) {
-    await finishXCall(callKey, 'failed', response.status);
+    await finishXCall(callKey, 'failed', 'tweet_lookup', response.status);
     const errText = await response.text();
     throw new Error(`La API de X devolvió el estado HTTP ${response.status}: ${errText.slice(0, 200)}`);
   }
 
   const data = (await response.json()) as XApiResponse;
-  await finishXCall(callKey, 'succeeded', response.status);
+  await finishXCall(callKey, 'succeeded', 'tweet_lookup', response.status, data);
 
   const rawTweets = data.data || [];
   const tweetsData: XTweet[] = [];
@@ -382,19 +433,19 @@ export async function resolveXUsername(username: string, attribution?: XCallAttr
     });
   } catch {
     clearTimeout(timeoutId);
-    await finishXCall(callKey, 'failed');
+    await finishXCall(callKey, 'failed', 'user_lookup');
     throw new Error('Error de conexión al resolver usuario en X.');
   } finally {
     clearTimeout(timeoutId);
   }
 
   if (!response.ok) {
-    await finishXCall(callKey, 'failed', response.status);
+    await finishXCall(callKey, 'failed', 'user_lookup', response.status);
     throw new Error(`La API de X devolvió el estado HTTP ${response.status} al resolver el usuario.`);
   }
 
   const data = (await response.json()) as { data?: { id: string } };
-  await finishXCall(callKey, 'succeeded', response.status);
+  await finishXCall(callKey, 'succeeded', 'user_lookup', response.status, data as unknown as XApiResponse);
   if (!data.data || !data.data.id) {
     throw new Error(`El usuario ${username} no existe o está suspendido.`);
   }
@@ -456,19 +507,19 @@ export async function fetchNewXPostsForAccount(
     });
   } catch {
     clearTimeout(timeoutId);
-    await finishXCall(callKey, 'failed');
+    await finishXCall(callKey, 'failed', 'timeline_lookup');
     throw new Error('Error de red al consultar posts.');
   } finally {
     clearTimeout(timeoutId);
   }
 
   if (!response.ok) {
-    await finishXCall(callKey, 'failed', response.status);
+    await finishXCall(callKey, 'failed', 'timeline_lookup', response.status);
     throw new Error(`La API de X devolvió HTTP ${response.status}`);
   }
 
   const data = (await response.json()) as XApiResponse;
-  await finishXCall(callKey, 'succeeded', response.status);
+  await finishXCall(callKey, 'succeeded', 'timeline_lookup', response.status, data);
   const rawTweets = data.data || [];
   const tweetsData: XTweet[] = [];
   for (const item of rawTweets) {
