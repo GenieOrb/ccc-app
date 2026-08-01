@@ -556,6 +556,17 @@ CREATE TABLE IF NOT EXISTS generation_api_calls (
   attribution_key UUID,
   failure_kind TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), finished_at TIMESTAMPTZ
 );
+-- Legacy compatibility: generation_api_calls cost columns
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS input_tokens INTEGER;
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS cached_input_tokens INTEGER;
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS output_tokens INTEGER;
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS input_price_per_million NUMERIC(12,6);
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS cached_input_price_per_million NUMERIC(12,6);
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS output_price_per_million NUMERIC(12,6);
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'USD';
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS estimated_cost NUMERIC(16,8);
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS failure_kind TEXT;
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS generation_api_calls_campaign_idx ON generation_api_calls (campaign_id, created_at DESC);
 ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS attribution_key UUID;
 CREATE INDEX IF NOT EXISTS generation_api_calls_attribution_idx ON generation_api_calls (attribution_key) WHERE campaign_id IS NULL;
@@ -593,6 +604,14 @@ CREATE TABLE IF NOT EXISTS x_api_calls (
   http_status INTEGER, failure_kind TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), finished_at TIMESTAMPTZ
 );
+-- Legacy compatibility: x_api_calls cost columns
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS campaign_id UUID REFERENCES campaigns(id) ON DELETE RESTRICT;
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS campaign_account_id UUID REFERENCES campaign_accounts(id) ON DELETE RESTRICT;
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS currency TEXT;
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS estimated_cost NUMERIC(16,8);
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS http_status INTEGER;
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS failure_kind TEXT;
+ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS x_api_calls_campaign_idx ON x_api_calls (campaign_id, created_at DESC);
 ALTER TABLE x_api_calls ADD COLUMN IF NOT EXISTS attribution_key UUID;
 CREATE INDEX IF NOT EXISTS x_api_calls_attribution_idx ON x_api_calls (attribution_key) WHERE campaign_id IS NULL;
@@ -612,6 +631,17 @@ CREATE TABLE IF NOT EXISTS campaign_previews (
   input_price_per_million NUMERIC(12,6), cached_input_price_per_million NUMERIC(12,6), output_price_per_million NUMERIC(12,6), currency TEXT, pricing_effective_at DATE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Legacy compatibility: campaign_previews cost columns
+ALTER TABLE campaign_previews ADD COLUMN IF NOT EXISTS input_tokens INTEGER;
+ALTER TABLE campaign_previews ADD COLUMN IF NOT EXISTS cached_input_tokens INTEGER;
+ALTER TABLE campaign_previews ADD COLUMN IF NOT EXISTS output_tokens INTEGER;
+ALTER TABLE campaign_previews ADD COLUMN IF NOT EXISTS estimated_cost NUMERIC(16,8);
+ALTER TABLE campaign_previews ADD COLUMN IF NOT EXISTS error_message TEXT;
+ALTER TABLE campaign_previews ADD COLUMN IF NOT EXISTS input_price_per_million NUMERIC(12,6);
+ALTER TABLE campaign_previews ADD COLUMN IF NOT EXISTS cached_input_price_per_million NUMERIC(12,6);
+ALTER TABLE campaign_previews ADD COLUMN IF NOT EXISTS output_price_per_million NUMERIC(12,6);
+ALTER TABLE campaign_previews ADD COLUMN IF NOT EXISTS currency TEXT;
+ALTER TABLE campaign_previews ADD COLUMN IF NOT EXISTS pricing_effective_at DATE;
 CREATE INDEX IF NOT EXISTS campaign_previews_campaign_idx ON campaign_previews (campaign_id, created_at DESC);
 
 -- Snapshot is populated at enqueue time from the campaign, so legacy enqueue paths
