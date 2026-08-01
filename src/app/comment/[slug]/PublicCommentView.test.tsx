@@ -104,6 +104,52 @@ describe('PublicCommentView banner', () => {
     unmount();
   });
 
+  it('navigates to canonical postUrl on mobile instead of using intent', async () => {
+    // Simulamos un entorno móvil
+    vi.stubGlobal('navigator', { ...navigator, userAgent: 'iPhone', clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
+    let resolveFetch!: (value: unknown) => void;
+    const fetchPromise = new Promise((resolve) => { resolveFetch = resolve; });
+
+    vi.stubGlobal('fetch', vi.fn().mockImplementationOnce(() => fetchPromise).mockResolvedValue(json({ status: 'success' })));
+    const user = userEvent.setup();
+
+    const { unmount } = render(<PublicCommentView slug="test" />);
+
+    await act(async () => {
+      resolveFetch(json({ status: 'success', assignmentId: 'a1', comment: 'A comment', postUrl: 'https://x.com/user/status/1', replyIntentUrl: 'https://x.com/intent/tweet?in_reply_to=1' }));
+    });
+
+    await user.click(await screen.findByRole('button', { name: 'Copy' }));
+
+    const link = screen.getByRole('link', { name: 'Post' });
+    expect(link.getAttribute('href')).toBe('https://x.com/user/status/1'); // Se usó el postUrl directo en lugar del intent
+    unmount();
+  });
+
+  it('button is disabled if no valid identifiers are present', async () => {
+    vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText: vi.fn().mockResolvedValue(undefined) } });
+    let resolveFetch!: (value: unknown) => void;
+    const fetchPromise = new Promise((resolve) => { resolveFetch = resolve; });
+
+    vi.stubGlobal('fetch', vi.fn().mockImplementationOnce(() => fetchPromise));
+    const user = userEvent.setup();
+
+    const { unmount } = render(<PublicCommentView slug="test" />);
+
+    await act(async () => {
+      // Sin postUrl ni replyIntentUrl
+      resolveFetch(json({ status: 'success', assignmentId: 'a1', comment: 'A comment', postUrl: '', replyIntentUrl: '' }));
+    });
+
+    await user.click(await screen.findByRole('button', { name: 'Copy' }));
+
+    // El botón debe seguir deshabilitado y no ser un link
+    const button = screen.getByRole('button', { name: 'Post' });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole('link', { name: 'Post' })).toBeNull();
+    unmount();
+  });
+
   it('does not crash if tracking fails', async () => {
     let resolveFetch!: (value: unknown) => void;
     const fetchPromise = new Promise((resolve) => { resolveFetch = resolve; });
@@ -127,7 +173,6 @@ describe('PublicCommentView banner', () => {
 
     const link = screen.getByRole('link', { name: 'Post' });
 
-    // Do not await user.click directly if we are throwing inside unhandled promises, but we will catch it in the act block.
     await act(async () => {
       await user.click(link);
       rejectComplete(new Error('Network error'));

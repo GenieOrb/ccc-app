@@ -12,7 +12,7 @@ export default function PublicCommentView({ slug }: Props) {
   const [status, setStatus] = useState<'success' | 'expired' | 'unavailable' | 'generating' | 'error'>('success');
   const [waitLong, setWaitLong] = useState(false);
   const [assignmentId, setAssignmentId] = useState('');
-  const [, setPostUrl] = useState('');
+  const [postUrl, setPostUrl] = useState('');
   const [replyIntentUrl, setReplyIntentUrl] = useState('');
   const [comment, setComment] = useState('');
   const [hasCopied, setHasCopied] = useState(false);
@@ -100,7 +100,7 @@ export default function PublicCommentView({ slug }: Props) {
   }
 
   function handlePostClick() {
-    if (!hasCopied || !assignmentId || !replyIntentUrl || isCompleted || isPostingRef.current) return;
+    if (!hasCopied || !assignmentId || isCompleted || isPostingRef.current) return;
 
     isPostingRef.current = true;
     setIsPosting(true);
@@ -192,6 +192,10 @@ export default function PublicCommentView({ slug }: Props) {
     );
   }
 
+  const isMobile = typeof navigator !== 'undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  const safeHref = isMobile ? postUrl : (replyIntentUrl || postUrl);
+  const canPost = hasCopied && !isCompleted && !!safeHref;
+
   return (
     shell(<>
       <div className="public-card">
@@ -221,7 +225,7 @@ export default function PublicCommentView({ slug }: Props) {
             Copy
           </button>
 
-          {!hasCopied || !replyIntentUrl || isCompleted ? (
+          {!canPost ? (
             <button
               type="button"
               className="btn-public btn-post"
@@ -231,7 +235,7 @@ export default function PublicCommentView({ slug }: Props) {
             </button>
           ) : (
             <a
-              href={replyIntentUrl}
+              href={safeHref}
               target="_blank"
               rel="noopener noreferrer"
               referrerPolicy="no-referrer"
