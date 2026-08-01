@@ -155,7 +155,7 @@ function CampaignCardItem({
     try {
       const res = await fetch(`/api/admin/campaigns/${c.id}/settings`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(setting) });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'No se pudo guardar la configuraciÃ³n');
+      if (!res.ok) throw new Error(data.error || 'No se pudo guardar la configuración');
       await fetchCampaigns();
     } catch (e: unknown) { alert(e instanceof Error ? e.message : String(e)); }
     finally { setSavingIdentity(false); }
@@ -293,10 +293,7 @@ function CampaignCardItem({
     <div className="campaign-card">
       <div className="campaign-header-row">
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <span className="campaign-badge-id">{c.internalId}</span>
-          <span style={{ fontSize: '0.8rem', backgroundColor: '#e2e8f0', color: '#475569', padding: '2px 6px', borderRadius: '4px', fontWeight: 'bold' }}>
-            {c.campaignType === 'manual' ? 'Manual' : 'Perpetua'}
-          </span>
+          <strong>#{c.internalNumber} / {c.campaignType === 'manual' ? 'Manual' : '⭐ Perpetua'} / {c.displayName || 'Sin nombre'}</strong>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
           <span className={`status-badge ${c.isActive ? 'status-active' : 'status-inactive'}`}>
@@ -315,19 +312,17 @@ function CampaignCardItem({
         </div>
       </div>
 
-      <div style={{ marginTop: '8px', display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'baseline' }}>
-        <strong>{c.displayName || c.internalId}</strong>
-      </div>
+
       <div id={`campaign-details-${c.id}`} hidden={!expanded}>
       <form onSubmit={(e) => { e.preventDefault(); void saveSetting({ displayName: displayNameInput }); }} style={{ marginTop: '10px' }}>
-        <label htmlFor={`campaign-name-${c.id}`} className="form-label">Nombre de campaÃ±a</label>
+        <label htmlFor={`campaign-name-${c.id}`} className="form-label">Nombre de campaña</label>
         <div style={{ display: 'flex', gap: '8px' }}>
           <input id={`campaign-name-${c.id}`} className="form-textarea" value={displayNameInput} maxLength={120} onChange={(e) => setDisplayNameInput(e.target.value)} disabled={savingIdentity} />
           <button className="btn-admin btn-secondary" type="submit" disabled={savingIdentity}>Guardar</button>
         </div>
       </form>
       <form onSubmit={(e) => { e.preventDefault(); void saveSetting({ modelKey: modelKeyInput }); }} style={{ marginTop: '8px' }}>
-        <label htmlFor={`campaign-model-${c.id}`} className="form-label">Modelo de generaciÃ³n</label>
+        <label htmlFor={`campaign-model-${c.id}`} className="form-label">Modelo de generación</label>
         <div style={{ display: 'flex', gap: '8px' }}>
           <select id={`campaign-model-${c.id}`} className="form-textarea" value={modelKeyInput} onChange={(e) => setModelKeyInput(e.target.value)} disabled={savingIdentity}>
             {models.map((model) => <option key={model.key} value={model.key} disabled={!model.enabled || !model.configured}>{model.displayName}{!model.configured ? ' (no configurado)' : ''}</option>)}
@@ -337,9 +332,10 @@ function CampaignCardItem({
       </form>
 
       {c.direction && (
-        <p style={{ fontSize: '0.9rem', fontStyle: 'italic', color: '#475569' }}>
-          Dirección: &quot;{c.direction}&quot;
-        </p>
+        <details style={{ fontSize: '0.9rem', fontStyle: 'italic', color: '#475569', marginTop: '16px', marginBottom: '16px' }}>
+          <summary style={{ cursor: 'pointer', fontWeight: 'bold' }}>Dirección</summary>
+          <p style={{ marginTop: '8px', marginLeft: '12px' }}>&quot;{c.direction}&quot;</p>
+        </details>
       )}
 
       <div>

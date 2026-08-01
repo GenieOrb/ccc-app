@@ -80,6 +80,7 @@ export interface CampaignSummary {
   }[];
   withdrawnCount: number;
   createdAt: string;
+  brandVariants: { value: string; percentage: number }[];
 }
 
 export interface CampaignsPage {
@@ -118,8 +119,9 @@ export async function getCampaignsPage(
     safety_reason: string | null;
     initial_size: number;
     created_at: Date;
+    brand_variants: unknown;
   }>(
-    `SELECT id, internal_number, slug, campaign_type, max_comments_total, post_active_lifetime_hours, direction, display_name, model_key, is_active, safety_allowed, safety_category, safety_reason, initial_size, created_at
+    `SELECT id, internal_number, slug, campaign_type, max_comments_total, post_active_lifetime_hours, direction, display_name, model_key, is_active, safety_allowed, safety_category, safety_reason, initial_size, created_at, brand_variants
      FROM campaigns
      ORDER BY internal_number DESC
      LIMIT $1 OFFSET $2`,
@@ -275,6 +277,7 @@ export async function getCampaignsPage(
       limitReached,
       withdrawnCount: withdrawn,
       createdAt: new Date(c.created_at).toISOString(),
+      brandVariants: c.brand_variants ? (typeof c.brand_variants === 'string' ? JSON.parse(c.brand_variants) : c.brand_variants) : [],
     });
   }
 
