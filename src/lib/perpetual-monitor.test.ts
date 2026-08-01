@@ -336,12 +336,10 @@ describe('processPerpetualCampaigns', () => {
     });
     checkCampaignSafety.mockResolvedValueOnce({ allowed: true, category: 'safe', reason: 'ok' });
 
-    type TransactionCallback<T = unknown> = (client: PoolClient) => Promise<T>;
-    let transactionCallback: TransactionCallback | undefined;
+    type TransactionCallback<T = unknown> = (client: unknown) => Promise<T>;
     withTransaction.mockImplementation(async (cb: TransactionCallback) => {
-      transactionCallback = cb;
       return cb({
-        query: vi.fn((q, params) => {
+        query: vi.fn((q) => {
           if (q.includes('FOR UPDATE') && q.includes('campaign_accounts')) {
             return { rows: [{ initial_sync_pending: true, last_seen_post_id: null, removed_at: null, is_active: true }] };
           }
@@ -368,7 +366,7 @@ describe('processPerpetualCampaigns', () => {
     await processPerpetualCampaigns({ timeBudgetMs: 5000 });
 
     expect(withTransaction).toHaveBeenCalled();
-    const callback = withTransaction.mock.calls[0][0] as TransactionCallback;
+    expect(withTransaction).toHaveBeenCalled();
     // Should NOT have created generation_cycles
     // Wait, the client is local to the mock function above, but we can spy on it.
   });

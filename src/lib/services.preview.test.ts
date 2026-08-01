@@ -32,7 +32,7 @@ describe('generateCampaignPreview', () => {
     expect(queryDb).toHaveBeenCalledTimes(1);
   });
 
-  it('generates exactly seven comments in 5+2 batches and persists usage and cost', async () => {
+  it('generates exactly seven concurrent comments and persists usage and cost', async () => {
     queryDb.mockImplementation(async (sql: string) => String(sql).includes('RETURNING call_key') ? [{ call_key: 'acquired' }] : []);
     queryDb.mockResolvedValueOnce([postRow]);
     generateSingleComment.mockImplementation(async () => ({ comment: `comment-${generateSingleComment.mock.calls.length}`, usage: { inputTokens: 10, cachedInputTokens: 2, outputTokens: 5 } }));
@@ -41,7 +41,7 @@ describe('generateCampaignPreview', () => {
 
     expect(preview.comments).toHaveLength(7);
     expect(generateSingleComment).toHaveBeenCalledTimes(7);
-    expect(generateSingleComment.mock.calls[5][0].recentComments).toHaveLength(5);
+    expect(generateSingleComment.mock.calls[5][0].recentComments).toHaveLength(0);
     const insert = queryDb.mock.calls.find(([sql]) => String(sql).includes('INSERT INTO campaign_previews'));
     expect(insert).toBeDefined();
     if (!insert) throw new Error('Preview persistence query was not issued.');

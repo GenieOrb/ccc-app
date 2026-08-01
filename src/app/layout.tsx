@@ -17,8 +17,8 @@ const nunito = Nunito({
 });
 
 export const metadata: Metadata = {
-  title: 'Comment App',
-  description: 'Exclusive comment generation and distribution platform',
+  title: 'ccc-app',
+  description: 'ccc-app',
   robots: {
     index: false,
     follow: false,

@@ -75,7 +75,7 @@ describe('manual campaign generation inventory', () => {
     await createCampaign({ urlsInput: 'two posts' });
 
     const campaignInsert = queries.find(({ sql }) => sql.includes('INSERT INTO campaigns'))!;
-    expect(campaignInsert.sql.replace(/\s+/g, ' ')).toContain("true, true");
+    expect(campaignInsert.params?.[8]).toBe(true); // is_active
     const cycles = queries.filter(({ sql }) => sql.includes('INSERT INTO generation_cycles'));
     expect(cycles).toHaveLength(2);
     expect(cycles.map(({ params }) => params?.slice(0, 2))).toEqual([
@@ -129,6 +129,28 @@ describe('manual campaign generation inventory', () => {
       }),
     }));
 
-    await expect(toggleCampaignStatus('campaign-1', true)).rejects.toThrow('ciclo inicial inexistente o incompleto');
+    await expect(toggleCampaignStatus('campaign-1', true)).rejects.toThrow('No se puede activar: ciclo inicial incompleto y sin trabajos pendientes.');
+  });
+
+  it('creates an inactive manual campaign when requested', async () => {
+    parseMultipleXUrls.mockReturnValue([{ postId: 'one' }]);
+    fetchXPosts.mockResolvedValue([post('one')]);
+    checkCampaignSafety.mockResolvedValue({ allowed: true, category: 'safe', reason: 'ok' });
+    generateSecureSlug.mockReturnValue('new-slug-inactive');
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        queries.push({ sql, params });
+        if (sql.includes('INSERT INTO campaigns')) return { rows: [{ id: 'campaign-inactive' }] };
+        if (sql.includes('INSERT INTO campaign_posts')) return { rows: [{ id: 'post-inactive' }] };
+        if (sql.includes('INSERT INTO generation_cycles')) return { rows: [{ id: 'cycle-inactive' }] };
+        return { rows: [] };
+      }),
+    }));
+
+    await createCampaign({ urlsInput: 'one post', isInactive: true });
+
+    const campaignInsert = queries.find(({ sql }) => sql.includes('INSERT INTO campaigns'))!;
+    expect(campaignInsert.params?.[8]).toBe(false); // is_active
   });
 });

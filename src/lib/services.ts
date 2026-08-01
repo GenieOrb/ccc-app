@@ -5,7 +5,8 @@ import { parseMultipleXUrls, fetchXPosts, resolveXUsername } from './x-api';
 import { normalizeXAccounts } from './x-accounts';
 import { checkCampaignSafety } from './openai';
 import { generateSecureSlug } from './crypto';
-import { generateDeterministicSlotPlans } from './planner';
+import { generateDeterministicSlotPlans, LengthMode, EmojiPolicy, RhetoricalForm, Textures } from './planner';
+import { parseBrandVariantsSafe } from './brand-variants';
 import { DEFAULT_MODEL_KEY, getAiModel, isProviderConfigured } from './ai/models';
 import { generateSingleComment } from './openai';
 import { processPerpetualCampaigns, type PerpetualMonitorSummary } from './perpetual-monitor';
@@ -294,6 +295,7 @@ export async function createCampaign(params: {
   modelKey?: string;
   maxCommentsTotal?: number;
   brandVariants?: { value: string; percentage: number }[];
+  isInactive?: boolean;
 }): Promise<{ id: string; slug: string }> {
   const attributionKey = randomUUID();
 
@@ -328,9 +330,9 @@ export async function createCampaign(params: {
          slug, campaign_type, direction, post_active_lifetime_hours, max_comments_total, is_active, safety_allowed, safety_category, safety_reason,
          initial_size, replenishment_threshold, replenishment_size, display_name, model_key, brand_variants
        ) VALUES (
-         $1, 'manual', $2, NULL, $3, true, true, $4, $5, 30, 5, 10, $6, $7, $8::jsonb
+         $1, 'manual', $2, NULL, $3, $9, true, $4, $5, 30, 5, 10, $6, $7, $8::jsonb
        ) RETURNING id`,
-      [slug, params.direction || null, maxCommentsTotal, safetyResult.category, safetyResult.reason, displayName, model.key, JSON.stringify(params.brandVariants || [])]
+      [slug, params.direction || null, maxCommentsTotal, safetyResult.category, safetyResult.reason, displayName, model.key, JSON.stringify(params.brandVariants || []), !params.isInactive]
     );
     const campaignId = campRes.rows[0].id;
 
@@ -435,21 +437,35 @@ export async function toggleCampaignStatus(campaignId: string, desiredStatus: bo
         );
 
         const cycle = cycleRes.rows[0];
-        if (!cycle || Number(cycle.initial_cycle_count) === 0 || Number(cycle.incomplete_cycle_count) > 0) {
-          throw new Error('No se puede activar: ciclo inicial inexistente o incompleto.');
+        if (!cycle || Number(cycle.initial_cycle_count) === 0) {
+          throw new Error('No se puede activar: ciclo inicial inexistente.');
         }
 
-        if (Number(cycle.valid_produced_count) < Number(cycle.target_count)) {
-          throw new Error('No se puede activar: ciclo inicial sin haber producido el objetivo.');
-        }
-
-        const availRes = await client.query<{ avail_count: string }>(
-          `SELECT COUNT(*) as avail_count FROM suggestions
-           WHERE campaign_id = $1 AND assigned_to_session_id IS NULL AND valid_generated = true`,
+        const pendingJobsRes = await client.query<{ count: string }>(
+          `SELECT COUNT(*) as count FROM generation_jobs j
+           JOIN generation_cycles c ON j.cycle_id = c.id
+           WHERE j.campaign_id = $1 AND j.status IN ('pending', 'processing') AND c.cycle_type = 'initial'`,
           [campaignId]
         );
-        if (parseInt(availRes.rows[0]?.avail_count || '0', 10) < 1) {
-          throw new Error('No se puede activar: debe haber al menos un comentario disponible en el ciclo inicial.');
+        const hasPendingJobs = parseInt(pendingJobsRes.rows[0]?.count || '0', 10) > 0;
+
+        if (!hasPendingJobs) {
+          if (Number(cycle.incomplete_cycle_count) > 0) {
+            throw new Error('No se puede activar: ciclo inicial incompleto y sin trabajos pendientes.');
+          }
+
+          if (Number(cycle.valid_produced_count) < Number(cycle.target_count)) {
+            throw new Error('No se puede activar: ciclo inicial sin haber producido el objetivo.');
+          }
+
+          const availRes = await client.query<{ avail_count: string }>(
+            `SELECT COUNT(*) as avail_count FROM suggestions
+             WHERE campaign_id = $1 AND assigned_to_session_id IS NULL AND valid_generated = true`,
+            [campaignId]
+          );
+          if (parseInt(availRes.rows[0]?.avail_count || '0', 10) < 1) {
+            throw new Error('No se puede activar: debe haber al menos un comentario disponible en el ciclo inicial.');
+          }
         }
 
         const postRes = await client.query<{ count: string }>(
@@ -619,8 +635,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
             if (actualRepSize <= 0) break;
           }
 
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const slotPlans = generateDeterministicSlotPlans([postId], actualRepSize, (campaignInfo.brand_variants as any) || []);
+          const slotPlans = generateDeterministicSlotPlans([postId], actualRepSize, parseBrandVariantsSafe(campaignInfo.brand_variants));
           const cycleRes = await client.query<{ id: string }>(
             `INSERT INTO generation_cycles (
               campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name, prompt_version
@@ -741,8 +756,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
           if (actualRepSize <= 0) break;
         }
 
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const slotPlans = generateDeterministicSlotPlans([postId], actualRepSize, (campaignInfo.brand_variants as any) || []);
+        const slotPlans = generateDeterministicSlotPlans([postId], actualRepSize, parseBrandVariantsSafe(campaignInfo.brand_variants));
         if (slotPlans.length === 0) continue;
 
         const cycleRes = await client.query<{ id: string }>(
@@ -1027,7 +1041,8 @@ export async function createPerpetualCampaign(params: {
   displayName?: string;
   modelKey?: string;
   brandVariants?: { value: string; percentage: number }[];
-}): Promise<{ id: string; slug: string; initialSync: PerpetualMonitorSummary }> {
+  isInactive?: boolean;
+}): Promise<{ id: string; slug: string; initialSync: PerpetualMonitorSummary | null }> {
   const attributionKey = randomUUID();
   const normalizedAccounts = normalizeXAccounts(params.accountsInput);
   const model = resolveCampaignModel(params.modelKey);
@@ -1058,9 +1073,9 @@ export async function createPerpetualCampaign(params: {
          slug, campaign_type, direction, post_active_lifetime_hours, max_comments_total, is_active, safety_allowed,
          initial_size, replenishment_threshold, replenishment_size, display_name, model_key, brand_variants
        ) VALUES (
-         $1, 'perpetual', $2, $3, $4, true, true, 30, 5, 10, $5, $6, $7::jsonb
+         $1, 'perpetual', $2, $3, $4, $8, true, 30, 5, 10, $5, $6, $7::jsonb
        ) RETURNING id`,
-      [slug, params.direction || null, params.postActiveLifetimeHours, maxCommentsTotal, displayName, model.key, JSON.stringify(params.brandVariants || [])]
+      [slug, params.direction || null, params.postActiveLifetimeHours, maxCommentsTotal, displayName, model.key, JSON.stringify(params.brandVariants || []), !params.isInactive]
     );
     const campaignId = campRes.rows[0].id;
 
@@ -1084,11 +1099,14 @@ export async function createPerpetualCampaign(params: {
   // This runs only after the campaign/accounts transaction commits. It is
   // awaited because serverless runtimes may discard detached work; cron keeps
   // reconciling every perpetual account if this bounded nudge is incomplete.
-  const initialSync = await processPerpetualCampaigns({
-    campaignId: created.id,
-    accountIds: created.accountIds,
-    timeBudgetMs: 30_000,
-  });
+  let initialSync = null;
+  if (!params.isInactive) {
+    initialSync = await processPerpetualCampaigns({
+      campaignId: created.id,
+      accountIds: created.accountIds,
+      timeBudgetMs: 30_000,
+    });
+  }
   return { id: created.id, slug: created.slug, initialSync };
 }
 
@@ -1111,6 +1129,10 @@ export async function reconcileCampaignReplenishment(limit = 50): Promise<{ chec
 }
 
 export async function generateCampaignPreview(campaignId: string) {
+  const PREVIEW_TOTAL_BUDGET_MS = 50_000;
+  const PREVIEW_AI_TIMEOUT_MS = 30_000;
+  const startTime = Date.now();
+
   const rows = await queryDb<{ model_key: string; direction: string | null; brand_variants: unknown; post_id: string; text_content: string; author_name: string | null; author_username: string | null; accessible_context: unknown }>(
     `SELECT c.model_key,c.direction,c.brand_variants,p.id post_id,p.text_content,p.author_name,p.author_username,p.accessible_context
      FROM campaigns c JOIN campaign_posts p ON p.campaign_id=c.id
@@ -1118,60 +1140,90 @@ export async function generateCampaignPreview(campaignId: string) {
      ORDER BY p.posted_at DESC NULLS LAST,p.created_at DESC LIMIT 1`, [campaignId]);
   if (!rows[0]) throw new Error('No hay ningún post vigente para generar la preview.');
   const row = rows[0]; const model = resolveCampaignModel(row.model_key);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const plans = generateDeterministicSlotPlans([row.post_id], 7, (row.brand_variants as any) || []);
+  const brandVariants = parseBrandVariantsSafe(row.brand_variants);
+
+  const plans = generateDeterministicSlotPlans(
+    [row.post_id],
+    7,
+    brandVariants,
+  );
   const comments: string[] = []; let errorMessage: string | null = null;
   let inputTokens: number | null = 0;
   let cachedInputTokens: number | null = 0;
   let outputTokens: number | null = 0;
   const previewExecutionId = randomUUID();
+  let isTimeoutError = false;
+
   try {
-    // Preview follows the same 5+2 batch boundary as production while never
-    // falling back to a different model.
-    for (const batch of [plans.slice(0, 5), plans.slice(5)]) {
-      const generated = await Promise.all(batch.map(async (plan) => {
-        const callKey = `preview:${previewExecutionId}:${plan.slotIndex}`;
-        const acquired = await queryDb<{ call_key: string }>(
-          `INSERT INTO generation_api_calls (call_key,campaign_id,campaign_post_id,purpose,provider,model_key,api_model,status,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency)
-           VALUES ($1,$2,$3,'preview',$4,$5,$6,'started',$7,$8,$9,$10)
-           ON CONFLICT (call_key) DO NOTHING
-           RETURNING call_key`,
-          [callKey, campaignId, row.post_id, model.provider, model.key, model.apiModel, model.inputPricePerMillion, model.cachedInputPricePerMillion ?? null, model.outputPricePerMillion, model.currency],
-        );
-        if (Array.isArray(acquired) && acquired.length === 0) {
-          throw new Error('AI preview call acquisition conflict; no durable result is available.');
-        }
-        try {
-          const generatedComment = await generateSingleComment({ apiModel: model.apiModel, provider: model.provider, postText: row.text_content, authorName: row.author_name || '', authorUsername: row.author_username || '', accessibleContext: (row.accessible_context as Record<string, unknown>) || {}, direction: row.direction || undefined, plan, recentComments: [...comments] });
-          const callUsage = generatedComment.usage;
-          const callCost = callUsage
-            ? ((callUsage.inputTokens ?? 0) - (callUsage.cachedInputTokens ?? 0)) * model.inputPricePerMillion / 1_000_000 + (callUsage.cachedInputTokens ?? 0) * (model.cachedInputPricePerMillion ?? model.inputPricePerMillion) / 1_000_000 + (callUsage.outputTokens ?? 0) * model.outputPricePerMillion / 1_000_000
-            : null;
-          await queryDb(`UPDATE generation_api_calls SET status = $2,input_tokens = $3,cached_input_tokens = $4,output_tokens = $5,estimated_cost = $6,finished_at = NOW() WHERE call_key = $1`, [callKey, callUsage ? 'succeeded' : 'usage_unknown', callUsage?.inputTokens ?? null, callUsage?.cachedInputTokens ?? null, callUsage?.outputTokens ?? null, callCost]);
-          return generatedComment;
-        } catch (error) {
-          await queryDb(`UPDATE generation_api_calls SET status = 'failed',failure_kind = 'provider_error',finished_at = NOW() WHERE call_key = $1`, [callKey]);
-          throw error;
-        }
-      }));
-      comments.push(...generated.map((item) => item.comment));
-      for (const item of generated) {
-        if (!item.usage) {
-          inputTokens = null;
-          cachedInputTokens = null;
-          outputTokens = null;
-          continue;
-        }
-        if (inputTokens !== null) inputTokens += item.usage.inputTokens ?? 0;
-        if (cachedInputTokens !== null) cachedInputTokens += item.usage.cachedInputTokens ?? 0;
-        if (outputTokens !== null) outputTokens += item.usage.outputTokens ?? 0;
+    const generatedPromises = plans.map(async (plan) => {
+      const callKey = `preview:${previewExecutionId}:${plan.slotIndex}`;
+      const acquired = await queryDb<{ call_key: string }>(
+        `INSERT INTO generation_api_calls (call_key,campaign_id,campaign_post_id,purpose,provider,model_key,api_model,status,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency)
+         VALUES ($1,$2,$3,'preview',$4,$5,$6,'started',$7,$8,$9,$10)
+         ON CONFLICT (call_key) DO NOTHING
+         RETURNING call_key`,
+        [callKey, campaignId, row.post_id, model.provider, model.key, model.apiModel, model.inputPricePerMillion, model.cachedInputPricePerMillion ?? null, model.outputPricePerMillion, model.currency],
+      );
+      if (Array.isArray(acquired) && acquired.length === 0) {
+        throw new Error('AI preview call acquisition conflict; no durable result is available.');
       }
+      try {
+        const remainingTime = PREVIEW_TOTAL_BUDGET_MS - (Date.now() - startTime);
+        if (remainingTime <= 0) throw new Error('PREVIEW_TIMEOUT');
+        const aiTimeout = Math.min(PREVIEW_AI_TIMEOUT_MS, remainingTime);
+
+        const generatedComment = await generateSingleComment({ apiModel: model.apiModel, provider: model.provider, postText: row.text_content, authorName: row.author_name || '', authorUsername: row.author_username || '', accessibleContext: (row.accessible_context as Record<string, unknown>) || {}, direction: row.direction || undefined, plan, recentComments: [], timeoutMs: aiTimeout });
+        const callUsage = generatedComment.usage;
+        const callCost = callUsage
+          ? ((callUsage.inputTokens ?? 0) - (callUsage.cachedInputTokens ?? 0)) * model.inputPricePerMillion / 1_000_000 + (callUsage.cachedInputTokens ?? 0) * (model.cachedInputPricePerMillion ?? model.inputPricePerMillion) / 1_000_000 + (callUsage.outputTokens ?? 0) * model.outputPricePerMillion / 1_000_000
+          : null;
+        await queryDb(`UPDATE generation_api_calls SET status = $2,input_tokens = $3,cached_input_tokens = $4,output_tokens = $5,estimated_cost = $6,finished_at = NOW() WHERE call_key = $1`, [callKey, callUsage ? 'succeeded' : 'usage_unknown', callUsage?.inputTokens ?? null, callUsage?.cachedInputTokens ?? null, callUsage?.outputTokens ?? null, callCost]);
+        return generatedComment;
+      } catch (error) {
+        await queryDb(`UPDATE generation_api_calls SET status = 'failed',failure_kind = 'provider_error',finished_at = NOW() WHERE call_key = $1`, [callKey]);
+        throw error;
+      }
+    });
+
+    const results = await Promise.allSettled(generatedPromises);
+    const failed = results.find(r => r.status === 'rejected');
+    if (failed) {
+       throw (failed as PromiseRejectedResult).reason;
     }
-  } catch { errorMessage = `La preview con ${model.displayName} no pudo generarse.`; }
+
+    const generated = results.map((result) => {
+      if (result.status === 'rejected') throw result.reason;
+      return result.value;
+    });
+
+    comments.push(...generated.map((item) => item.comment));
+    for (const item of generated) {
+      if (!item.usage) {
+        inputTokens = null;
+        cachedInputTokens = null;
+        outputTokens = null;
+        continue;
+      }
+      if (inputTokens !== null) inputTokens += item.usage.inputTokens ?? 0;
+      if (cachedInputTokens !== null) cachedInputTokens += item.usage.cachedInputTokens ?? 0;
+      if (outputTokens !== null) outputTokens += item.usage.outputTokens ?? 0;
+    }
+  } catch (error) {
+    if (error instanceof Error && (error.message === 'PREVIEW_TIMEOUT' || error.name === 'AbortError' || error.message.includes('timeout') || Date.now() - startTime >= PREVIEW_TOTAL_BUDGET_MS)) {
+      isTimeoutError = true;
+      errorMessage = 'PREVIEW_TIMEOUT';
+    } else {
+      errorMessage = `La preview con ${model.displayName} no pudo generarse.`;
+    }
+  }
+
   const estimatedCost = inputTokens === null || cachedInputTokens === null || outputTokens === null
     ? null
     : ((inputTokens - cachedInputTokens) * model.inputPricePerMillion + cachedInputTokens * (model.cachedInputPricePerMillion ?? model.inputPricePerMillion) + outputTokens * model.outputPricePerMillion) / 1_000_000;
-  await queryDb(`INSERT INTO campaign_previews (campaign_id,campaign_post_id,model_key,provider,api_model,comments,input_tokens,cached_input_tokens,output_tokens,estimated_cost,error_message,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency,pricing_effective_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, [campaignId,row.post_id,model.key,model.provider,model.apiModel,JSON.stringify(comments),inputTokens,cachedInputTokens,outputTokens,estimatedCost,errorMessage,model.inputPricePerMillion,model.cachedInputPricePerMillion ?? null,model.outputPricePerMillion,model.currency,model.pricingEffectiveAt]);
+
+  await queryDb(`INSERT INTO campaign_previews (campaign_id,campaign_post_id,model_key,provider,api_model,comments,input_tokens,cached_input_tokens,output_tokens,estimated_cost,error_message,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency,pricing_effective_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, [campaignId,row.post_id,model.key,model.provider,model.apiModel,JSON.stringify(comments),inputTokens,cachedInputTokens,outputTokens,estimatedCost,isTimeoutError ? 'La preview tardó demasiado en generarse. Vuelve a intentarlo.' : errorMessage,model.inputPricePerMillion,model.cachedInputPricePerMillion ?? null,model.outputPricePerMillion,model.currency,model.pricingEffectiveAt]);
+
+  if (isTimeoutError) throw new Error('PREVIEW_TIMEOUT');
   if (errorMessage) throw new Error(errorMessage);
   return { postId: row.post_id, modelKey: model.key, provider: model.provider, comments };
 }

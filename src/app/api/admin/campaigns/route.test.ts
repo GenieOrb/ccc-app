@@ -44,25 +44,53 @@ describe('admin campaigns route', () => {
   });
 
   it('creates a valid manual campaign and rejects ambiguous manual payloads', async () => {
-    const valid = await POST(new Request('http://localhost/api/admin/campaigns', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ campaignType: 'manual', urlsInput: 'https://x.com/a/status/1', direction: 'amable', displayName: 'Prueba', modelKey: 'model-a' }) }));
+    const valid = await POST(new Request('http://localhost/api/admin/campaigns', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ campaignType: 'manual', urlsInput: 'https://x.com/a/status/1', direction: 'amable', displayName: 'Prueba', modelKey: 'model-a', creationMode: 'active' }) }));
     expect(valid.status).toBe(200);
     await expect(valid.json()).resolves.toMatchObject({ success: true, campaign: { id: 'manual-1', campaignType: 'manual' } });
-    expect(createCampaign).toHaveBeenCalledWith({ urlsInput: 'https://x.com/a/status/1', direction: 'amable', displayName: 'Prueba', modelKey: 'model-a' });
+    expect(createCampaign).toHaveBeenCalledWith({ urlsInput: 'https://x.com/a/status/1', direction: 'amable', displayName: 'Prueba', modelKey: 'model-a', brandVariants: undefined, maxCommentsTotal: undefined, isInactive: false });
 
     const ambiguous = await POST(new Request('http://localhost/api/admin/campaigns', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ campaignType: 'manual', urlsInput: 'https://x.com/a/status/1', accountsInput: '@someone' }) }));
     expect(ambiguous.status).toBe(400);
     expect(createCampaign).toHaveBeenCalledTimes(1);
   });
 
-  it('returns the awaited initial perpetual synchronization result', async () => {
+  it('creates a valid manual campaign with inactive mode and optional parameters', async () => {
+    const valid = await POST(new Request('http://localhost/api/admin/campaigns', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ campaignType: 'manual', urlsInput: 'https://x.com/a/status/1', creationMode: 'inactive', brandVariants: [], maxCommentsTotal: 100 }) }));
+    expect(valid.status).toBe(200);
+    expect(createCampaign).toHaveBeenCalledWith({ urlsInput: 'https://x.com/a/status/1', direction: undefined, displayName: undefined, modelKey: undefined, brandVariants: [], maxCommentsTotal: 100, isInactive: true });
+  });
+
+  it('preserves compatibility when creationMode is omitted', async () => {
+    const valid = await POST(new Request('http://localhost/api/admin/campaigns', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ campaignType: 'manual', urlsInput: 'https://x.com/a/status/1' }) }));
+    expect(valid.status).toBe(200);
+    expect(createCampaign).toHaveBeenCalledWith(expect.objectContaining({ isInactive: false }));
+  });
+
+  it('rejects unknown creationMode values', async () => {
+    const invalid = await POST(new Request('http://localhost/api/admin/campaigns', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ campaignType: 'manual', urlsInput: 'https://x.com/a/status/1', creationMode: 'invalid' }) }));
+    expect(invalid.status).toBe(400);
+  });
+
+  it('returns the awaited initial perpetual synchronization result when active', async () => {
     createPerpetualCampaign.mockResolvedValue({ id: 'perpetual-1', slug: 'perpetual-slug', initialSync: { accountsProcessed: 1, postsImported: 1, errors: [] } });
     const response = await POST(new Request('http://localhost/api/admin/campaigns', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ campaignType: 'perpetual', accountsInput: '@author', postActiveLifetimeHours: 24 }),
+      body: JSON.stringify({ campaignType: 'perpetual', accountsInput: '@author', postActiveLifetimeHours: 24, creationMode: 'active' }),
     }));
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({ campaign: { id: 'perpetual-1', campaignType: 'perpetual' }, initialSync: { accountsProcessed: 1, postsImported: 1 } });
-    expect(createPerpetualCampaign).toHaveBeenCalledWith(expect.objectContaining({ accountsInput: '@author', postActiveLifetimeHours: 24 }));
+    expect(createPerpetualCampaign).toHaveBeenCalledWith(expect.objectContaining({ accountsInput: '@author', postActiveLifetimeHours: 24, isInactive: false }));
+  });
+
+  it('returns pending initial sync when a perpetual campaign is saved as inactive', async () => {
+    createPerpetualCampaign.mockResolvedValue({ id: 'perpetual-1', slug: 'perpetual-slug', initialSync: null });
+    const response = await POST(new Request('http://localhost/api/admin/campaigns', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ campaignType: 'perpetual', accountsInput: '@author', postActiveLifetimeHours: 24, creationMode: 'inactive' }),
+    }));
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ campaign: { id: 'perpetual-1', campaignType: 'perpetual' }, initialSync: { pending: true } });
+    expect(createPerpetualCampaign).toHaveBeenCalledWith(expect.objectContaining({ accountsInput: '@author', postActiveLifetimeHours: 24, isInactive: true }));
   });
 
   describe('maxCommentsTotal validation', () => {

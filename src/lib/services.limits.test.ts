@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { PoolClient } from '@neondatabase/serverless';
 import { triggerReplenishmentIfNeeded } from './services';
 import { queryDb, withTransaction } from './db';

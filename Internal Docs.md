@@ -25,8 +25,8 @@ Al crear una campaña:
 5. Se genera un slug aleatorio seguro de 16 bytes.
 6. Se crea una única URL pública `/comment/{slug}`.
 7. Se encola automáticamente el lote inicial de 50 slots.
-8. Se inicia el worker en segundo plano.
-9. La campaña se mantiene desactivada por defecto.
+8. Se inicia el worker en segundo plano (si la campaña fue creada como activa).
+9. La campaña se mantiene desactivada si fue creada usando el modo "Guardar" (creationMode: 'inactive').
 
 ## 3. Campañas y URL Única
 Cada campaña posee exactamente un slug y una URL pública estable:
@@ -298,7 +298,7 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 * Modelos: DeepSeek V4 Flash/Pro, GPT-5.4 mini/GPT-5.4 y Qwen 3.7 Plus Frankfurt. Cada ciclo/job conserva proveedor, API model y tarifa snapshot.
 * `DEEPSEEK_API_KEY` habilita ambos DeepSeek; `DASHSCOPE_API_KEY` es canónico para Qwen (alias heredado `QWEN_API_KEY`), y `QWEN_BASE_URL` es el endpoint compatible-mode completo de Frankfurt.
 * Preflight conserva OpenAI/`OPENAI_MODEL`; la generación de comentarios usa el modelo snapshot de campaña.
-* Inventario: 30 iniciales por post, umbral 5 y reposición 10. Previews persistentes son siete comentarios en 5+2, sin fallback.
+* Inventario: 30 iniciales por post, umbral 5 y reposición 10. Previews persistentes son siete comentarios generados de forma concurrente, protegidos por un timeout de 50s para evitar el límite de 60s (retornando un 504 ordenado de ser necesario).
 * El polling de X sigue sin webhooks. Expiración se calcula desde `posted_at`; la cuenta se inicializa asíncronamente y el monitor evita resoluciones recurrentes.
 * El público muestra `Wait please...` y después `This should only take a moment.` cuando hay trabajo vigente.
 
@@ -313,13 +313,14 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 - `v1.3.1`: Corregido el ciclo de vida de las conexiones Neon en entornos serverless para evitar reutilizar conexiones WebSocket terminadas, creando y cerrando un pool local por cada transacción.
 - `v1.5.0`: Implementación de Diversidad Determinista V2. Se amplían las dimensiones del plan incorporando `firstPersonSubfamily`, `emotionalTone`, `expressionMode`, `punctuationMode`, `capitalizationMode`, `syntaxMode` y `brandVariant` (con distribución LRM). Validación local estricta basada en Regex y comprobación sintáctica rigurosa.
 - `v1.5.1`: Corrección quirúrgica. Se sustituye el modo de escritura `parenthetical_aside` (que obligaba a paréntesis) por `double_space_between_words`, que inyecta exactamente dos espacios consecutivos. El botón de Preview se separa completamente de la creación de campaña y persistencia mediante un nuevo endpoint puro y sin estado.
+- `v1.6.0`: Implementación de Preview de tanda única concurrente para sortear el error 504 con control interno de timeout, modo de creación 'inactive' (botón Guardar en administración) y neutralización total de textos de marca a 'ccc-app'.
+- `v1.6.1`: Auditoría de calidad y reparación de contratos. Se solucionaron warnings de `React act(...)` en tests y se blindaron tipos inseguros mediante el normalizador `parseBrandVariantsSafe`. Se ajustaron tests para verificar concurrencia de 7 comentarios en preview, y se actualizó la aserción de creación manual/perpetua cubriendo `creationMode`. El banner público queda estrictamente afirmado en `ccc-app` sin restos promocionales.
 
 ## 35. Sistema Visual
 - Se ha aplicado una estética pastel cálida y amable con bordes redondeados (radios de 12px a 24px) y sombras suaves.
 - Tipografías utilizadas: Fredoka (títulos y botones) y Nunito (cuerpo y formularios).
 - Variables visuales centralizadas en `globals.css` (ej. `--bg-primary`, `--bg-card`, `--color-primary`).
-- La promoción pública está separada y siempre visible fuera de los estados condicionales.
-- El enlace de promoción es exactamente https://t.me/PunkPinkTG.
+- Se ha neutralizado cualquier mención de marca, nombre comercial o promoción. La identidad pública es exclusivamente `ccc-app` para no revelar la intención detrás de la distribución de comentarios.
 
 ## 36. Botón Post como Enlace a Web Intent
 - El botón Post usa un enlace directo al Web Intent oficial.

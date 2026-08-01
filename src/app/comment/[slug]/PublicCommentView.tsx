@@ -138,10 +138,7 @@ export default function PublicCommentView({ slug }: Props) {
   const shell = (content: ReactNode) => (
     <div className="public-container">
       <div className="public-banner">
-        <div className="banner-main-text">Get thousands of original comments from real users for your posts.</div>
-        <div className="banner-sub-text">
-          Promote with us: <a href="https://t.me/PunkPinkTG" target="_blank" rel="noopener noreferrer" className="banner-link">https://t.me/PunkPinkTG</a>
-        </div>
+        <div className="banner-main-text">ccc-app</div>
       </div>
       {content}
     </div>

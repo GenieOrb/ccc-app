@@ -4,6 +4,7 @@ import { checkCampaignSafety } from './openai';
 import { resolveXUsername, fetchNewXPostsForAccount } from './x-api';
 import { randomUUID } from 'crypto';
 import { generateDeterministicSlotPlans } from './planner';
+import { parseBrandVariantsSafe } from './brand-variants';
 import { getAiModel } from './ai/models';
 
 export interface PerpetualMonitorSummary {
@@ -355,11 +356,10 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
               return { imported: false, cycleCreated: false };
             }
 
-            const campaignDataLock = await client.query<{ max_comments_total: number | null }>(
+            await client.query<{ max_comments_total: number | null }>(
               `SELECT max_comments_total FROM campaigns WHERE id = $1 FOR UPDATE`,
               [account.campaign_id]
             );
-            const campaignData = campaignDataLock.rows[0];
 
             if (isInitialRecovery && !currentData.initial_sync_pending) {
               return { imported: false, cycleCreated: false }; // Another monitor completed recovery while X was being queried.
@@ -443,8 +443,7 @@ export async function processPerpetualCampaigns(options: number | PerpetualMonit
                     INSERT INTO generation_cycles (id, campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name)
                     VALUES ($1, $2, $3, 'initial', $4, 'pending', $5, $6)
                   `, [cycleId, account.campaign_id, newCampaignPostId, actualTargetCount, model.key, model.apiModel]);
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  for (const plan of generateDeterministicSlotPlans([newCampaignPostId], actualTargetCount, (account.brand_variants as any) || [])) {
+                  for (const plan of generateDeterministicSlotPlans([newCampaignPostId], actualTargetCount, parseBrandVariantsSafe(account.brand_variants))) {
                     await client.query(`INSERT INTO generation_jobs (cycle_id,campaign_id,campaign_post_id,slot_index,slot_plan,length_mode,emoji_policy,rhetorical_form,texture,status,model_name,prompt_version) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,1)`, [cycleId, account.campaign_id, newCampaignPostId, plan.slotIndex, JSON.stringify(plan), plan.lengthMode, plan.emojiPolicy, plan.rhetoricalForm, plan.texture, model.apiModel]);
                   }
                 }

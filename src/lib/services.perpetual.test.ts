@@ -47,6 +47,7 @@ describe('toggleCampaignStatus perpetual activation recovery', () => {
         query: vi.fn(async (sql: string) => {
           if (sql.includes('SELECT is_active, campaign_type')) return { rows: [campaign] };
           if (sql.includes('COUNT(*) AS initial_cycle_count')) return { rows: [{ initial_cycle_count: '1', incomplete_cycle_count: '0', valid_produced_count: '1', target_count: '1' }] };
+          if (sql.includes('SELECT COUNT(*) as count FROM generation_jobs j')) return { rows: [{ count: '1' }] };
           if (sql.includes('FROM suggestions')) return { rows: [{ avail_count: '1' }] };
           if (sql.includes('FROM campaign_posts')) return { rows: [{ count: '1' }] };
           if (sql.includes('UPDATE campaigns SET is_active')) return { rows: [] };

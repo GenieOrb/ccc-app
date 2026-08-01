@@ -2,7 +2,6 @@ import { NextResponse } from 'next/server';
 import { isAdminAuthenticated, validateSameOrigin } from '@/lib/auth';
 import { getCampaignsPage, createCampaign, createPerpetualCampaign } from '@/lib/services';
 import { getConfig } from '@/lib/config';
-import { queryDb } from '@/lib/db';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -70,6 +69,14 @@ export async function POST(req: Request) {
     }
 
     const campaignType = body.campaignType || 'manual';
+    const creationMode = body.creationMode;
+    if (creationMode !== undefined && creationMode !== 'active' && creationMode !== 'inactive') {
+      return NextResponse.json(
+        { error: 'Modo de creación no válido. Debe ser active o inactive.' },
+        { status: 400, headers: { 'Cache-Control': 'no-store' } }
+      );
+    }
+    const isInactive = creationMode === 'inactive';
 
     if (campaignType === 'manual') {
       if ('accountsInput' in body || 'postActiveLifetimeHours' in body) {
@@ -107,7 +114,7 @@ export async function POST(req: Request) {
       if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length > 120)) return NextResponse.json({ error: 'Nombre de campaña no válido.' }, { status: 400 });
       if (modelKey !== undefined && typeof modelKey !== 'string') return NextResponse.json({ error: 'Modelo no válido.' }, { status: 400 });
       if (brandVariants !== undefined && !Array.isArray(brandVariants)) return NextResponse.json({ error: 'Variantes de marca no válidas.' }, { status: 400 });
-      const created = await createCampaign({ urlsInput, direction, displayName, modelKey, brandVariants, maxCommentsTotal });
+      const created = await createCampaign({ urlsInput, direction, displayName, modelKey, brandVariants, maxCommentsTotal, isInactive });
 
       return NextResponse.json(
         { success: true, campaign: { ...created, campaignType: 'manual' } },
@@ -156,10 +163,10 @@ export async function POST(req: Request) {
       if (displayName !== undefined && (typeof displayName !== 'string' || displayName.trim().length > 120)) return NextResponse.json({ error: 'Nombre de campaña no válido.' }, { status: 400 });
       if (modelKey !== undefined && typeof modelKey !== 'string') return NextResponse.json({ error: 'Modelo no válido.' }, { status: 400 });
       if (brandVariants !== undefined && !Array.isArray(brandVariants)) return NextResponse.json({ error: 'Variantes de marca no válidas.' }, { status: 400 });
-      const created = await createPerpetualCampaign({ accountsInput, direction, postActiveLifetimeHours, displayName, modelKey, brandVariants, maxCommentsTotal });
+      const created = await createPerpetualCampaign({ accountsInput, direction, postActiveLifetimeHours, displayName, modelKey, brandVariants, maxCommentsTotal, isInactive });
 
       return NextResponse.json(
-        { success: true, campaign: { id: created.id, slug: created.slug, campaignType: 'perpetual' }, initialSync: created.initialSync },
+        { success: true, campaign: { id: created.id, slug: created.slug, campaignType: 'perpetual' }, initialSync: created.initialSync || { pending: true } },
         { headers: { 'Cache-Control': 'no-store' } }
       );
     } else {

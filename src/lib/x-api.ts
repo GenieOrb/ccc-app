@@ -235,7 +235,7 @@ export function parseMultipleXUrls(input: string): ExtractedXUrl[] {
   return extractedList;
 }
 
-export async function fetchXPosts(extractedUrls: ExtractedXUrl[], attribution?: XCallAttribution): Promise<FetchedXPost[]> {
+export async function fetchXPosts(extractedUrls: ExtractedXUrl[], attribution?: XCallAttribution, timeoutMs?: number): Promise<FetchedXPost[]> {
   const config = getConfig();
   if (!config.xBearerToken) {
     throw new Error('X_BEARER_TOKEN no está configurado en el servidor.');
@@ -259,7 +259,8 @@ export async function fetchXPosts(extractedUrls: ExtractedXUrl[], attribution?: 
   const apiUrl = url.toString();
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
+  const requestTimeoutMs = boundedXTimeoutMs(timeoutMs, 15_000);
+  const timeoutId = setTimeout(() => controller.abort(), requestTimeoutMs);
 
   const callKey = await recordXCall('tweet_lookup', attribution);
   let response: Response;

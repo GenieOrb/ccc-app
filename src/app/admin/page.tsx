@@ -741,7 +741,64 @@ export default function AdminDashboardPage() {
     router.refresh();
   }
 
-  async function createCampaign() {
+  async function generatePreview(e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
+    if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
+
+    setPreviewFormError(null);
+    setGeneratingPreview(true);
+
+    try {
+      const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, displayName, modelKey };
+      if (campaignTypeToCreate === 'manual') {
+        payload.urlsInput = urlsInput;
+      } else {
+        payload.accountsInput = accountsInput;
+      }
+
+      if (brandVariants.length > 0) {
+        payload.brandVariants = brandVariants.map(bv => ({ value: bv.value.trim(), percentage: bv.percentage })).filter(bv => bv.value);
+      }
+
+      const previewResponse = await fetch(`/api/admin/campaigns/preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (previewResponse.status === 504) {
+        throw new Error('La preview tardó demasiado en generarse. Vuelve a intentarlo.');
+      }
+
+      const contentType = previewResponse.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        await previewResponse.text(); // consume the body
+        throw new Error(`La preview no pudo generarse porque el servidor devolvió una respuesta inesperada (HTTP ${previewResponse.status}).`);
+      }
+
+      const previewData = await previewResponse.json();
+      if (!previewResponse.ok) throw new Error(previewData.error || `Error al generar preview (HTTP ${previewResponse.status}).`);
+
+      const comments = previewData.preview?.comments;
+      if (!Array.isArray(comments) || comments.length !== 7) {
+        throw new Error('La preview devolvió una cantidad incorrecta de comentarios.');
+      }
+
+      setCreatedPreview(
+        comments.map(c => typeof c === 'object' && c !== null ? c.text : String(c))
+      );
+    } catch (previewError: unknown) {
+      setPreviewFormError(previewError instanceof Error ? previewError.message : 'No se pudo generar el preview.');
+      setCreatedPreview(null);
+    } finally {
+      setGeneratingPreview(false);
+    }
+  }
+
+  async function handleCreateCampaign(creationMode: 'active' | 'inactive') {
     if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
     if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
     const parsedDuration = Number(postActiveLifetimeHours);
@@ -751,7 +808,7 @@ export default function AdminDashboardPage() {
     setCreating(true);
 
     try {
-      const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, displayName, modelKey };
+      const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, displayName, modelKey, creationMode };
       const trimmedMax = maxCommentsTotalInput.trim();
       if (trimmedMax !== '') {
         const parsedMaxTotal = Number(trimmedMax);
@@ -793,69 +850,15 @@ export default function AdminDashboardPage() {
       setDirection('');
       setMaxCommentsTotalInput('');
       await fetchCampaigns(1);
+
+      if (creationMode === 'inactive') {
+        alert('Campaña guardada y desactivada.');
+      }
     } catch {
       setError('Error al enviar la petición de creación.');
     } finally {
       setCreating(false);
     }
-  }
-
-  async function generatePreview(e: React.MouseEvent) {
-    e.preventDefault();
-    e.stopPropagation();
-
-    if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
-    if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
-
-    setPreviewFormError(null);
-    setGeneratingPreview(true);
-
-    try {
-      const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, displayName, modelKey };
-      if (campaignTypeToCreate === 'manual') {
-        payload.urlsInput = urlsInput;
-      } else {
-        payload.accountsInput = accountsInput;
-      }
-
-      if (brandVariants.length > 0) {
-        payload.brandVariants = brandVariants.map(bv => ({ value: bv.value.trim(), percentage: bv.percentage })).filter(bv => bv.value);
-      }
-
-      const previewResponse = await fetch(`/api/admin/campaigns/preview`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-
-      const contentType = previewResponse.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        await previewResponse.text(); // consume the body
-        throw new Error(`La preview no pudo generarse porque el servidor devolvió una respuesta inesperada (HTTP ${previewResponse.status}).`);
-      }
-
-      const previewData = await previewResponse.json();
-      if (!previewResponse.ok) throw new Error(previewData.error || `Error al generar preview (HTTP ${previewResponse.status}).`);
-
-      const comments = previewData.preview?.comments;
-      if (!Array.isArray(comments) || comments.length !== 7) {
-        throw new Error('La preview devolvió una cantidad incorrecta de comentarios.');
-      }
-
-      setCreatedPreview(
-        comments.map(c => typeof c === 'object' && c !== null ? c.text : String(c))
-      );
-    } catch (previewError: unknown) {
-      setPreviewFormError(previewError instanceof Error ? previewError.message : 'No se pudo generar el preview.');
-      setCreatedPreview(null);
-    } finally {
-      setGeneratingPreview(false);
-    }
-  }
-
-  function handleCreateCampaign(e: React.FormEvent) {
-    e.preventDefault();
-    void createCampaign();
   }
 
   async function handleToggleStatus(campaignId: string, currentStatus: boolean) {
@@ -948,7 +951,7 @@ export default function AdminDashboardPage() {
         {/* Create Campaign Card */}
         <section className="admin-card">
           <h2 className="admin-card-header">Crear Nueva Campaña</h2>
-          <form onSubmit={handleCreateCampaign} noValidate>
+          <form onSubmit={(e) => { e.preventDefault(); void handleCreateCampaign('active'); }} noValidate>
             <div className="form-group"><label className="form-label">Nombre de campaña</label><input className="form-textarea" value={displayName} maxLength={120} onChange={(e) => setDisplayName(e.target.value)} /></div>
             <div className="form-group"><label className="form-label">Modelo</label><select className="form-textarea" value={modelKey} onChange={(e) => setModelKey(e.target.value)}>{models.map(model => <option key={model.key} value={model.key} disabled={!model.enabled || !model.configured}>{model.displayName} — Entrada ${model.inputPricePerMillion} · salida ${model.outputPricePerMillion} / 1M tokens{!model.configured ? ' · No configurado' : ''}</option>)}</select></div>
             <div className="form-group">
@@ -1084,8 +1087,16 @@ export default function AdminDashboardPage() {
               </button>
               <button
                 type="button"
+                onClick={() => handleCreateCampaign('inactive')}
                 className="btn-admin btn-secondary"
-                disabled={generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
+                disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
+              >
+                {creating ? 'Guardando...' : 'Guardar'}
+              </button>
+              <button
+                type="button"
+                className="btn-admin btn-secondary"
+                disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
                 onClick={generatePreview}
               >
                 {generatingPreview ? 'Generando preview...' : 'Generar preview'}

@@ -75,13 +75,20 @@ export interface SlotPlanV2 {
   assignedPostId: string;
 }
 
+const VALID_RHETORICAL_FORMS = new Set<RhetoricalForm>([
+  'direct_reaction', 'specific_observation', 'concrete_consequence',
+  'contrast_or_tension', 'genuine_question', 'clear_position',
+  'call_to_action', 'practical_angle', 'community_angle', 'future_implication'
+]);
+
+const VALID_TEXTURES = new Set<Textures>(['plain', 'warm', 'firm', 'energetic', 'reflective']);
+
 // Ensure old versions can be imported
 export function normalizeStoredSlotPlan(raw: unknown): SlotPlanV2 {
   if (!raw || typeof raw !== 'object') {
     throw new Error('Invalid raw SlotPlan');
   }
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const anyRaw = raw as any;
+  const anyRaw = raw as Record<string, unknown>;
 
   if (anyRaw.version === 2) {
     return anyRaw as unknown as SlotPlanV2;
@@ -91,10 +98,10 @@ export function normalizeStoredSlotPlan(raw: unknown): SlotPlanV2 {
   return {
     version: 2,
     slotIndex: typeof anyRaw.slotIndex === 'number' ? anyRaw.slotIndex : 0,
-    lengthMode: anyRaw.lengthMode || 'normal',
-    emojiPolicy: anyRaw.emojiPolicy || 'no_emoji',
-    rhetoricalForm: anyRaw.rhetoricalForm || 'direct_reaction',
-    texture: anyRaw.texture || 'plain',
+    lengthMode: anyRaw.lengthMode === 'ultra_short' ? 'ultra_short' : 'normal',
+    emojiPolicy: anyRaw.emojiPolicy === 'one_emoji' ? 'one_emoji' : 'no_emoji',
+    rhetoricalForm: typeof anyRaw.rhetoricalForm === 'string' && VALID_RHETORICAL_FORMS.has(anyRaw.rhetoricalForm as RhetoricalForm) ? (anyRaw.rhetoricalForm as RhetoricalForm) : 'direct_reaction',
+    texture: typeof anyRaw.texture === 'string' && VALID_TEXTURES.has(anyRaw.texture as Textures) ? (anyRaw.texture as Textures) : 'plain',
     voiceFamily: 'general',
     firstPersonSubfamily: null,
     emotionalTone: 'neutral',
@@ -104,7 +111,7 @@ export function normalizeStoredSlotPlan(raw: unknown): SlotPlanV2 {
     syntaxMode: 'standard',
     brandVariant: null,
     deliveryOrder: typeof anyRaw.deliveryOrder === 'number' ? anyRaw.deliveryOrder : 0,
-    assignedPostId: anyRaw.assignedPostId || '',
+    assignedPostId: typeof anyRaw.assignedPostId === 'string' ? anyRaw.assignedPostId : '',
   };
 }
 
@@ -156,6 +163,24 @@ export function allocateByLargestRemainder<T extends { weight: number; id: strin
     return { id: item.id, count: alloc ? alloc.count : 0 };
   });
 
+  return result;
+}
+
+/**
+ * Safely parses and normalizes raw JSON input into BrandVariantInput array.
+ */
+export function parseBrandVariantsSafe(raw: unknown): BrandVariantInput[] {
+  if (!Array.isArray(raw)) return [];
+  const result: BrandVariantInput[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const candidate = item as Record<string, unknown>;
+    const value = typeof candidate.value === 'string' ? candidate.value.trim() : '';
+    const percentage = typeof candidate.percentage === 'number' ? candidate.percentage : Number(candidate.percentage);
+    if (value && Number.isFinite(percentage)) {
+      result.push({ value, percentage });
+    }
+  }
   return result;
 }
 

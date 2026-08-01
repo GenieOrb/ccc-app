@@ -15,6 +15,14 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   if (!(await isAdminAuthenticated())) return NextResponse.json({ error: 'No autorizado.' }, { status: 401 });
   if (!validateSameOrigin(req)) return NextResponse.json({ error: 'Petición de origen no permitida.' }, { status: 403 });
-  try { const { id } = await params; return NextResponse.json({ success: true, preview: await generateCampaignPreview(id) }, { headers: { 'Cache-Control': 'no-store' } }); }
-  catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : 'Error al generar preview.' }, { status: 400 }); }
+  try {
+    const { id } = await params;
+    return NextResponse.json({ success: true, preview: await generateCampaignPreview(id) }, { headers: { 'Cache-Control': 'no-store' } });
+  }
+  catch (error) {
+    if (error instanceof Error && error.message === 'PREVIEW_TIMEOUT') {
+      return NextResponse.json({ error: 'La preview tardó demasiado en generarse. Vuelve a intentarlo.' }, { status: 504, headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json' } });
+    }
+    return NextResponse.json({ error: error instanceof Error ? error.message : 'Error al generar preview.' }, { status: 400, headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json' } });
+  }
 }
