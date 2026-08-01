@@ -19,6 +19,14 @@ const nunito = Nunito({
 export const metadata: Metadata = {
   title: 'ccc-app',
   description: 'ccc-app',
+  openGraph: {
+    title: 'ccc-app',
+    description: 'ccc-app',
+  },
+  twitter: {
+    title: 'ccc-app',
+    description: 'ccc-app',
+  },
   robots: {
     index: false,
     follow: false,

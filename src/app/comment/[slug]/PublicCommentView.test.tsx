@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import PublicCommentView from './PublicCommentView';
 
-const banner = 'ccc-app';
+const banner = 'Get thousands of original comments from real users for your posts.';
 const json = (body: unknown, ok = true) => ({ ok, json: async () => body });
 
 describe('PublicCommentView banner', () => {
@@ -27,8 +27,9 @@ describe('PublicCommentView banner', () => {
       const { unmount } = render(<PublicCommentView slug="test" />);
 
       expect(screen.getAllByText(banner, { exact: true })).toHaveLength(1);
-      expect(screen.queryByText(/Promote with us:/i)).toBeNull();
-      expect(screen.queryByRole('link', { name: 'https://t.me/PunkPinkTG' })).toBeNull();
+      expect(screen.getByText(/Promote with us:/i)).toBeTruthy();
+      expect(screen.getByRole('link', { name: 'https://t.me/PunkPinkTG' }).getAttribute('href')).toBe('https://t.me/PunkPinkTG');
+      expect(screen.queryByText('ccc-app')).toBeNull();
 
       await act(async () => {
         resolveFetch(response);
@@ -39,8 +40,9 @@ describe('PublicCommentView banner', () => {
       });
 
       expect(screen.getAllByText(banner, { exact: true })).toHaveLength(1);
-      expect(screen.queryByText(/Promote with us:/i)).toBeNull();
-      expect(screen.queryByRole('link', { name: 'https://t.me/PunkPinkTG' })).toBeNull();
+      expect(screen.getByText(/Promote with us:/i)).toBeTruthy();
+      expect(screen.getByRole('link', { name: 'https://t.me/PunkPinkTG' }).getAttribute('href')).toBe('https://t.me/PunkPinkTG');
+      expect(screen.queryByText('ccc-app')).toBeNull();
 
       unmount();
     });
@@ -54,8 +56,9 @@ describe('PublicCommentView banner', () => {
     const { unmount } = render(<PublicCommentView slug="test" />);
 
     expect(screen.getAllByText(banner, { exact: true })).toHaveLength(1);
-    expect(screen.queryByText(/Promote with us:/i)).toBeNull();
-    expect(screen.queryByRole('link', { name: 'https://t.me/PunkPinkTG' })).toBeNull();
+    expect(screen.getByText(/Promote with us:/i)).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'https://t.me/PunkPinkTG' }).getAttribute('href')).toBe('https://t.me/PunkPinkTG');
+    expect(screen.queryByText('ccc-app')).toBeNull();
 
     await act(async () => {
       resolveFetch(json({ status: 'error' }, false));

@@ -320,7 +320,7 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 - Se ha aplicado una estética pastel cálida y amable con bordes redondeados (radios de 12px a 24px) y sombras suaves.
 - Tipografías utilizadas: Fredoka (títulos y botones) y Nunito (cuerpo y formularios).
 - Variables visuales centralizadas en `globals.css` (ej. `--bg-primary`, `--bg-card`, `--color-primary`).
-- Se ha neutralizado cualquier mención de marca, nombre comercial o promoción. La identidad pública es exclusivamente `ccc-app` para no revelar la intención detrás de la distribución de comentarios.
+- El banner promocional visible conserva el texto comercial original; los metadatos sociales usan branding neutral ccc-app; ambos contenidos tienen finalidades distintas y no deben sustituirse entre sí.
 
 ## 36. Botón Post como Enlace a Web Intent
 - El botón Post usa un enlace directo al Web Intent oficial.
