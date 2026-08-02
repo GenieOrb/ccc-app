@@ -150,23 +150,23 @@ ${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''
       });
     }
 
-    let response;
+    let response: Awaited<typeof req>;
+    const req = ai.models.generateContent({
+      model: modelDef.apiModel,
+      contents: parts,
+    });
     try {
-      let req = ai.models.generateContent({
-        model: modelDef.apiModel,
-        contents: parts,
-      });
       if (options?.signal) {
         const sig = options.signal;
-        response = (await Promise.race([
+        response = await Promise.race([
           req,
           new Promise<never>((_, reject) => {
             if (sig.aborted) return reject(new Error('Aborted'));
             sig.addEventListener('abort', () => reject(new Error('Aborted')));
           })
-        ])) as any;
+        ]);
       } else {
-        response = (await req) as any;
+        response = await req;
       }
     } catch (error: unknown) {
       const err = error as Error & { status?: number };
@@ -180,7 +180,7 @@ ${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''
     }
 
     const candidate = response.candidates?.[0];
-    const imagePart = candidate?.content?.parts?.find((p: any) => p.inlineData);
+    const imagePart = candidate?.content?.parts?.find((p: { inlineData?: { data?: string, mimeType?: string } }) => p.inlineData);
     
     if (!imagePart || !imagePart.inlineData || !imagePart.inlineData.data) {
       throw new Error('Google GenAI returned empty image data.');

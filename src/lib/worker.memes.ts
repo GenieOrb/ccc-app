@@ -290,36 +290,67 @@ async function releaseLease(jobId: string, transition: 'pending' | 'failed' | 'c
   }
 }
 
-async function updateCycleStatus(cycleId: string, lastError?: string) {
+async function recalculateMemeCycleStatus(cycleId: string, lastError?: string) {
   await withTransaction(async (client) => {
-    const jobsRes = await client.query<{ status: string }>(
-      `SELECT status FROM meme_generation_jobs WHERE cycle_id = $1`,
+    // Lock cycles and jobs/memes to ensure consistency
+    const cycleRes = await client.query<{ target_count: number; status: string }>(
+      `SELECT target_count, status FROM meme_generation_cycles WHERE id = $1 FOR NO KEY UPDATE`,
+      [cycleId]
+    );
+    if (cycleRes.rows.length === 0) return;
+    const targetCount = cycleRes.rows[0].target_count;
+    const currentCycleStatus = cycleRes.rows[0].status;
+
+    const jobsRes = await client.query<{ id: string; status: string; slot_index: number }>(
+      `SELECT id, status, slot_index FROM meme_generation_jobs WHERE cycle_id = $1 FOR SHARE`,
+      [cycleId]
+    );
+
+    const memesRes = await client.query<{ job_id: string }>(
+      `SELECT m.job_id FROM memes m JOIN meme_generation_jobs j ON m.job_id = j.id WHERE j.cycle_id = $1 FOR SHARE`,
       [cycleId]
     );
 
     let pending = 0;
     let processing = 0;
-    let completed = 0;
-    let failed = 0;
+    let completedJobs = 0;
+    let failedJobs = 0;
+    const completedJobIds = new Set<string>();
 
     for (const j of jobsRes.rows) {
       if (j.status === 'pending') pending++;
       else if (j.status === 'processing') processing++;
-      else if (j.status === 'completed') completed++;
-      else if (j.status === 'failed' || j.status === 'cancelled') failed++;
+      else if (j.status === 'completed') {
+        completedJobs++;
+        completedJobIds.add(j.id);
+      }
+      else if (j.status === 'failed' || j.status === 'cancelled') failedJobs++;
     }
 
-    const terminal = pending === 0 && processing === 0;
+    const uniqueMemeJobIds = new Set<string>();
+    for (const m of memesRes.rows) {
+      uniqueMemeJobIds.add(m.job_id);
+    }
+    const validProducedCount = uniqueMemeJobIds.size;
+
     let cycleStatus = 'processing';
-    if (terminal) {
-      if (completed >= 3) {
-        cycleStatus = 'completed';
-      } else if (completed > 0) {
-        cycleStatus = 'partial';
-      } else {
-        cycleStatus = 'failed';
+
+    if (currentCycleStatus === 'cancelled') {
+      cycleStatus = 'cancelled';
+    } else {
+      const terminal = pending === 0 && processing === 0;
+      if (terminal) {
+        if (completedJobs === 3 && validProducedCount === 3 && targetCount === 3) {
+          cycleStatus = 'completed';
+        } else if (validProducedCount > 0) {
+          cycleStatus = 'partial';
+        } else {
+          cycleStatus = 'failed';
+        }
       }
     }
+
+    const isTerminalNow = cycleStatus === 'completed' || cycleStatus === 'partial' || cycleStatus === 'failed' || cycleStatus === 'cancelled';
 
     await client.query(
       `UPDATE meme_generation_cycles
@@ -328,10 +359,9 @@ async function updateCycleStatus(cycleId: string, lastError?: string) {
            failed_jobs_count = $3,
            status = $4,
            error_message = CASE WHEN $4 IN ('failed', 'partial') THEN COALESCE($5, error_message) ELSE error_message END,
-           finished_at = CASE WHEN $6::boolean THEN NOW() ELSE finished_at END,
-           updated_at = NOW()
+           finished_at = CASE WHEN $6::boolean AND finished_at IS NULL THEN NOW() ELSE finished_at END
        WHERE id = $7`,
-      [completed, completed, failed, cycleStatus, lastError || null, terminal, cycleId]
+      [validProducedCount, completedJobs, failedJobs, cycleStatus, lastError || null, isTerminalNow, cycleId]
     );
   });
 }
@@ -476,7 +506,7 @@ async function executeMemeJobTask(
           [job.jobId]
         );
       });
-      await updateCycleStatus(job.cycleId);
+      await recalculateMemeCycleStatus(job.cycleId);
       metrics.validMemes = 1;
       return { success: true, metrics };
     }
@@ -512,7 +542,7 @@ async function executeMemeJobTask(
           mimeType: (job.assetSnapshot.mime_type as string) || 'image/png',
           instruction: (job.assetSnapshot.instruction as string) || ''
         };
-      } catch (e) {
+      } catch {
         throw new Error('Failed to fetch required asset blob');
       }
     }
@@ -680,7 +710,7 @@ async function executeMemeJobTask(
       return { success: false, error: 'Failed to insert meme or lost lease', metrics };
     }
 
-    await updateCycleStatus(job.cycleId);
+    await recalculateMemeCycleStatus(job.cycleId);
     return { success: true, metrics };
   } catch (err: unknown) {
     if (abortController.signal.aborted) {
@@ -709,7 +739,7 @@ async function executeMemeJobTask(
       [isTerminal, isTerminal ? 3 : nextAttemptCount, finalErrorMessage, currentCost, job.jobId]
     );
 
-    await updateCycleStatus(job.cycleId, finalErrorMessage);
+    await recalculateMemeCycleStatus(job.cycleId, finalErrorMessage);
     return { success: false, error: finalErrorMessage, metrics };
   } finally {
     stopHeartbeat();

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 
 export interface CampaignSummary {
@@ -642,6 +642,7 @@ function CampaignCardItem({
 }
 
 export default function AdminDashboardPage() {
+  const abortControllerRef = useRef<AbortController | null>(null);
   const [campaigns, setCampaigns] = useState<CampaignSummary[]>([]);
   const [campaignPage, setCampaignPage] = useState(1);
   const [totalCampaigns, setTotalCampaigns] = useState(0);
@@ -918,6 +919,13 @@ export default function AdminDashboardPage() {
     if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
     if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
 
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    const signal = abortController.signal;
+
     setPreviewFormError(null);
     setGeneratingPreview(true);
     setCreatedPreview(null);
@@ -935,6 +943,7 @@ export default function AdminDashboardPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+        signal
       });
 
       if (previewResponse.status === 504) {
@@ -969,7 +978,9 @@ export default function AdminDashboardPage() {
       let terminalState = false;
 
       while (totalTime < MAX_TOTAL_TIME) {
-        const statusRes = await fetch(`/api/admin/meme-drafts/${newDraftId}/status?cycleId=${newCycleId}`);
+        if (signal.aborted) throw new Error('Preview de memes cancelada por el usuario.');
+
+        const statusRes = await fetch(`/api/admin/meme-drafts/${newDraftId}/status?cycleId=${newCycleId}`, { signal });
         if (!statusRes.ok) {
           let serverErr = '';
           try {
@@ -983,6 +994,7 @@ export default function AdminDashboardPage() {
         const statusData = await statusRes.json();
         
         const completedJobsCount = statusData.completedCount + statusData.failedCount + statusData.cancelledCount;
+        const actualMemesCount = statusData.actualMemesCount || 0;
 
         if (completedJobsCount > lastCompletedCount) {
           lastCompletedCount = completedJobsCount;
@@ -991,11 +1003,11 @@ export default function AdminDashboardPage() {
           inactivityTime += POLLING_INTERVAL;
         }
 
-        if (statusData.terminal || (statusData.targetCount > 0 && completedJobsCount >= statusData.targetCount)) {
+        if (statusData.terminal || actualMemesCount === 3 || (statusData.targetCount > 0 && completedJobsCount >= statusData.targetCount)) {
           finalMemes = statusData.memes || [];
           terminalState = true;
           
-          if (finalMemes.length === 0 && statusData.failedCount > 0) {
+          if (finalMemes.length < 3 && statusData.failedCount > 0) {
              const errors = (statusData.jobs || []).filter((j: { error_message?: string | null }) => j.error_message).map((j: { error_message?: string | null }) => j.error_message);
              if (errors.length > 0) {
                 throw new Error(`Fallo terminal: ${errors.join(' | ')}`);
@@ -1011,9 +1023,17 @@ export default function AdminDashboardPage() {
           throw new Error('La generación no ha arrancado o se ha estancado. Vuelve a intentarlo.');
         }
         
-        await new Promise(r => setTimeout(r, POLLING_INTERVAL));
+        await new Promise(r => {
+          const timeout = setTimeout(r, POLLING_INTERVAL);
+          signal.addEventListener('abort', () => {
+             clearTimeout(timeout);
+             r(null);
+          });
+        });
         totalTime += POLLING_INTERVAL;
       }
+
+      if (signal.aborted) throw new Error('Preview de memes cancelada por el usuario.');
 
       if (!terminalState && !finalMemes) {
         throw new Error('La preview de memes superó el tiempo de espera máximo (5 minutos).');
@@ -1033,10 +1053,16 @@ export default function AdminDashboardPage() {
 
       setCreatedMemePreview(mappedMemes);
     } catch (previewError: unknown) {
+      if (abortControllerRef.current?.signal.aborted || (previewError instanceof Error && previewError.name === 'AbortError')) {
+         console.log('Preview fetch aborted');
+         return; // Don't show error if aborted on purpose
+      }
       setPreviewFormError(previewError instanceof Error ? previewError.message : 'No se pudo generar el preview de memes.');
       setCreatedMemePreview(null);
     } finally {
-      setGeneratingPreview(false);
+      if (abortControllerRef.current === abortController) {
+        setGeneratingPreview(false);
+      }
     }
   }
 

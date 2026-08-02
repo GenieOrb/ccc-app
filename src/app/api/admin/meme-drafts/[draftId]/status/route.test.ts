@@ -51,18 +51,18 @@ describe('GET /api/admin/meme-drafts/[draftId]/status', () => {
           provider: 'google',
           api_model: 'gemini-3.1-flash-image',
           error_message: null,
-          updated_at: '2026-08-02T22:00:00Z'
+          created_at: '2026-08-02T22:00:00Z'
         }
       ])
       // 2. jobs query
       .mockResolvedValueOnce([
-        { id: 'job-1', status: 'completed', error_message: null },
-        { id: 'job-2', status: 'completed', error_message: null },
-        { id: 'job-3', status: 'completed', error_message: null }
+        { id: 'job-1', status: 'completed', slot_index: 0, error_message: null, attempts_count: 1, next_attempt_at: null, lease_expires_at: null, updated_at: '2026-08-02T22:00:00Z', latest_call_status: 'succeeded', latest_call_purpose: 'generation', latest_call_updated: '2026-08-02T22:00:00Z' },
+        { id: 'job-2', status: 'completed', slot_index: 1, error_message: null, attempts_count: 1, next_attempt_at: null, lease_expires_at: null, updated_at: '2026-08-02T22:00:00Z', latest_call_status: 'succeeded', latest_call_purpose: 'generation', latest_call_updated: '2026-08-02T22:00:00Z' },
+        { id: 'job-3', status: 'completed', slot_index: 2, error_message: null, attempts_count: 1, next_attempt_at: null, lease_expires_at: null, updated_at: '2026-08-02T22:00:00Z', latest_call_status: 'succeeded', latest_call_purpose: 'generation', latest_call_updated: '2026-08-02T22:00:00Z' }
       ])
       // 3. memes query (pre-parsed slot_plan object returned by pg driver)
       .mockResolvedValueOnce([
-        { id: 'meme-1', mime_type: 'image/png', slot_plan: { slotIndex: 0, textPolicy: 'no_text' } }
+        { id: 'meme-1', mime_type: 'image/png', slot_plan: { slotIndex: 0, textPolicy: 'no_text' }, created_at: '2026-08-02T22:00:00Z' }
       ]);
 
     const req = new Request(`http://localhost/api/admin/meme-drafts/${validDraftId}/status?cycleId=${validCycleId}`);

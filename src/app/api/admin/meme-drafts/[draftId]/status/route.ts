@@ -40,9 +40,9 @@ export async function GET(req: Request, props: { params: Promise<{ draftId: stri
       provider: string;
       api_model: string;
       error_message: string | null;
-      updated_at: Date | string;
+      created_at: Date | string;
     }>(
-      `SELECT id, status, target_count, model_key, provider, api_model, error_message, updated_at
+      `SELECT id, status, target_count, model_key, provider, api_model, error_message, created_at
        FROM meme_generation_cycles
        WHERE id = $1 AND draft_id = $2
        LIMIT 1`,
@@ -61,12 +61,23 @@ export async function GET(req: Request, props: { params: Promise<{ draftId: stri
     const jobsRows = await queryDb<{
       id: string;
       status: string;
+      slot_index: number;
       error_message: string | null;
+      attempts_count: number;
+      next_attempt_at: Date | string | null;
+      lease_expires_at: Date | string | null;
+      updated_at: Date | string;
+      latest_call_status: string | null;
+      latest_call_purpose: string | null;
+      latest_call_updated: Date | string | null;
     }>(
-      `SELECT id, status, error_message
-       FROM meme_generation_jobs
-       WHERE cycle_id = $1 AND draft_id = $2
-       ORDER BY slot_index ASC`,
+      `SELECT j.id, j.status, j.slot_index, j.error_message, j.attempts_count, j.next_attempt_at, j.lease_expires_at, j.updated_at,
+              (SELECT c.status FROM meme_api_calls c WHERE c.job_id = j.id ORDER BY c.created_at DESC LIMIT 1) as latest_call_status,
+              (SELECT c.purpose FROM meme_api_calls c WHERE c.job_id = j.id ORDER BY c.created_at DESC LIMIT 1) as latest_call_purpose,
+              (SELECT c.finished_at FROM meme_api_calls c WHERE c.job_id = j.id ORDER BY c.created_at DESC LIMIT 1) as latest_call_updated
+       FROM meme_generation_jobs j
+       WHERE j.cycle_id = $1 AND j.draft_id = $2
+       ORDER BY j.slot_index ASC`,
       [validCycleId, validDraftId]
     );
 
@@ -76,13 +87,42 @@ export async function GET(req: Request, props: { params: Promise<{ draftId: stri
     let failedCount = 0;
     let cancelledCount = 0;
 
-    for (const job of jobsRows) {
-      if (job.status === 'pending') pendingCount++;
-      else if (job.status === 'processing') processingCount++;
-      else if (job.status === 'completed') completedCount++;
-      else if (job.status === 'failed') failedCount++;
-      else if (job.status === 'cancelled') cancelledCount++;
-    }
+    let latestProgressTime = new Date(cycle.created_at).getTime();
+
+    const jobs = jobsRows.map(j => {
+      if (j.status === 'pending') pendingCount++;
+      else if (j.status === 'processing') processingCount++;
+      else if (j.status === 'completed') completedCount++;
+      else if (j.status === 'failed') failedCount++;
+      else if (j.status === 'cancelled') cancelledCount++;
+
+      const jobUpdatedTime = new Date(j.updated_at).getTime();
+      if (jobUpdatedTime > latestProgressTime) latestProgressTime = jobUpdatedTime;
+
+      if (j.latest_call_updated) {
+        const callUpdatedTime = new Date(j.latest_call_updated).getTime();
+        if (callUpdatedTime > latestProgressTime) latestProgressTime = callUpdatedTime;
+      }
+
+      let currentPhase = 'pending';
+      if (j.status === 'completed') currentPhase = 'completed';
+      else if (j.status === 'failed') currentPhase = 'failed';
+      else if (j.status === 'cancelled') currentPhase = 'cancelled';
+      else if (j.latest_call_purpose) currentPhase = j.latest_call_purpose;
+
+      return {
+        id: j.id,
+        slotIndex: j.slot_index,
+        status: j.status,
+        attemptsCount: j.attempts_count,
+        nextAttemptAt: j.next_attempt_at,
+        leaseExpiresAt: j.lease_expires_at,
+        updatedAt: j.updated_at,
+        currentPhase,
+        latestCallStatus: j.latest_call_status,
+        errorMessage: j.error_message || null
+      };
+    });
 
     const terminal = pendingCount === 0 && processingCount === 0;
 
@@ -90,8 +130,9 @@ export async function GET(req: Request, props: { params: Promise<{ draftId: stri
       id: string;
       mime_type: string;
       slot_plan: unknown;
+      created_at: Date | string;
     }>(
-      `SELECT m.id, m.mime_type, m.slot_plan
+      `SELECT m.id, m.mime_type, m.slot_plan, m.created_at
        FROM memes m
        JOIN meme_generation_jobs j ON m.job_id = j.id
        WHERE j.cycle_id = $1 AND j.draft_id = $2
@@ -99,13 +140,19 @@ export async function GET(req: Request, props: { params: Promise<{ draftId: stri
       [validCycleId, validDraftId]
     );
 
+    const actualMemesCount = memesRows.length;
+
     const memes = memesRows.map((m) => {
       let plan;
       try {
         plan = normalizeJsonObject(m.slot_plan);
       } catch {
-        plan = { slotIndex: 0 };
+        plan = null;
       }
+
+      const memeCreatedTime = new Date(m.created_at).getTime();
+      if (memeCreatedTime > latestProgressTime) latestProgressTime = memeCreatedTime;
+
       return {
         id: m.id,
         url: `/api/admin/meme-drafts/${validDraftId}/memes/${m.id}/view`,
@@ -128,13 +175,10 @@ export async function GET(req: Request, props: { params: Promise<{ draftId: stri
         completedCount,
         failedCount,
         cancelledCount,
+        actualMemesCount,
         terminal,
-        updatedAt: cycle.updated_at,
-        jobs: jobsRows.map((j) => ({
-          id: j.id,
-          status: j.status,
-          error_message: j.error_message
-        })),
+        progressUpdatedAt: new Date(latestProgressTime).toISOString(),
+        jobs,
         memes,
         errorMessage: cycle.error_message || null
       },
