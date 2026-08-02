@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { isAdminAuthenticated, validateSameOrigin } from '@/lib/auth';
-import { processBackgroundQueue } from '@/lib/worker';
+import { runGenerationProcessing } from '@/lib/worker';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -23,9 +23,9 @@ export async function POST(req: Request) {
   }
 
   try {
-    const result = await processBackgroundQueue();
+    const generationResult = await runGenerationProcessing();
     return NextResponse.json(
-      { success: true, ...result },
+      { success: true, ...generationResult },
       { headers: { 'Cache-Control': 'no-store' } }
     );
   } catch (error: unknown) {

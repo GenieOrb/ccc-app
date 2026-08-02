@@ -7,6 +7,7 @@ import { normalizeXAccounts } from '@/lib/x-accounts';
 import { z } from 'zod';
 import { createHash } from 'crypto';
 import { withTransaction } from '@/lib/db';
+import { buildInternalProcessAuthorizationHeader } from '@/lib/internal-process-auth';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -191,7 +192,48 @@ export async function POST(req: Request) {
       );
     });
 
-    fetch(new URL('/api/internal/generation/process', req.url).toString(), { method: 'POST' }).catch(() => {});
+    const resultData = await txResult.clone().json();
+    const finalDraftId = resultData.draftId;
+
+    if (resultData.status !== 'completed' && finalDraftId) {
+      try {
+        const triggerUrl = new URL('/api/internal/generation/process', req.url).toString();
+        const triggerRes = await fetch(triggerUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': buildInternalProcessAuthorizationHeader(),
+            'Cache-Control': 'no-store',
+            'Content-Type': 'application/json'
+          }
+        });
+        
+        if (!triggerRes.ok) {
+          console.error('Internal generation trigger rejected', {
+            route: '/api/internal/generation/process',
+            status: triggerRes.status,
+            draftId: finalDraftId,
+            hasInternalProcessSecret: !!process.env.INTERNAL_PROCESS_SECRET,
+            hasCronSecret: !!process.env.CRON_SECRET
+          });
+          return NextResponse.json(
+            { error: 'No se pudo iniciar el procesador de memes. Los trabajos quedaron pendientes y pueden reintentarse.' },
+            { status: 500, headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json' } }
+          );
+        }
+      } catch {
+        console.error('Internal generation trigger error', {
+            route: '/api/internal/generation/process',
+            status: 'timeout or network error',
+            draftId: finalDraftId,
+            hasInternalProcessSecret: !!process.env.INTERNAL_PROCESS_SECRET,
+            hasCronSecret: !!process.env.CRON_SECRET
+        });
+        return NextResponse.json(
+          { error: 'No se pudo iniciar el procesador de memes. Los trabajos quedaron pendientes y pueden reintentarse.' },
+          { status: 500, headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json' } }
+        );
+      }
+    }
 
     return txResult;
   } catch (error: unknown) {

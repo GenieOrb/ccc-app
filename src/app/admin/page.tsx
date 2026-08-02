@@ -958,27 +958,56 @@ export default function AdminDashboardPage() {
       setDraftId(newDraftId);
       
       // Polling
-      let attempts = 0;
+      let totalTime = 0;
+      let lastCompletedCount = 0;
+      let inactivityTime = 0;
+      const POLLING_INTERVAL = 2000;
+      const MAX_TOTAL_TIME = 300_000; // 5 minutos
+      const MAX_INACTIVITY_TIME = 90_000; // 90 segundos sin progreso
       let finalMemes = null;
-      while (attempts < 60) {
+      let terminalState = false;
+
+      while (totalTime < MAX_TOTAL_TIME) {
         const statusRes = await fetch(`/api/admin/meme-drafts/${newDraftId}/status`);
         if (!statusRes.ok) throw new Error('Error al consultar estado de preview.');
         const statusData = await statusRes.json();
         
-        const jobs = statusData.jobs || [];
-        const completedJobs = jobs.filter((j: { status: string }) => j.status === 'completed' || j.status === 'failed');
-        
-        if (completedJobs.length >= 3 || (jobs.length > 0 && completedJobs.length === jobs.length)) {
+        const completedJobsCount = statusData.completedCount + statusData.failedCount + statusData.cancelledCount;
+
+        if (completedJobsCount > lastCompletedCount) {
+          lastCompletedCount = completedJobsCount;
+          inactivityTime = 0;
+        } else {
+          inactivityTime += POLLING_INTERVAL;
+        }
+
+        if (statusData.terminal || (statusData.targetCount > 0 && completedJobsCount >= statusData.targetCount)) {
           finalMemes = statusData.memes || [];
+          terminalState = true;
+          
+          if (finalMemes.length === 0 && statusData.failedCount > 0) {
+             const errors = (statusData.jobs || []).filter((j: { error_message?: string | null }) => j.error_message).map((j: { error_message?: string | null }) => j.error_message);
+             if (errors.length > 0) {
+                throw new Error(`Fallo terminal: ${errors.join(' | ')}`);
+             }
+          }
           break;
         }
+
+        if (inactivityTime >= MAX_INACTIVITY_TIME) {
+          throw new Error('La generación no ha arrancado o se ha estancado. Vuelve a intentarlo.');
+        }
         
-        await new Promise(r => setTimeout(r, 2000));
-        attempts++;
+        await new Promise(r => setTimeout(r, POLLING_INTERVAL));
+        totalTime += POLLING_INTERVAL;
       }
 
-      if (!finalMemes) {
-        throw new Error('La preview de memes superó el tiempo de espera.');
+      if (!terminalState && !finalMemes) {
+        throw new Error('La preview de memes superó el tiempo de espera máximo (5 minutos).');
+      }
+      
+      if (finalMemes && finalMemes.length === 0) {
+        throw new Error('La generación finalizó pero no produjo imágenes válidas.');
       }
 
       // Map to the expected format for the UI

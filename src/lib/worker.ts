@@ -10,6 +10,7 @@ import {
   validateCommentLocally,
 } from './validator';
 import { SlotPlanV2, normalizeStoredSlotPlan } from './brand-variants';
+import { processMemeBackgroundQueue, MIN_MEME_WORKER_JOB_BUDGET_MS } from './worker.memes';
 
 export interface ClaimedJob {
   jobId: string;
@@ -601,8 +602,36 @@ async function cancelJobAndCheckCycle(client: PoolClient, jobId: string, cycleId
         } else {
            // Only cancelled (and maybe some completed, but not enough). Mark cycle as cancelled.
            await client.query(`UPDATE generation_cycles SET status = 'cancelled', finished_at = NOW() WHERE id = $1`, [cycleId]);
-        }
+         }
       }
     }
   }
+}
+
+export async function runGenerationProcessing(
+  workerId: string = randomUUID(),
+  totalBudgetMs: number = 50000
+): Promise<{
+  worker: { processed: number; completed: number; failed: number; skipped?: string };
+  workerMemes: { processed: number; completed: number; failed: number; skipped?: string };
+}> {
+  const startTime = Date.now();
+  
+  // Split budget roughly evenly if both have budget, or give all to one
+  const commentBudget = Math.floor(totalBudgetMs / 2);
+
+  const workerResult = commentBudget >= MIN_WORKER_JOB_BUDGET_MS
+    ? await processBackgroundQueue(workerId, commentBudget)
+    : { processed: 0, completed: 0, failed: 0, skipped: 'insufficient_time_budget' };
+
+  const remainingBudgetMs = Math.max(0, totalBudgetMs - (Date.now() - startTime));
+
+  const workerMemesResult = remainingBudgetMs >= MIN_MEME_WORKER_JOB_BUDGET_MS
+    ? await processMemeBackgroundQueue(workerId, remainingBudgetMs)
+    : { processed: 0, completed: 0, failed: 0, skipped: 'insufficient_time_budget' };
+
+  return {
+    worker: workerResult,
+    workerMemes: workerMemesResult
+  };
 }
