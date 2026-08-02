@@ -208,7 +208,6 @@ async function executeMemeJobTask(
   let currentCost = 0;
 
   try {
-  try {
     if (!job.modelSnapshot.key || !job.modelSnapshot.provider || !job.modelSnapshot.apiModel) {
       console.error(`Invalid meme model snapshot: apiModel is missing for job ${job.jobId}`);
       job.attemptsCount = 99; // Prevents indefinite retries
