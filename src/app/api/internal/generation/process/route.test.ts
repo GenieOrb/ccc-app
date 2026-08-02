@@ -42,8 +42,19 @@ describe('internal generation cron route', () => {
     const response = await POST(new Request('http://localhost/api/internal/generation/process', { headers: { authorization: 'Bearer cron-only-secret' } }));
 
     expect(response.status).toBe(200);
-    expect(runGenerationProcessing).toHaveBeenCalledWith(expect.any(String), 15_000);
+    expect(runGenerationProcessing).toHaveBeenCalledWith(expect.any(String), 15_000, undefined);
     now.mockRestore();
+  });
+
+  it('passes memeCycleId when provided in POST body', async () => {
+    const response = await POST(new Request('http://localhost/api/internal/generation/process', {
+      method: 'POST',
+      headers: { authorization: 'Bearer cron-only-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ memeCycleId: 'test-cycle-uuid' })
+    }));
+
+    expect(response.status).toBe(200);
+    expect(runGenerationProcessing).toHaveBeenCalledWith(expect.any(String), expect.any(Number), 'test-cycle-uuid');
   });
 });
 

@@ -1,12 +1,13 @@
 import 'server-only';
 import { randomUUID } from 'node:crypto';
 import { queryDb, withTransaction } from './db';
-import { uploadGeneratedMeme, getMemeBlobBuffer } from './memes/blob';
+import { uploadGeneratedMeme, getMemeBlobBuffer, deleteBlob } from './memes/blob';
 import { performMemeAnalysis } from './memes/analysis';
 import { generateMemeImage, MemeGenerationResult } from './memes/generation';
 import { validateMemeImage } from './memes/validation';
 import { MemeSlotPlan } from './memes/planner';
 import { ImageModelSnapshot } from './ai/image-models';
+import { classifyMemeProviderError } from './memes/errors';
 
 export interface MemeClaimedJob {
   jobId: string;
@@ -27,16 +28,34 @@ export interface MemeClaimedJob {
   campaignDirection?: string;
 }
 
+export interface ProcessMemeQueueOptions {
+  workerId?: string;
+  budgetMs?: number;
+  cycleId?: string;
+  maxJobs?: number;
+  maxConcurrency?: number;
+}
+
 export const MIN_MEME_WORKER_JOB_BUDGET_MS = 25_000;
+const WORKER_DURABLE_WRITE_RESERVE_MS = 5_000;
 
 export async function processMemeBackgroundQueue(
-  workerId: string = randomUUID(),
-  budgetMs: number = 50000
+  optionsOrWorkerId: ProcessMemeQueueOptions | string = {},
+  budgetMsParam: number = 50000
 ) {
+  const options: ProcessMemeQueueOptions =
+    typeof optionsOrWorkerId === 'string'
+      ? { workerId: optionsOrWorkerId, budgetMs: budgetMsParam }
+      : optionsOrWorkerId;
+
+  const workerId = options.workerId || randomUUID();
+  const budgetMs = options.budgetMs !== undefined ? options.budgetMs : 50000;
+  const cycleId = options.cycleId;
+  const maxParallelConcurrency = options.maxConcurrency || 3;
+
   const startTime = Date.now();
   const deadline = startTime + Math.max(0, budgetMs);
   const hasSafeJobBudget = () => deadline - Date.now() >= MIN_MEME_WORKER_JOB_BUDGET_MS;
-  const maxParallelConcurrency = 10; // "lotes de 10" from instructions
 
   let totalProcessed = 0;
   let totalCompleted = 0;
@@ -51,7 +70,7 @@ export async function processMemeBackgroundQueue(
 
     for (let c = 0; c < maxParallelConcurrency; c++) {
       if (!hasSafeJobBudget()) break;
-      const job = await claimNextMemeJob(workerId);
+      const job = await claimNextMemeJob(workerId, cycleId);
       if (job) {
         claimedJobs.push(job);
       } else {
@@ -64,12 +83,18 @@ export async function processMemeBackgroundQueue(
     }
 
     const settled = await Promise.allSettled(
-      claimedJobs.map((job) => executeMemeJobTask(job, workerId))
+      claimedJobs.map((job) => executeMemeJobTask(job, workerId, deadline))
     );
 
-    const results = settled.map((result) => result.status === 'fulfilled'
-      ? result.value
-      : ({ success: false, error: 'Unhandled worker task failure', metrics: { regenerations: 0, validMemes: 0, cost: 0, boundedErrors: 1 } }));
+    const results = settled.map((result) =>
+      result.status === 'fulfilled'
+        ? result.value
+        : {
+            success: false,
+            error: 'Unhandled worker task failure',
+            metrics: { regenerations: 0, validMemes: 0, cost: 0, boundedErrors: 1 }
+          }
+    );
 
     for (const res of results) {
       totalProcessed++;
@@ -97,11 +122,22 @@ export async function processMemeBackgroundQueue(
   };
 }
 
-async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null> {
-  const leaseDurationSeconds = 300;
+async function claimNextMemeJob(
+  workerId: string,
+  cycleId?: string
+): Promise<MemeClaimedJob | null> {
+  const leaseDurationSeconds = 90;
 
   return await withTransaction(async (client) => {
-    const selectRes = await client.query(`
+    const queryParams: unknown[] = [workerId];
+    let cycleFilter = '';
+    if (cycleId) {
+      queryParams.push(cycleId);
+      cycleFilter = `AND j.cycle_id = $${queryParams.length}`;
+    }
+
+    const selectRes = await client.query(
+      `
        SELECT
          j.id as job_id,
          j.cycle_id,
@@ -134,10 +170,13 @@ async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null
        AND (
          (c.is_active = true) OR (md.status = 'active')
        )
+       ${cycleFilter}
        ORDER BY j.created_at ASC
        LIMIT 1
        FOR UPDATE OF j SKIP LOCKED
-    `);
+    `,
+      queryParams
+    );
 
     if (selectRes.rows.length === 0) {
       return null;
@@ -145,18 +184,23 @@ async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null
 
     const row = selectRes.rows[0];
 
-    const rawSnap = (typeof row.model_snapshot === 'object' && row.model_snapshot !== null) 
-       ? (row.model_snapshot as Record<string, unknown>) 
-       : {};
+    const rawSnap =
+      typeof row.model_snapshot === 'object' && row.model_snapshot !== null
+        ? (row.model_snapshot as Record<string, unknown>)
+        : {};
 
-    const normKey = String(rawSnap.key || rawSnap.modelKey || rawSnap.model_key || row.cycle_model_key || '');
+    const normKey = String(
+      rawSnap.key || rawSnap.modelKey || rawSnap.model_key || row.cycle_model_key || ''
+    );
     const normProvider = String(rawSnap.provider || row.cycle_provider || '');
-    const normApiModel = String(rawSnap.apiModel || rawSnap.api_model || rawSnap.model_name || row.cycle_api_model || '');
+    const normApiModel = String(
+      rawSnap.apiModel || rawSnap.api_model || rawSnap.model_name || row.cycle_api_model || ''
+    );
 
     const canonicalSnapshot: ImageModelSnapshot = {
-       key: normKey,
-       provider: normProvider as 'openai' | 'google',
-       apiModel: normApiModel
+      key: normKey,
+      provider: normProvider as 'openai' | 'google',
+      apiModel: normApiModel
     };
 
     await client.query(
@@ -170,7 +214,6 @@ async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null
       [workerId, JSON.stringify(canonicalSnapshot), row.job_id]
     );
 
-    // Update cycle if it's the first time
     await client.query(
       `UPDATE meme_generation_cycles
        SET status = 'processing',
@@ -200,60 +243,247 @@ async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null
   });
 }
 
+async function extendLease(jobId: string, workerId: string, seconds: number = 90): Promise<boolean> {
+  const res = await queryDb(
+    `UPDATE meme_generation_jobs
+     SET lease_expires_at = NOW() + INTERVAL '${seconds} seconds', updated_at = NOW()
+     WHERE id = $1 AND lease_owner = $2 AND status = 'processing'
+     RETURNING id`,
+    [jobId, workerId]
+  );
+  return res.length > 0;
+}
+
+async function verifyLease(jobId: string, workerId: string): Promise<boolean> {
+  const res = await queryDb(
+    `SELECT id FROM meme_generation_jobs
+     WHERE id = $1 AND lease_owner = $2 AND status = 'processing' AND lease_expires_at > NOW()`,
+    [jobId, workerId]
+  );
+  return res.length > 0;
+}
+
+async function releaseLease(jobId: string) {
+  await queryDb(
+    `UPDATE meme_generation_jobs
+     SET lease_owner = NULL, lease_expires_at = NULL
+     WHERE id = $1 AND status = 'processing'`,
+    [jobId]
+  );
+}
+
+async function updateCycleStatus(cycleId: string, lastError?: string) {
+  await withTransaction(async (client) => {
+    const jobsRes = await client.query<{ status: string }>(
+      `SELECT status FROM meme_generation_jobs WHERE cycle_id = $1`,
+      [cycleId]
+    );
+
+    let pending = 0;
+    let processing = 0;
+    let completed = 0;
+    let failed = 0;
+
+    for (const j of jobsRes.rows) {
+      if (j.status === 'pending') pending++;
+      else if (j.status === 'processing') processing++;
+      else if (j.status === 'completed') completed++;
+      else if (j.status === 'failed' || j.status === 'cancelled') failed++;
+    }
+
+    const terminal = pending === 0 && processing === 0;
+    let cycleStatus = 'processing';
+    if (terminal) {
+      if (completed >= 3) {
+        cycleStatus = 'completed';
+      } else if (completed > 0) {
+        cycleStatus = 'partial';
+      } else {
+        cycleStatus = 'failed';
+      }
+    }
+
+    await client.query(
+      `UPDATE meme_generation_cycles
+       SET valid_produced_count = $1,
+           completed_jobs_count = $2,
+           failed_jobs_count = $3,
+           status = $4,
+           error_message = CASE WHEN $4 IN ('failed', 'partial') THEN COALESCE($5, error_message) ELSE error_message END,
+           finished_at = CASE WHEN $6::boolean THEN NOW() ELSE finished_at END,
+           updated_at = NOW()
+       WHERE id = $7`,
+      [completed, completed, failed, cycleStatus, lastError || null, terminal, cycleId]
+    );
+  });
+}
+
 async function executeMemeJobTask(
   job: MemeClaimedJob,
-  workerId: string
-): Promise<{ success: boolean; error?: string; metrics: { regenerations: number, validMemes: number, cost: number, boundedErrors: number } }> {
+  workerId: string,
+  deadline: number
+): Promise<{
+  success: boolean;
+  error?: string;
+  metrics: { regenerations: number; validMemes: number; cost: number; boundedErrors: number };
+}> {
   const metrics = { regenerations: 0, validMemes: 0, cost: 0, boundedErrors: 0 };
   let currentCost = 0;
 
+  const hasRemainingBudget = (reserveMs: number = WORKER_DURABLE_WRITE_RESERVE_MS) =>
+    deadline - Date.now() >= reserveMs;
+
+  const attemptNumber = job.attemptsCount + 1;
+
+  const startApiCall = async (
+    purpose: string,
+    provider: string,
+    modelKey: string,
+    apiModel: string
+  ): Promise<{ callKey: string; shouldExecute: boolean }> => {
+    const callKey = `${job.jobId}:${attemptNumber}:${purpose}`;
+    const insertRes = await queryDb<{ id: string }>(
+      `INSERT INTO meme_api_calls (
+         call_key, campaign_id, draft_id, cycle_id, job_id, purpose, provider, model_key, api_model, status, total_cost, pricing_snapshot, currency, attempt
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'started', 0, $10, 'USD', $11)
+       ON CONFLICT (call_key) DO NOTHING
+       RETURNING id`,
+      [
+        callKey,
+        job.campaignId || null,
+        job.draftId || null,
+        job.cycleId,
+        job.jobId,
+        purpose,
+        provider,
+        modelKey,
+        apiModel,
+        JSON.stringify(job.modelSnapshot),
+        attemptNumber
+      ]
+    );
+
+    if (insertRes.length > 0) {
+      return { callKey, shouldExecute: true };
+    }
+
+    // Check existing call status if insert conflicted
+    const existing = await queryDb<{ status: string; created_at: Date | string }>(
+      `SELECT status, created_at FROM meme_api_calls WHERE call_key = $1 LIMIT 1`,
+      [callKey]
+    );
+
+    if (existing.length > 0) {
+      const callStatus = existing[0].status;
+      const createdAt = new Date(existing[0].created_at).getTime();
+      const ageSeconds = (Date.now() - createdAt) / 1000;
+
+      if (callStatus === 'started') {
+        if (ageSeconds >= 120) {
+          await queryDb(`UPDATE meme_api_calls SET status = 'usage_unknown' WHERE call_key = $1`, [
+            callKey
+          ]);
+        }
+        return { callKey, shouldExecute: false };
+      }
+      if (callStatus === 'succeeded' || callStatus === 'failed') {
+        return { callKey, shouldExecute: false };
+      }
+    }
+
+    return { callKey, shouldExecute: true };
+  };
+
+  const finishApiCall = async (callKey: string, cost: number, status: string, error?: string) => {
+    await queryDb(
+      `UPDATE meme_api_calls
+       SET status = $1, total_cost = $2, error_message = $3, finished_at = NOW()
+       WHERE call_key = $4`,
+      [status, cost, error || null, callKey]
+    );
+  };
+
   try {
+    // 0. VALIDACIÓN DE SNAPSHOT Y MODELO
     if (!job.modelSnapshot.key || !job.modelSnapshot.provider || !job.modelSnapshot.apiModel) {
-      console.error(`Invalid meme model snapshot: apiModel is missing for job ${job.jobId}`);
-      job.attemptsCount = 99; // Prevents indefinite retries
-      throw new Error('No se pudo recuperar el modelo de imagen asociado al trabajo.');
+      const classified = classifyMemeProviderError('apimodel is missing');
+      job.attemptsCount = 99; // Stop retries immediately
+      throw new Error(classified.sanitizedMessage);
+    }
+
+    if (!hasRemainingBudget()) {
+      await releaseLease(job.jobId);
+      return { success: false, error: 'Budget timeout before starting job', metrics };
     }
 
     const postText = job.postText || '';
     const campaignDirection = job.campaignDirection || 'General campaign';
-    const callKeyBase = `${job.jobId}:${job.attemptsCount + 1}`;
 
-    const startApiCall = async (purpose: string): Promise<string> => {
-       const callKey = `${callKeyBase}:${purpose}`;
-       await queryDb(`
-         INSERT INTO meme_api_calls (
-           call_key, campaign_id, draft_id, cycle_id, job_id, purpose, provider, model_key, api_model, status, total_cost, pricing_snapshot, currency
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'started', 0, $10, 'USD')
-         ON CONFLICT (call_key) DO NOTHING
-       `, [
-         callKey, job.campaignId || null, job.draftId || null, job.cycleId, job.jobId, purpose, job.modelSnapshot.provider, job.modelSnapshot.key, job.modelSnapshot.apiModel, JSON.stringify(job.modelSnapshot)
-       ]);
-       return callKey;
-    };
-
-    const finishApiCall = async (callKey: string, cost: number, status: string, error?: string) => {
-       await queryDb(`
-         UPDATE meme_api_calls
-         SET status = $1, total_cost = $2, error_message = $3, finished_at = NOW()
-         WHERE call_key = $4
-       `, [status, cost, error || null, callKey]);
-    };
+    // Check if meme already exists for this job (Idempotency)
+    const existingMemes = await queryDb<{ id: string }>(
+      `SELECT id FROM memes WHERE job_id = $1 LIMIT 1`,
+      [job.jobId]
+    );
+    if (existingMemes.length > 0) {
+      await withTransaction(async (client) => {
+        await client.query(
+          `UPDATE meme_generation_jobs
+           SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL, error_message = NULL, updated_at = NOW()
+           WHERE id = $1`,
+          [job.jobId]
+        );
+      });
+      await updateCycleStatus(job.cycleId);
+      metrics.validMemes = 1;
+      return { success: true, metrics };
+    }
 
     // 1. ANÁLISIS SEMÁNTICO PREVIO
-    const availableAssets = job.assetSnapshot ? [{
-        id: String(job.assetSnapshot.id || ''),
-        instruction: String(job.assetSnapshot.instruction || ''),
-        assetType: String(job.assetSnapshot.assetType || '')
-    }] : [];
+    const availableAssets = job.assetSnapshot
+      ? [
+          {
+            id: String(job.assetSnapshot.id || ''),
+            instruction: String(job.assetSnapshot.instruction || ''),
+            assetType: String(job.assetSnapshot.assetType || '')
+          }
+        ]
+      : [];
 
-    const analysis = await performMemeAnalysis({
-      postText,
-      campaignDirection,
-      availableAssets
-    });
+    const analysisCall = await startApiCall(
+      'analysis',
+      'google',
+      'gemini-2.5-flash',
+      'gemini-2.5-flash'
+    );
+    let analysis;
+    if (analysisCall.shouldExecute) {
+      try {
+        analysis = await performMemeAnalysis({
+          postText,
+          campaignDirection,
+          availableAssets
+        });
+        await finishApiCall(analysisCall.callKey, 0, 'succeeded');
+      } catch (e: unknown) {
+        await finishApiCall(
+          analysisCall.callKey,
+          0,
+          'failed',
+          e instanceof Error ? e.message : String(e)
+        );
+        throw e;
+      }
+    } else {
+      analysis = await performMemeAnalysis({
+        postText,
+        campaignDirection,
+        availableAssets
+      });
+    }
 
-    let assetData: { buffer: Buffer, mimeType: string, instruction: string } | undefined;
-    const storageKeyOrUrl = (job.assetSnapshot?.storage_key || job.assetSnapshot?.storage_url) as string;
+    let assetData: { buffer: Buffer; mimeType: string; instruction: string } | undefined;
+    const storageKeyOrUrl = (job.assetSnapshot?.storage_key ||
+      job.assetSnapshot?.storage_url) as string;
     if (job.assetSnapshot && storageKeyOrUrl) {
       try {
         const buffer = await getMemeBlobBuffer(storageKeyOrUrl);
@@ -268,44 +498,94 @@ async function executeMemeJobTask(
     }
 
     // 2. GENERATE MEME IMAGE
+    if (!hasRemainingBudget(WORKER_DURABLE_WRITE_RESERVE_MS + 10000)) {
+      await releaseLease(job.jobId);
+      return { success: false, error: 'Insufficient budget for image generation', metrics };
+    }
+
+    await extendLease(job.jobId, workerId, 90);
+
+    const genCall = await startApiCall(
+      'generation',
+      job.modelSnapshot.provider,
+      job.modelSnapshot.key,
+      job.modelSnapshot.apiModel
+    );
+
     let generation: MemeGenerationResult;
-    let currentCallKey = `${callKeyBase}:generation`;
-    try {
-      await startApiCall('generation');
-      generation = await generateMemeImage(
-        job.slotPlan,
-        analysis,
-        job.modelSnapshot.key,
-        assetData
-      );
-      currentCost += parseFloat(generation.cost);
-      metrics.cost = currentCost;
-      await finishApiCall(currentCallKey, parseFloat(generation.cost), 'succeeded');
-    } catch (e: unknown) {
-      const errorMessage = e instanceof Error ? e.message : String(e);
-      await finishApiCall(currentCallKey, 0, 'failed', errorMessage);
-      throw e;
+    if (genCall.shouldExecute) {
+      try {
+        generation = await generateMemeImage(
+          job.slotPlan,
+          analysis,
+          job.modelSnapshot.key,
+          assetData
+        );
+        currentCost += parseFloat(generation.cost);
+        metrics.cost = currentCost;
+        await finishApiCall(genCall.callKey, parseFloat(generation.cost), 'succeeded');
+      } catch (e: unknown) {
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        await finishApiCall(genCall.callKey, 0, 'failed', errorMessage);
+        throw e;
+      }
+    } else {
+      throw new Error('Call already executed or pending reconciliation');
+    }
+
+    // Verify lease before proceeding
+    if (!(await verifyLease(job.jobId, workerId))) {
+      return { success: false, error: 'Lost worker lease after image generation', metrics };
     }
 
     // 3. VALIDATE MULTIMODAL
-    let validation = await validateMemeImage(
-      generation.imageBuffer,
-      generation.mimeType,
-      job.slotPlan,
-      campaignDirection
-    );
+    const valCall = await startApiCall('validation', 'google', 'gemini-2.5-flash', 'gemini-2.5-flash');
+    let validation;
+    if (valCall.shouldExecute) {
+      try {
+        validation = await validateMemeImage(
+          generation.imageBuffer,
+          generation.mimeType,
+          job.slotPlan,
+          campaignDirection
+        );
+        await finishApiCall(valCall.callKey, 0, 'succeeded');
+      } catch (e: unknown) {
+        await finishApiCall(valCall.callKey, 0, 'failed', e instanceof Error ? e.message : String(e));
+        throw e;
+      }
+    } else {
+      validation = await validateMemeImage(
+        generation.imageBuffer,
+        generation.mimeType,
+        job.slotPlan,
+        campaignDirection
+      );
+    }
 
     let is_valid = validation.is_valid;
 
-    // Regeneración controlada
+    // Controlled Regeneration if invalid
     if (!is_valid) {
       metrics.regenerations++;
       metrics.boundedErrors++;
 
-      // Intentamos otra vez
-        currentCallKey = `${callKeyBase}:regeneration`;
+      if (!hasRemainingBudget(WORKER_DURABLE_WRITE_RESERVE_MS + 10000)) {
+        await releaseLease(job.jobId);
+        return { success: false, error: 'Insufficient budget for regeneration', metrics };
+      }
+
+      await extendLease(job.jobId, workerId, 90);
+
+      const regenCall = await startApiCall(
+        'regeneration',
+        job.modelSnapshot.provider,
+        job.modelSnapshot.key,
+        job.modelSnapshot.apiModel
+      );
+
+      if (regenCall.shouldExecute) {
         try {
-          await startApiCall('regeneration');
           const regenerateInstruction = `FAILED VALIDATION REASON: ${validation.reason}\n\nCRITICAL: Simplify radically, remove all explanations, remove extra labels, reduce scene complexity, express one immediate visual joke. Do NOT render text if no_text was specified!`;
           generation = await generateMemeImage(
             job.slotPlan,
@@ -316,19 +596,39 @@ async function executeMemeJobTask(
           );
           currentCost += parseFloat(generation.cost);
           metrics.cost = currentCost;
-          await finishApiCall(currentCallKey, parseFloat(generation.cost), 'succeeded');
+          await finishApiCall(regenCall.callKey, parseFloat(generation.cost), 'succeeded');
         } catch (e: unknown) {
           const errorMessage = e instanceof Error ? e.message : String(e);
-          await finishApiCall(currentCallKey, 0, 'failed', errorMessage);
+          await finishApiCall(regenCall.callKey, 0, 'failed', errorMessage);
           throw e;
         }
+      }
 
-      validation = await validateMemeImage(
-        generation.imageBuffer,
-        generation.mimeType,
-        job.slotPlan,
-        campaignDirection
+      const revalCall = await startApiCall(
+        'revalidation',
+        'google',
+        'gemini-2.5-flash',
+        'gemini-2.5-flash'
       );
+      if (revalCall.shouldExecute) {
+        try {
+          validation = await validateMemeImage(
+            generation.imageBuffer,
+            generation.mimeType,
+            job.slotPlan,
+            campaignDirection
+          );
+          await finishApiCall(revalCall.callKey, 0, 'succeeded');
+        } catch (e: unknown) {
+          await finishApiCall(
+            revalCall.callKey,
+            0,
+            'failed',
+            e instanceof Error ? e.message : String(e)
+          );
+          throw e;
+        }
+      }
 
       if (!validation.is_valid) {
         throw new Error('Meme validation failed twice');
@@ -340,117 +640,162 @@ async function executeMemeJobTask(
       metrics.validMemes = 1;
     }
 
+    // Check remaining budget & lease before Blob upload and DB write
+    if (!hasRemainingBudget(WORKER_DURABLE_WRITE_RESERVE_MS)) {
+      await releaseLease(job.jobId);
+      return { success: false, error: 'Insufficient budget for Blob storage and DB write', metrics };
+    }
+
+    if (!(await verifyLease(job.jobId, workerId))) {
+      return { success: false, error: 'Lost worker lease before Blob upload', metrics };
+    }
+
     // 4. Upload to blob storage
-    const storageResult = await uploadGeneratedMeme(
-      generation.imageBuffer,
-      generation.mimeType
-    );
+    let storageResult;
+    try {
+      storageResult = await uploadGeneratedMeme(generation.imageBuffer, generation.mimeType);
+    } catch (blobErr) {
+      console.error('Blob upload failed', blobErr);
+      throw new Error('No se pudo guardar la imagen en el almacenamiento de blobs.');
+    }
 
-    // 5. Save to DB
-    await withTransaction(async (client) => {
-      const leaseRes = await client.query<{ id: string }>(
-        `SELECT id FROM meme_generation_jobs
-         WHERE id = $1 AND status = 'processing' AND lease_owner = $2 AND lease_expires_at > NOW()
-         FOR UPDATE`,
-        [job.jobId, workerId]
-      );
+    // 5. Save to DB with transaction
+    let insertSuccess = false;
+    try {
+      await withTransaction(async (client) => {
+        const leaseRes = await client.query<{ id: string }>(
+          `SELECT id FROM meme_generation_jobs
+           WHERE id = $1 AND status = 'processing' AND lease_owner = $2 AND lease_expires_at > NOW()
+           FOR UPDATE`,
+          [job.jobId, workerId]
+        );
 
-      if (leaseRes.rows.length === 0) return; // Lease expired or taken
+        if (leaseRes.rows.length === 0) return; // Lease expired or taken
 
-      // Verify draft or campaign is still valid
-      if (job.draftId) {
-         const draftLock = await client.query(`SELECT id FROM meme_drafts WHERE id = $1 AND status = 'active' FOR SHARE`, [job.draftId]);
-         if (draftLock.rows.length === 0) {
-            await client.query(`UPDATE meme_generation_jobs SET status = 'cancelled', error_message = 'Draft expired' WHERE id = $1`, [job.jobId]);
+        // Verify draft or campaign is still valid
+        if (job.draftId) {
+          const draftLock = await client.query(
+            `SELECT id FROM meme_drafts WHERE id = $1 AND status = 'active' FOR SHARE`,
+            [job.draftId]
+          );
+          if (draftLock.rows.length === 0) {
+            await client.query(
+              `UPDATE meme_generation_jobs SET status = 'cancelled', error_message = 'Draft expired' WHERE id = $1`,
+              [job.jobId]
+            );
             return;
-         }
-      } else {
-         const postLock = await client.query(
+          }
+        } else {
+          const postLock = await client.query(
             `SELECT p.id FROM campaign_posts p JOIN campaigns c ON p.campaign_id = c.id WHERE p.id = $1 AND p.retired_at IS NULL AND (p.expires_at IS NULL OR p.expires_at > NOW()) AND c.is_active = true FOR SHARE`,
             [job.campaignPostId]
-         );
-         if (postLock.rows.length === 0) {
-            await client.query(`UPDATE meme_generation_jobs SET status = 'cancelled', error_message = 'Post retired' WHERE id = $1`, [job.jobId]);
+          );
+          if (postLock.rows.length === 0) {
+            await client.query(
+              `UPDATE meme_generation_jobs SET status = 'cancelled', error_message = 'Post retired' WHERE id = $1`,
+              [job.jobId]
+            );
             return;
-         }
+          }
+        }
+
+        const finalDraftId = job.draftId || null;
+        const finalCampaignId = job.campaignId || null;
+        const finalCampaignPostId = job.campaignPostId || null;
+        const finalStatus = finalDraftId ? 'preview' : 'available';
+
+        await client.query(
+          `INSERT INTO memes (
+             draft_id, campaign_id, campaign_post_id, job_id,
+             status, storage_provider, storage_key, storage_url,
+             mime_type, size_bytes, width, height, sha256_hash,
+             slot_plan, model_key, accumulated_cost, delivery_order, asset_id
+           ) VALUES (
+             $1, $2, $3, $4,
+             $5, 'vercel_blob', $6, $7,
+             $8, $9, $10, $11, $12,
+             $13, $14, $15, $16, $17
+           ) RETURNING id`,
+          [
+            finalDraftId,
+            finalCampaignId,
+            finalCampaignPostId,
+            job.jobId,
+            finalStatus,
+            storageResult.pathname,
+            storageResult.url,
+            generation.mimeType,
+            generation.imageBuffer.length,
+            generation.width,
+            generation.height,
+            storageResult.sha256Hash,
+            JSON.stringify(job.slotPlan),
+            job.modelSnapshot.key,
+            currentCost,
+            job.slotIndex,
+            job.assetSnapshot?.id || null
+          ]
+        );
+
+        await client.query(
+          `UPDATE meme_generation_jobs
+           SET status = 'completed',
+               lease_owner = NULL,
+               lease_expires_at = NULL,
+               error_message = NULL,
+               accumulated_cost = accumulated_cost + $1,
+               updated_at = NOW()
+           WHERE id = $2`,
+          [currentCost, job.jobId]
+        );
+
+        insertSuccess = true;
+      });
+    } catch (dbErr) {
+      console.error('DB Insert meme failed, attempting blob cleanup', dbErr);
+      if (storageResult?.url) {
+        try {
+          await deleteBlob(storageResult.url);
+        } catch {
+          // ignore cleanup errors
+        }
       }
+      throw dbErr;
+    }
 
-      const finalDraftId = job.draftId || null;
-      const finalCampaignId = job.campaignId || null;
-      const finalCampaignPostId = job.campaignPostId || null;
-      const finalStatus = finalDraftId ? 'preview' : 'available';
+    if (!insertSuccess) {
+      return { success: false, error: 'Failed to insert meme or lost lease', metrics };
+    }
 
-      await client.query(
-        `INSERT INTO memes (
-           draft_id, campaign_id, campaign_post_id, job_id,
-           status, storage_provider, storage_key, storage_url,
-           mime_type, size_bytes, width, height, sha256_hash,
-           slot_plan, model_key, accumulated_cost, delivery_order, asset_id
-         ) VALUES (
-           $1, $2, $3, $4,
-           $5, 'vercel_blob', $6, $7,
-           $8, $9, $10, $11, $12,
-           $13, $14, $15, $16, $17
-         ) RETURNING id`,
-        [
-          finalDraftId, finalCampaignId, finalCampaignPostId, job.jobId,
-          finalStatus, storageResult.pathname, storageResult.url,
-          generation.mimeType, generation.imageBuffer.length, generation.width, generation.height, storageResult.sha256Hash,
-          JSON.stringify(job.slotPlan), job.modelSnapshot.key, currentCost, job.slotIndex, job.assetSnapshot?.id || null
-        ]
-      );
-
-      await client.query(
-        `UPDATE meme_generation_jobs
-         SET status = 'completed',
-             lease_owner = NULL,
-             lease_expires_at = NULL,
-             error_message = NULL,
-             accumulated_cost = accumulated_cost + $1,
-             updated_at = NOW()
-         WHERE id = $2`,
-        [currentCost, job.jobId]
-      );
-
-      await client.query(
-        `UPDATE meme_generation_cycles
-         SET valid_produced_count = valid_produced_count + 1,
-             completed_jobs_count = completed_jobs_count + 1,
-             status = CASE WHEN valid_produced_count + 1 >= target_count THEN 'completed' ELSE status END,
-             finished_at = CASE WHEN valid_produced_count + 1 >= target_count THEN NOW() ELSE finished_at END
-         WHERE id = $1`,
-        [job.cycleId]
-      );
-    });
+    await updateCycleStatus(job.cycleId);
 
     return { success: true, metrics };
   } catch (err: unknown) {
     metrics.boundedErrors++;
+
+    const classified = classifyMemeProviderError(err);
+    const isPermanent = classified.isPermanent;
+    const nextAttemptCount = job.attemptsCount + 1;
+    const isTerminal = isPermanent || nextAttemptCount >= 3;
+    const finalErrorMessage = classified.sanitizedMessage;
+
     await queryDb(
-       `UPDATE meme_generation_jobs
-        SET status = CASE WHEN attempts_count >= 3 THEN 'failed' ELSE 'pending' END,
-            attempts_count = attempts_count + 1,
-            next_attempt_at = NOW() + INTERVAL '1 minute',
-            error_message = $1,
-            accumulated_cost = accumulated_cost + $2,
-            lease_owner = NULL,
-            lease_expires_at = NULL,
-            updated_at = NOW()
-        WHERE id = $3
-        RETURNING status`,
-       [err instanceof Error ? err.message : String(err), currentCost, job.jobId]
-    ).then(async (res) => {
-       if (res[0]?.status === 'failed') {
-         await queryDb(
-           `UPDATE meme_generation_cycles
-            SET failed_jobs_count = failed_jobs_count + 1,
-                status = CASE WHEN valid_produced_count + failed_jobs_count + 1 >= (SELECT COUNT(*) FROM meme_generation_jobs WHERE cycle_id = $1) THEN 'partial' ELSE status END,
-                finished_at = CASE WHEN valid_produced_count + failed_jobs_count + 1 >= (SELECT COUNT(*) FROM meme_generation_jobs WHERE cycle_id = $1) THEN NOW() ELSE finished_at END
-            WHERE id = $1`,
-           [job.cycleId]
-         );
-       }
-    });
-    return { success: false, error: err instanceof Error ? err.message : String(err), metrics };
+      `UPDATE meme_generation_jobs
+       SET status = CASE WHEN $1::boolean THEN 'failed' ELSE 'pending' END,
+           attempts_count = $2,
+           next_attempt_at = NOW() + INTERVAL '1 minute',
+           error_message = $3,
+           accumulated_cost = accumulated_cost + $4,
+           lease_owner = NULL,
+           lease_expires_at = NULL,
+           updated_at = NOW()
+       WHERE id = $5
+       RETURNING status`,
+      [isTerminal, isTerminal ? 3 : nextAttemptCount, finalErrorMessage, currentCost, job.jobId]
+    );
+
+    await updateCycleStatus(job.cycleId, finalErrorMessage);
+
+    return { success: false, error: finalErrorMessage, metrics };
   }
 }

@@ -950,11 +950,12 @@ export default function AdminDashboardPage() {
       const previewData = await previewResponse.json();
       if (!previewResponse.ok) throw new Error(previewData.error || `Error HTTP ${previewResponse.status}.`);
 
-      if (!previewData.draftId) {
-        throw new Error('No se recibió el draftId para la preview de memes.');
+      if (!previewData.draftId || !previewData.cycleId) {
+        throw new Error('No se recibió el draftId o cycleId para la preview de memes.');
       }
       
       const newDraftId = previewData.draftId;
+      const newCycleId = previewData.cycleId;
       setDraftId(newDraftId);
       
       // Polling
@@ -968,8 +969,17 @@ export default function AdminDashboardPage() {
       let terminalState = false;
 
       while (totalTime < MAX_TOTAL_TIME) {
-        const statusRes = await fetch(`/api/admin/meme-drafts/${newDraftId}/status`);
-        if (!statusRes.ok) throw new Error('Error al consultar estado de preview.');
+        const statusRes = await fetch(`/api/admin/meme-drafts/${newDraftId}/status?cycleId=${newCycleId}`);
+        if (!statusRes.ok) {
+          let serverErr = '';
+          try {
+            const errJson = await statusRes.json();
+            serverErr = errJson.error || '';
+          } catch {
+            // non-json response
+          }
+          throw new Error(serverErr || `Error HTTP ${statusRes.status} al consultar estado de preview.`);
+        }
         const statusData = await statusRes.json();
         
         const completedJobsCount = statusData.completedCount + statusData.failedCount + statusData.cancelledCount;
@@ -989,6 +999,9 @@ export default function AdminDashboardPage() {
              const errors = (statusData.jobs || []).filter((j: { error_message?: string | null }) => j.error_message).map((j: { error_message?: string | null }) => j.error_message);
              if (errors.length > 0) {
                 throw new Error(`Fallo terminal: ${errors.join(' | ')}`);
+             }
+             if (statusData.errorMessage) {
+                throw new Error(`Fallo terminal: ${statusData.errorMessage}`);
              }
           }
           break;

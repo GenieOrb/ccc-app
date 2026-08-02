@@ -610,7 +610,8 @@ async function cancelJobAndCheckCycle(client: PoolClient, jobId: string, cycleId
 
 export async function runGenerationProcessing(
   workerId: string = randomUUID(),
-  totalBudgetMs: number = 50000
+  totalBudgetMs: number = 50000,
+  memeCycleId?: string
 ): Promise<{
   worker: { processed: number; completed: number; failed: number; skipped?: string };
   workerMemes: { processed: number; completed: number; failed: number; skipped?: string };
@@ -627,7 +628,12 @@ export async function runGenerationProcessing(
   const remainingBudgetMs = Math.max(0, totalBudgetMs - (Date.now() - startTime));
 
   const workerMemesResult = remainingBudgetMs >= MIN_MEME_WORKER_JOB_BUDGET_MS
-    ? await processMemeBackgroundQueue(workerId, remainingBudgetMs)
+    ? await processMemeBackgroundQueue({
+        workerId,
+        budgetMs: remainingBudgetMs,
+        cycleId: memeCycleId,
+        maxConcurrency: 3
+      })
     : { processed: 0, completed: 0, failed: 0, skipped: 'insufficient_time_budget' };
 
   return {

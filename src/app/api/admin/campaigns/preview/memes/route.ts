@@ -116,10 +116,10 @@ export async function POST(req: Request) {
         if (cycleRes.rowCount! > 0) {
            return NextResponse.json({ success: true, draftId: effectiveDraftId, cycleId: cycleRes.rows[0].id, targetCount: 3, status: cycleRes.rows[0].status });
         }
-        // Check if completed 3 previews
-        const memesRes = await client.query(`SELECT id FROM memes WHERE draft_id = $1 AND status = 'preview'`, [effectiveDraftId]);
-        if (memesRes.rowCount! >= 3) {
-           return NextResponse.json({ success: true, draftId: effectiveDraftId, targetCount: 3, status: 'completed' });
+        // Check if completed 3 previews for a cycle
+        const completedCycleRes = await client.query(`SELECT id FROM meme_generation_cycles WHERE draft_id = $1 AND status = 'completed' ORDER BY created_at DESC LIMIT 1`, [effectiveDraftId]);
+        if (completedCycleRes.rowCount! > 0) {
+           return NextResponse.json({ success: true, draftId: effectiveDraftId, cycleId: completedCycleRes.rows[0].id, targetCount: 3, status: 'completed' });
         }
       }
 
@@ -194,8 +194,9 @@ export async function POST(req: Request) {
 
     const resultData = await txResult.clone().json();
     const finalDraftId = resultData.draftId;
+    const finalCycleId = resultData.cycleId;
 
-    if (resultData.status !== 'completed' && finalDraftId) {
+    if (resultData.status !== 'completed' && finalDraftId && finalCycleId) {
       try {
         const triggerUrl = new URL('/api/internal/generation/process', req.url).toString();
         const triggerRes = await fetch(triggerUrl, {
@@ -204,7 +205,8 @@ export async function POST(req: Request) {
             'Authorization': buildInternalProcessAuthorizationHeader(),
             'Cache-Control': 'no-store',
             'Content-Type': 'application/json'
-          }
+          },
+          body: JSON.stringify({ memeCycleId: finalCycleId })
         });
         
         if (!triggerRes.ok) {

@@ -18,6 +18,18 @@ async function handleProcess(req: Request) {
   }
 
   try {
+    let memeCycleId: string | undefined = undefined;
+    if (req.method === 'POST') {
+      try {
+        const body = await req.json();
+        if (body && typeof body.memeCycleId === 'string') {
+          memeCycleId = body.memeCycleId;
+        }
+      } catch {
+        // body could be empty or non-JSON
+      }
+    }
+
     const startPerpetual = Date.now();
     // Le damos 15 segundos al monitor de campañas perpetuas
     const perpetualResult = await processPerpetualCampaigns(30000);
@@ -27,7 +39,7 @@ async function handleProcess(req: Request) {
     const workerBudgetMs = Math.max(0, 50000 - (Date.now() - startPerpetual));
     const workerId = randomUUID();
 
-    const generationResult = await runGenerationProcessing(workerId, workerBudgetMs);
+    const generationResult = await runGenerationProcessing(workerId, workerBudgetMs, memeCycleId);
 
     return NextResponse.json(
       {
