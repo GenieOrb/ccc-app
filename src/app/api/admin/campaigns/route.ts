@@ -86,7 +86,7 @@ export async function POST(req: Request) {
         );
       }
 
-      const { urlsInput, direction, displayName, modelKey, brandVariants, maxCommentsTotal, includeMemes, memePercentage, memeModelKey } = body;
+      const { urlsInput, direction, displayName, modelKey, brandVariants, maxCommentsTotal, includeMemes, memePercentage, memeModelKey, draftId } = body;
 
       if (maxCommentsTotal !== undefined) {
         if (!Number.isInteger(maxCommentsTotal) || maxCommentsTotal < 1 || maxCommentsTotal > 1000000) {
@@ -116,7 +116,7 @@ export async function POST(req: Request) {
       if (brandVariants !== undefined && !Array.isArray(brandVariants)) return NextResponse.json({ error: 'Variantes de marca no válidas.' }, { status: 400 });
       if (memePercentage !== undefined && (!Number.isInteger(memePercentage) || memePercentage < 0 || memePercentage > 100)) return NextResponse.json({ error: 'Porcentaje de memes no válido.' }, { status: 400 });
 
-      const created = await createCampaign({ urlsInput, direction, displayName, modelKey, brandVariants, maxCommentsTotal, isInactive, includeMemes, memePercentage, memeModelKey });
+      const created = await createCampaign({ urlsInput, direction, displayName, modelKey, brandVariants, maxCommentsTotal, isInactive, includeMemes, memePercentage, memeModelKey, draftId });
 
       return NextResponse.json(
         { success: true, campaign: { ...created, campaignType: 'manual' } },

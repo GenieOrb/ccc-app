@@ -313,6 +313,7 @@ export async function createCampaign(params: {
   includeMemes?: boolean;
   memePercentage?: number;
   memeModelKey: string;
+  draftId?: string | null;
 }): Promise<{ id: string; slug: string }> {
   const attributionKey = randomUUID();
 
@@ -453,6 +454,11 @@ export async function createCampaign(params: {
 
     await client.query(`UPDATE generation_api_calls SET campaign_id = $1 WHERE attribution_key = $2 AND campaign_id IS NULL`, [campaignId, attributionKey]);
     await client.query(`UPDATE x_api_calls SET campaign_id = $1 WHERE attribution_key = $2 AND campaign_id IS NULL`, [campaignId, attributionKey]);
+
+    if (params.draftId) {
+      await client.query(`UPDATE meme_assets SET draft_id = NULL, campaign_id = $1 WHERE draft_id = $2`, [campaignId, params.draftId]);
+      await client.query(`DELETE FROM meme_drafts WHERE id = $1`, [params.draftId]);
+    }
 
     return { id: campaignId, slug };
   });

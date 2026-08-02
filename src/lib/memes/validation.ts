@@ -1,9 +1,8 @@
 import 'server-only';
 import { z } from 'zod';
-import { getOpenAIClient, requestOptionsForDeadline } from '../openai';
-import { zodResponseFormat } from 'openai/helpers/zod';
-import type { ChatCompletionContentPart } from 'openai/resources/index.mjs';
 import { MemeSlotPlan } from './planner';
+import { Type, GoogleGenAI } from '@google/genai';
+import { getConfig } from '../config';
 
 export const MemeValidationSchema = z.object({
   is_valid: z.boolean().describe("True si la imagen cumple con todos los requisitos y es segura, false de lo contrario."),
@@ -16,14 +15,16 @@ export async function validateMemeImage(
   imageBuffer: Buffer,
   mimeType: string,
   plan: MemeSlotPlan,
-  campaignDirection: string,
-  deadline?: number
+  campaignDirection: string
 ): Promise<MemeValidationResult> {
-  const client = getOpenAIClient('openai');
-  const reqOpts = requestOptionsForDeadline(deadline);
+  const config = getConfig();
+  
+  if (!config.googleAiApiKey) {
+    throw new Error('Google AI API Key no configurada. (provider: google, phase: validation)');
+  }
 
-  const base64Image = imageBuffer.toString('base64');
-  const dataUrl = `data:${mimeType};base64,${base64Image}`;
+  const client = new GoogleGenAI({ apiKey: config.googleAiApiKey });
+  const modelName = config.memeValidationModel || 'gemini-3.1-flash-lite';
 
   const systemPrompt = `Eres un auditor de calidad y seguridad de marketing. 
 Tu tarea es analizar una imagen generada para un meme y asegurarte de que:
@@ -34,27 +35,53 @@ Tu tarea es analizar una imagen generada para un meme y asegurarte de que:
 
 Devuelve is_valid = false si hay texto ilegible flagrante, problemas graves de seguridad, o es completamente incoherente con el estilo/tono. De lo contrario, true.`;
 
-  const userContent: ChatCompletionContentPart[] = [
-    { type: 'text', text: `Verifica esta imagen generada.` },
-    {
-      type: 'image_url',
-      image_url: { url: dataUrl, detail: 'low' } // Use low detail for cost efficiency in validation
+  const userContent = `Verifica esta imagen generada.`;
+  
+  const base64Image = imageBuffer.toString('base64');
+  const imagePart = {
+    inlineData: {
+      data: base64Image,
+      mimeType
     }
-  ];
+  };
 
-  const completion = await client.beta.chat.completions.parse({
-    model: 'gpt-4o-mini',
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userContent }
-    ],
-    response_format: zodResponseFormat(MemeValidationSchema, 'meme_validation'),
-    ...reqOpts
-  });
+  const responseSchema = {
+    type: Type.OBJECT,
+    properties: {
+      is_valid: { type: Type.BOOLEAN, description: "True si la imagen cumple con todos los requisitos y es segura, false de lo contrario." },
+      reason: { type: Type.STRING, description: "Razón de la validación o rechazo." }
+    },
+    required: ["is_valid", "reason"]
+  };
 
-  if (!completion.choices[0].message.parsed) {
-    throw new Error('Failed to parse meme validation analysis');
+  try {
+    const response = await client.models.generateContent({
+      model: modelName,
+      contents: [
+        { role: 'user', parts: [{ text: userContent }, imagePart] }
+      ],
+      config: {
+        systemInstruction: systemPrompt,
+        responseMimeType: 'application/json',
+        responseSchema: responseSchema
+      }
+    });
+
+    if (!response.text) {
+      throw new Error('Empty response from model');
+    }
+
+    const parsed = JSON.parse(response.text);
+    return MemeValidationSchema.parse(parsed);
+  } catch (error: unknown) {
+    const err = error as Error & { status?: number };
+    let code = 500;
+    let type = 'content';
+    if (err.status === 403) code = 403;
+    if (err.status === 429) code = 429;
+    if (code === 403) type = 'acceso denegado';
+    else if (code === 429) type = 'rate limit';
+    
+    throw new Error(`No se pudo validar el contenido con ${modelName}: ${type}. (phase: validation, provider: google, status: ${code})`);
   }
-
-  return completion.choices[0].message.parsed;
 }

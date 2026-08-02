@@ -215,7 +215,24 @@ async function executeMemeJobTask(
       postText,
       campaignDirection,
       availableAssets
-    }, deadline);
+    });
+
+    let assetData;
+    if (job.assetSnapshot && job.assetSnapshot.storage_url) {
+      try {
+        const resp = await fetch(job.assetSnapshot.storage_url as string);
+        if (resp.ok) {
+          const buffer = Buffer.from(await resp.arrayBuffer());
+          assetData = {
+            buffer,
+            mimeType: (job.assetSnapshot.mime_type as string) || 'image/png',
+            instruction: (job.assetSnapshot.instruction as string) || ''
+          };
+        }
+      } catch (e) {
+        console.error('Failed to fetch asset blob', e);
+      }
+    }
 
     // 2. GENERATE MEME IMAGE
     let generation;
@@ -224,6 +241,7 @@ async function executeMemeJobTask(
         job.slotPlan,
         analysis,
         job.modelSnapshot.key,
+        assetData,
         deadline
       );
       currentCost += parseFloat(generation.cost);
@@ -240,8 +258,7 @@ async function executeMemeJobTask(
       generation.imageBuffer,
       generation.mimeType,
       job.slotPlan,
-      campaignDirection,
-      deadline
+      campaignDirection
     );
     
     let is_valid = validation.is_valid;
@@ -257,6 +274,7 @@ async function executeMemeJobTask(
           job.slotPlan,
           analysis,
           job.modelSnapshot.key,
+          assetData,
           deadline
         );
         currentCost += parseFloat(generation.cost);
@@ -272,8 +290,7 @@ async function executeMemeJobTask(
         generation.imageBuffer,
         generation.mimeType,
         job.slotPlan,
-        campaignDirection,
-        deadline
+        campaignDirection
       );
       
       if (!validation.is_valid) {

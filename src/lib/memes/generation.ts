@@ -6,6 +6,8 @@ import { getConfig } from '../config';
 import { MemeSlotPlan } from './planner';
 import { MemePreflightAnalysis } from './analysis';
 
+import { toFile } from 'openai';
+
 export interface MemeGenerationResult {
   imageBuffer: Buffer;
   mimeType: string;
@@ -18,6 +20,7 @@ export async function generateMemeImage(
   plan: MemeSlotPlan,
   analysis: MemePreflightAnalysis,
   modelKey: string,
+  assetData?: { buffer: Buffer; mimeType: string; instruction?: string },
   deadline?: number
 ): Promise<MemeGenerationResult> {
   const modelDef = resolveImageModel(modelKey);
@@ -35,25 +38,64 @@ IMPORTANT GUIDELINES:
 - No text in the image unless strictly necessary for the meme format.
 - Ensure the image matches the tone and visual style precisely.
 ${plan.requiresAsset ? `- The meme MUST feature the provided brand asset visually integrated.` : ''}
+${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''}
 `;
 
   if (modelDef.provider === 'openai') {
     const client = getOpenAIClient('openai');
-    const response = await client.images.generate(
-      {
-        model: modelDef.apiModel,
-        prompt: prompt,
-        n: 1,
-        size: '1024x1024',
-        response_format: 'b64_json',
-      },
-      reqOpts
-    );
+    let b64: string;
+    
+    try {
+      if (plan.requiresAsset && assetData) {
+        // Usa image edit si hay asset de referencia
+        const file = await toFile(assetData.buffer, 'reference.png', { type: assetData.mimeType });
+        const response = await client.images.edit(
+          {
+            model: modelDef.apiModel,
+            image: file,
+            prompt: prompt,
+            n: 1,
+            size: '1024x1024',
+            response_format: 'b64_json',
+          },
+          reqOpts
+        );
 
-    if (!response.data || !response.data[0] || !response.data[0].b64_json) {
-      throw new Error('OpenAI returned empty image data.');
+        if (!response.data || !response.data[0] || !response.data[0].b64_json) {
+          throw new Error('OpenAI returned empty image data.');
+        }
+        b64 = response.data[0].b64_json;
+      } else {
+        // Generación normal
+        const response = await client.images.generate(
+          {
+            model: modelDef.apiModel,
+            prompt: prompt,
+            n: 1,
+            size: '1024x1024',
+            response_format: 'b64_json',
+          },
+          reqOpts
+        );
+
+        if (!response.data || !response.data[0] || !response.data[0].b64_json) {
+          throw new Error('OpenAI returned empty image data.');
+        }
+        b64 = response.data[0].b64_json;
+      }
+    } catch (error: unknown) {
+      const err = error as Error & { status?: number; error?: { code?: string } };
+      if (err.status === 403) {
+        throw new Error(`Acceso denegado a modelo de imagen OpenAI: ${modelDef.apiModel} (403)`);
+      }
+      if (err.status === 429) {
+        throw new Error(`Rate limit excedido en modelo de imagen OpenAI: ${modelDef.apiModel} (429)`);
+      }
+      if (err.error?.code === 'content_policy_violation') {
+        throw new Error(`Rechazo de contenido por política en modelo de imagen OpenAI: ${modelDef.apiModel}`);
+      }
+      throw err;
     }
-    const b64 = response.data[0].b64_json;
 
     const imageBuffer = Buffer.from(b64, 'base64');
     return {
@@ -68,10 +110,33 @@ ${plan.requiresAsset ? `- The meme MUST feature the provided brand asset visuall
     if (!config.googleAiApiKey) throw new Error('GOOGLE_AI_API_KEY is not configured');
     const ai = new GoogleGenAI({ apiKey: config.googleAiApiKey });
     
-    const response = await ai.models.generateContent({
-      model: modelDef.apiModel,
-      contents: prompt,
-    });
+    const parts: ({ text: string } | { inlineData: { mimeType: string, data: string } })[] = [{ text: prompt }];
+    
+    if (plan.requiresAsset && assetData) {
+      parts.push({
+        inlineData: {
+          data: assetData.buffer.toString('base64'),
+          mimeType: assetData.mimeType
+        }
+      });
+    }
+
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: modelDef.apiModel,
+        contents: parts,
+      });
+    } catch (error: unknown) {
+      const err = error as Error & { status?: number };
+      if (err.status === 403) {
+        throw new Error(`Acceso denegado a modelo de imagen Google: ${modelDef.apiModel} (403)`);
+      }
+      if (err.status === 429) {
+        throw new Error(`Rate limit excedido en modelo de imagen Google: ${modelDef.apiModel} (429)`);
+      }
+      throw error;
+    }
 
     const candidate = response.candidates?.[0];
     const imagePart = candidate?.content?.parts?.find(p => p.inlineData);

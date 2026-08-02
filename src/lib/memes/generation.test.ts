@@ -56,7 +56,9 @@ describe('generateMemeImage (Gemini adapter)', () => {
     expect(result.imageBuffer.toString('base64')).toBe('YmFzZTY0dGVzdA==');
     expect(mockGenerateContent).toHaveBeenCalledWith({
       model: 'gemini-3.1-flash-image',
-      contents: expect.any(String)
+      contents: expect.arrayContaining([
+        expect.objectContaining({ text: expect.any(String) })
+      ])
     });
     // Check generateImages was NOT called
     expect(genAiInstance.models.generateImages).not.toHaveBeenCalled();

@@ -33,7 +33,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Cuerpo de petición no válido.' }, { status: 400 });
     }
 
-    const { campaignType, urlsInput, accountsInput, direction, memeModelKey } = body;
+    const { campaignType, urlsInput, accountsInput, direction, memeModelKey, draftId } = body;
     if (!memeModelKey) {
       return NextResponse.json({ error: 'Debe especificar un modelo de generación (memeModelKey).' }, { status: 400 });
     }
@@ -97,25 +97,54 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'No se pudo obtener contenido para la preview.' }, { status: 400 });
     }
 
+    let assets: { id: string, asset_type: string, instruction: string, storage_url: string, mime_type: string }[] = [];
+    if (draftId) {
+      const { queryDb } = await import('@/lib/db');
+      const assetsRes = await queryDb<{ id: string, asset_type: string, instruction: string, storage_url: string, mime_type: string }>(
+        `SELECT id, asset_type, instruction, storage_url, mime_type FROM meme_assets WHERE draft_id = $1 AND status = 'active'`,
+        [draftId]
+      );
+      assets = assetsRes;
+    }
+
     const plans = generateDeterministicMemeSlotPlans(null, 'preview-draft-id', [postContent.post_id], 3, []);
 
-    const generatedPromises = plans.map(async (plan) => {
+    const generatedPromises = plans.map(async (plan, index) => {
       const remainingTime = PREVIEW_TOTAL_BUDGET_MS - (Date.now() - startTime);
       if (remainingTime <= 0) {
         throw new Error('PREVIEW_TIMEOUT');
+      }
+
+      let assetData;
+      if (assets.length > 0) {
+        const pickedAsset = assets[index % assets.length];
+        try {
+          const resp = await fetch(pickedAsset.storage_url);
+          if (resp.ok) {
+            const buffer = Buffer.from(await resp.arrayBuffer());
+            assetData = {
+              buffer,
+              mimeType: pickedAsset.mime_type || 'image/png',
+              instruction: pickedAsset.instruction || ''
+            };
+          }
+        } catch (e) {
+          console.error('Preview asset fetch error', e);
+        }
       }
 
       try {
         const analysis = await performMemeAnalysis({
           postText: postContent!.text_content,
           campaignDirection: direction || 'Sin dirección específica.',
-          availableAssets: []
+          availableAssets: assets.map(a => ({ id: a.id, assetType: a.asset_type, instruction: a.instruction }))
         });
 
         const generation = await generateMemeImage(
           plan,
           analysis,
-          model.key
+          model.key,
+          assetData
         );
         
         const imageBlobUrl = `data:${generation.mimeType};base64,${generation.imageBuffer.toString('base64')}`;

@@ -683,6 +683,20 @@ export default function AdminDashboardPage() {
   const [includeMemes, setIncludeMemes] = useState(true);
   const [memePercentage, setMemePercentage] = useState('25');
   const [memeModelKey, setMemeModelKey] = useState('');
+  const [checkingMemeModel, setCheckingMemeModel] = useState(false);
+  const [memeModelCheckResult, setMemeModelCheckResult] = useState<{ success: boolean; message: string } | null>(null);
+
+  const [draftId, setDraftId] = useState<string | null>(null);
+  const [memeAssets, setMemeAssets] = useState<Array<{
+    id: string;
+    asset_type: string;
+    appearance_percentage: number;
+    instruction: string;
+    storage_url: string;
+    mime_type: string;
+    size_bytes: number;
+  }>>([]);
+  const [uploadingAsset, setUploadingAsset] = useState(false);
 
   const [creating, setCreating] = useState(false);
   const [generatingPreview, setGeneratingPreview] = useState(false);
@@ -690,6 +704,97 @@ export default function AdminDashboardPage() {
   const [previewFormError, setPreviewFormError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [brandVariants, setBrandVariants] = useState<Array<{value: string, percentage: number}>>([]);
+
+  const handleCheckMemeModel = async () => {
+    if (!memeModelKey) return;
+    setCheckingMemeModel(true);
+    setMemeModelCheckResult(null);
+    try {
+      const res = await fetch('/api/admin/image-models/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelKey: memeModelKey })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setMemeModelCheckResult({ success: data.success, message: data.message || data.error });
+      } else {
+        setMemeModelCheckResult({ success: false, message: data.error || 'Error desconocido al verificar' });
+      }
+    } catch (e: unknown) {
+      setMemeModelCheckResult({ success: false, message: e instanceof Error ? e.message : 'Error de red' });
+    } finally {
+      setCheckingMemeModel(false);
+    }
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (memeAssets.length >= 10) {
+      alert('Máximo 10 assets permitidos.');
+      return;
+    }
+    
+    setUploadingAsset(true);
+    const formData = new FormData();
+    formData.append('file', file);
+    if (draftId) formData.append('draftId', draftId);
+
+    try {
+      const res = await fetch('/api/admin/meme-drafts/assets', {
+        method: 'POST',
+        body: formData
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Error subiendo asset');
+      
+      if (!draftId && data.draftId) {
+        setDraftId(data.draftId);
+      }
+      
+      // Recargar assets
+      const draftToFetch = draftId || data.draftId;
+      const listRes = await fetch(`/api/admin/meme-drafts/${draftToFetch}/assets`);
+      const listData = await listRes.json();
+      if (listRes.ok) setMemeAssets(listData.assets);
+      
+    } catch (error: unknown) {
+      alert(error instanceof Error ? error.message : 'Error subiendo asset');
+    } finally {
+      setUploadingAsset(false);
+      e.target.value = ''; // reset input
+    }
+  };
+
+  const handleUpdateAsset = async (assetId: string, field: 'asset_type'|'appearance_percentage'|'instruction', val: string|number) => {
+    const updated = memeAssets.map(a => a.id === assetId ? { ...a, [field]: val } : a);
+    setMemeAssets(updated);
+    
+    // Check percentage sum before sending (optional but good practice)
+    
+    try {
+      const asset = updated.find(a => a.id === assetId);
+      if (!asset) return;
+      await fetch(`/api/admin/meme-drafts/${draftId}/assets/${assetId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ assetType: asset.asset_type, percentage: asset.appearance_percentage, instruction: asset.instruction })
+      });
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleDeleteAsset = async (assetId: string) => {
+    if (!confirm('¿Borrar este asset?')) return;
+    try {
+      await fetch(`/api/admin/meme-drafts/${draftId}/assets/${assetId}`, { method: 'DELETE' });
+      setMemeAssets(memeAssets.filter(a => a.id !== assetId));
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const handleAddBrandVariant = () => setBrandVariants([...brandVariants, { value: '', percentage: 100 }]);
   const handleRemoveBrandVariant = (index: number) => setBrandVariants(brandVariants.filter((_, i) => i !== index));
@@ -834,7 +939,7 @@ export default function AdminDashboardPage() {
     setCreatedMemePreview(null);
 
     try {
-      const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, memeModelKey };
+      const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, memeModelKey, draftId };
       if (campaignTypeToCreate === 'manual') {
         payload.urlsInput = urlsInput;
       } else {
@@ -892,7 +997,8 @@ export default function AdminDashboardPage() {
         creationMode,
         includeMemes,
         memePercentage: Number(memePercentage),
-        memeModelKey
+        memeModelKey,
+        draftId
       };
 
       const trimmedMax = maxCommentsTotalInput.trim();
@@ -1155,6 +1261,86 @@ export default function AdminDashboardPage() {
                         </option>
                       ))}
                     </select>
+                    <div style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <button 
+                        type="button" 
+                        onClick={handleCheckMemeModel} 
+                        disabled={checkingMemeModel || creating || !memeModelKey} 
+                        className="btn-admin btn-secondary"
+                        style={{ padding: '4px 8px', fontSize: '0.85em' }}
+                      >
+                        {checkingMemeModel ? 'Verificando...' : 'Probar acceso'}
+                      </button>
+                      {memeModelCheckResult && (
+                        <span style={{ fontSize: '0.85em', color: memeModelCheckResult.success ? 'green' : 'red' }}>
+                          {memeModelCheckResult.message}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  
+                  <div style={{ marginTop: '16px', borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
+                    <label className="form-label" style={{ fontWeight: 'bold' }}>Material visual para los memes (opcional)</label>
+                    <p style={{ fontSize: '0.85em', color: 'var(--text-secondary)', marginBottom: '12px' }}>
+                      Sube logos, mascotas, productos u otras referencias (máximo 10).
+                    </p>
+                    
+                    {memeAssets.length > 0 && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '12px' }}>
+                        {memeAssets.map(asset => (
+                          <div key={asset.id} style={{ display: 'flex', gap: '12px', padding: '12px', background: 'var(--bg-color)', borderRadius: '6px', border: '1px solid var(--border-color)' }}>
+                            <img src={`/api/admin/meme-drafts/${draftId}/assets/${asset.id}/view`} alt="Asset" style={{ width: '80px', height: '80px', objectFit: 'cover', borderRadius: '4px' }} />
+                            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                              <div style={{ display: 'flex', gap: '8px' }}>
+                                <select 
+                                  className="form-textarea" style={{ minHeight: 'auto', padding: '4px', flex: 1 }}
+                                  value={asset.asset_type}
+                                  onChange={e => handleUpdateAsset(asset.id, 'asset_type', e.target.value)}
+                                  disabled={creating}
+                                >
+                                  <option value="logo">Logo</option>
+                                  <option value="mascot">Mascota</option>
+                                  <option value="product">Producto</option>
+                                  <option value="fictional_character">Personaje</option>
+                                  <option value="object">Objeto</option>
+                                  <option value="other">Otro</option>
+                                </select>
+                                <input 
+                                  type="number" min="1" max="100" 
+                                  className="form-textarea" style={{ width: '80px', minHeight: 'auto', padding: '4px' }}
+                                  value={asset.appearance_percentage}
+                                  onChange={e => handleUpdateAsset(asset.id, 'appearance_percentage', parseInt(e.target.value) || 0)}
+                                  disabled={creating}
+                                  title="Porcentaje de aparición"
+                                />
+                                <button type="button" onClick={() => handleDeleteAsset(asset.id)} disabled={creating} className="btn-admin btn-danger" style={{ padding: '4px 8px' }}>X</button>
+                              </div>
+                              <input 
+                                type="text"
+                                className="form-textarea" style={{ minHeight: 'auto', padding: '4px' }}
+                                placeholder="Instrucciones para la IA (ej. No deformar el logo)"
+                                value={asset.instruction}
+                                onChange={e => handleUpdateAsset(asset.id, 'instruction', e.target.value)}
+                                disabled={creating}
+                              />
+                            </div>
+                          </div>
+                        ))}
+                        {memeAssets.reduce((sum, a) => sum + a.appearance_percentage, 0) > 100 && (
+                          <div style={{ color: 'red', fontSize: '0.85em', fontWeight: 'bold' }}>Error: La suma de porcentajes no puede superar el 100%</div>
+                        )}
+                      </div>
+                    )}
+                    
+                    <input 
+                      type="file" 
+                      accept="image/png, image/jpeg, image/webp"
+                      onChange={handleFileUpload} 
+                      disabled={uploadingAsset || creating || memeAssets.length >= 10} 
+                      className="form-textarea"
+                      style={{ padding: '8px', minHeight: 'auto' }}
+                    />
+                    {uploadingAsset && <span style={{ fontSize: '0.85em', marginLeft: '8px' }}>Subiendo...</span>}
                   </div>
                 </div>
               )}
@@ -1220,7 +1406,7 @@ export default function AdminDashboardPage() {
                   disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
                   onClick={generateMemePreview}
                 >
-                  {generatingPreview ? 'Generando preview...' : 'Generar preview de memes'}
+                  {generatingPreview ? 'Generando preview...' : 'Generar 3 memes'}
                 </button>
               )}
             </div>

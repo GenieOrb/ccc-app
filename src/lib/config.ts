@@ -17,6 +17,8 @@ export interface AppConfig {
   securityHmacSecret: string;
   internalProcessSecret: string;
   cronSecret: string;
+  memeAnalysisModel: string;
+  memeValidationModel: string;
 }
 
 let cachedConfig: AppConfig | null = null;
@@ -47,6 +49,8 @@ export function getConfig(): AppConfig {
   const securityHmacSecret = process.env.SECURITY_HMAC_SECRET || '';
   const internalProcessSecret = process.env.INTERNAL_PROCESS_SECRET || '';
   const cronSecret = process.env.CRON_SECRET || '';
+  const memeAnalysisModel = process.env.MEME_ANALYSIS_MODEL || 'gemini-3.1-flash-lite';
+  const memeValidationModel = process.env.MEME_VALIDATION_MODEL || 'gemini-3.1-flash-lite';
 
   cachedConfig = {
     databaseUrl,
@@ -65,6 +69,8 @@ export function getConfig(): AppConfig {
     securityHmacSecret,
     internalProcessSecret,
     cronSecret,
+    memeAnalysisModel,
+    memeValidationModel,
   };
 
   return cachedConfig;
