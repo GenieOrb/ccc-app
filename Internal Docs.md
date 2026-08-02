@@ -85,7 +85,7 @@ Antes de aceptar un comentario generado:
 - Reclamación de trabajos mediante transacción con `FOR UPDATE SKIP LOCKED`.
 - Asignación de `lease_owner` y expiración de lease (`lease_expires_at`).
 - Reintentos con backoff exponencial hasta 3 intentos por trabajo.
-- Estados de ciclo y trabajo: `pending`, `processing`, `completed`, `failed`.
+- Estados de ciclo y trabajo: `pending`, `processing`, `completed`, `failed`. Un ciclo 'failed' es puramente terminal y no impide la creación de nuevas autorreposiciones.
 - Un ciclo se completa únicamente cuando produce exactamente 50 sugerencias válidas.
 - **Retirada de sugerencias**:
   - Las sugerencias en estado `available` pueden retirarse administrativamente (pasan a estado `withdrawn` con `withdrawn_at`).
@@ -95,7 +95,7 @@ Antes de aceptar un comentario generado:
 - Inventario inicial: 50 sugerencias.
 - Cuando el inventario disponible desciende a 20 o menos:
   - La comprobación y posible reposición se lanza asíncronamente de forma separada *después* de haber completado y cerrado la transacción de asignación o de retirar administrativamente una sugerencia, para evitar tiempos de respuesta lentos.
-  - Se crea automáticamente un ciclo de reposición de 50 slots utilizando el snapshot actual de posts vigentes de la campaña.
+  - Se crea automáticamente un ciclo de reposición de 50 slots utilizando el snapshot actual de posts vigentes de la campaña. Las autorreposiciones crean siempre un ciclo nuevo, ignorando los ciclos fallidos antiguos para evitar bucles infinitos de reintentos en slots problemáticos.
   - La reposición respeta en todo momento la capacidad máxima configurada en la campaña (`max_comments_total`), la cual es un límite global opcional. Si este campo se deja vacío (`NULL`), la campaña no tiene límite y puede generar comentarios perpetuamente. Cuando existe un límite y queda capacidad parcial, se generan exactamente los slots restantes; cuando se agota el inventario máximo configurado, cesan los ciclos de generación y el polling de nuevos posts.
   - La base de datos impide más de un ciclo activo por campaña mediante un bloqueo transaccional a nivel de fila sobre la propia campaña (`SELECT 1 FROM campaigns FOR UPDATE`). Esto provee una garantía real contra carreras concurrentes (ej. entre ediciones de posts y disparos de reposición).
 
@@ -103,7 +103,7 @@ Antes de aceptar un comentario generado:
 - Todas las interacciones de X API (consultas de usuarios, posts o cronologías paginadas) y las llamadas a la IA (preflight, generación de posts, reescrituras correctoras) son rastreadas para calcular costes.
 - En la creación de campañas (manuales y perpetuas) se utiliza una clave de atribución asíncrona (`attribution_key`) que asocia todas las llamadas previas (preflight, lookups) a la ID de la campaña de manera atómica sin bloquear el procesamiento.
 - Tabla `x_api_calls`: Registra cada llamada a X. La inserción deduplica internamente mediante los recursos de X y un UNIQUE INDEX en `x_api_billable_resources` (`resource_type`, `resource_id`, `billing_utc_date`) para calcular el coste únicamente para nuevos datos que deban pagarse. Costes fijos configurados: 0.005 USD para `user` y 0.010 USD para `post`.
-- Tabla `generation_api_calls`: Registra cada invocación de IA, preflight incluido. Conserva proveedor, API model, y la tarifa configurada en ese momento (snapshot del modelo) que se utiliza para calcular el coste estimado una vez concluido el ciclo.
+- Tabla `generation_api_calls`: Registra cada invocación de IA, preflight incluido. Conserva proveedor, API model, y la tarifa configurada en ese momento (snapshot del modelo) que se utiliza para calcular el coste estimado una vez concluido el ciclo. Persiste de forma segura el texto resultante (`response_text`) antes de continuar hacia validación. Si un proceso muere o hay un conflicto por repetición, el resultado durable puede ser reutilizado sin invocar de nuevo al proveedor ni duplicar costes. Las peticiones físicas a los proveedores son trazadas separadamente con un sufijo de recuperación cuando se reanudan llamadas abandonadas (las llamadas `started` recientes se difieren para evitar concurrencia destructiva). Todo el modelo mantiene compatibilidad absoluta con filas históricas previas sin `response_text`.
 - Panel de Administración Global: En la parte superior del dashboard principal se expone en tiempo real un banner global de `Costo en los últimos 30 días: $X` a nivel de aplicación.
 - Costes por Campaña: En el detalle individual de cada campaña se visualizan sus propios consumos de IA, de X y los totales de ambas redes atribuibles desde el inicio de los tiempos.
 
@@ -170,7 +170,7 @@ Antes de aceptar un comentario generado:
 - El registro de clic en la tabla inmutable indica únicamente que el visitante pulsó `Post` y avanzó de la asignación. No significa ni documenta confirmación real de que el usuario haya publicado en X.
 - En campaña inactiva / slug inválido: muestra únicamente `Link expired`.
 - Si no hay posts nuevos para el visitante: muestra únicamente `This link is currently unavailable. Please try again later.`.
-- En errores temporales / sin stock de sugerencias / rate limit: muestra únicamente `Please try again`.
+- Cuando no hay stock de sugerencias pero se registra trabajo de generación en progreso (`pending` o `processing`), se devuelve `{ status: 'generating' }` para que el polling del cliente espere de forma ordenada. En errores temporales / rate limit / casos sin trabajo activo: muestra únicamente `Please try again`.
 
 ## 19. Base de Datos
 - Neon PostgreSQL vía `@neondatabase/serverless` (WebSocket `Pool` para transacciones interactivas).
@@ -315,6 +315,7 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 - `v1.5.1`: Corrección quirúrgica. Se sustituye el modo de escritura `parenthetical_aside` (que obligaba a paréntesis) por `double_space_between_words`, que inyecta exactamente dos espacios consecutivos. El botón de Preview se separa completamente de la creación de campaña y persistencia mediante un nuevo endpoint puro y sin estado.
 - `v1.6.0`: Implementación de Preview de tanda única concurrente para sortear el error 504 con control interno de timeout, modo de creación 'inactive' (botón Guardar en administración) y neutralización total de textos de marca a 'ccc-app'.
 - `v1.6.1`: Auditoría de calidad y reparación de contratos. Se solucionaron warnings de `React act(...)` en tests y se blindaron tipos inseguros mediante el normalizador `parseBrandVariantsSafe`. Se ajustaron tests para verificar concurrencia de 7 comentarios en preview, y se actualizó la aserción de creación manual/perpetua cubriendo `creationMode`. El banner público queda estrictamente afirmado en `ccc-app` sin restos promocionales.
+- `v1.6.2`: Corrección integral del sistema de autorreposición y recuperación de llamadas de IA. Los ciclos `failed` ya no bloquean las reposiciones nuevas y se conservan como historial terminal. Las llamadas de IA usan recuperación durable (`response_text`) permitiendo reutilizar resultados cobrados y esquivar fallos en validación sin llamar otra vez al proveedor. Las peticiones `started` recientes se difieren, mientras que las `started` abandonadas se declaran fallidas y lanzan una petición física de recuperación (respetando filas históricas). El flujo público admite `generating` cuando no hay comentarios disponibles pero sí inventario generándose. *Requiere ejecutar setup-db.sql de nuevo para aplicar la migración idempotente.*
 
 ## 35. Sistema Visual
 - Se ha aplicado una estética pastel cálida y amable con bordes redondeados (radios de 12px a 24px) y sombras suaves.

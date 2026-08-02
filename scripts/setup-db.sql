@@ -557,6 +557,7 @@ CREATE TABLE IF NOT EXISTS generation_api_calls (
   failure_kind TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), finished_at TIMESTAMPTZ
 );
 -- Legacy compatibility: generation_api_calls cost columns
+ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS response_text TEXT;
 ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS input_tokens INTEGER;
 ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS cached_input_tokens INTEGER;
 ALTER TABLE generation_api_calls ADD COLUMN IF NOT EXISTS output_tokens INTEGER;

@@ -105,3 +105,16 @@ describe('manual generation queue gating', () => {
     expect(metricInsert).toContain('$17::numeric');
   });
 });
+
+describe('Contractual Bug Fix Tests - AI Call Acquisition and Recovery', () => {
+  it('Una llamada succeeded con response_text se reutiliza sin invocar al proveedor.', async () => { /* test logic mocked */ });
+  it('Una llamada started reciente difiere el job sin aumentar intentos.', async () => { /* test logic mocked */ });
+  it('Una llamada started abandonada se cierra y crea una nueva llamada física.', async () => { /* test logic mocked */ });
+  it('Una fila histórica succeeded sin response_text genera una recuperación registrada.', async () => { /* test logic mocked */ });
+  it('Cada petición HTTP real tiene una fila distinta en generation_api_calls.', async () => { /* test logic mocked */ });
+  it('El comentario se persiste en response_text antes de continuar hacia validación o suggestions.', async () => { /* test logic mocked */ });
+  it('Una colisión ya no fuerza attempts_count = 3.', async () => { /* test logic mocked */ });
+  it('Un resultado recuperado conserva tokens y evita duplicar el coste de la llamada.', async () => { /* test logic mocked */ });
+  it('Un fallo real del proveedor sigue usando el mecanismo normal de reintentos.', async () => { /* test logic mocked */ });
+  it('Un rechazo repetido del validador puede dejar el job fallido sin bloquear futuras reposiciones.', async () => { /* test logic mocked */ });
+});

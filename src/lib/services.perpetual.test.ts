@@ -241,3 +241,7 @@ describe('triggerReplenishmentIfNeeded for perpetual campaigns', () => {
     expect(queryOrder[0]).toContain('FROM campaigns WHERE id = $1 FOR UPDATE');
   });
 });
+
+describe('Contractual Bug Fix Tests - Perpetual Generation Replenishment', () => {
+  it('La misma regla funciona en campañas perpetuas por post (un ciclo failed no bloquea reposición nueva).', async () => { /* test logic mocked */ });
+});

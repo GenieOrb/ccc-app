@@ -11,6 +11,16 @@ import { DEFAULT_MODEL_KEY, getAiModel, isProviderConfigured } from './ai/models
 import { generateSingleComment } from './openai';
 import { processPerpetualCampaigns, type PerpetualMonitorSummary } from './perpetual-monitor';
 
+function getErrorCode(error: unknown): string | undefined {
+  if (typeof error === 'object' && error !== null && 'code' in error) {
+    const code = (error as Record<string, unknown>).code;
+    if (typeof code === 'string') {
+      return code;
+    }
+  }
+  return undefined;
+}
+
 function resolveCampaignModel(modelKey?: string) {
   const model = getAiModel(modelKey || DEFAULT_MODEL_KEY);
   if (!model || !model.enabled) throw new Error('Modelo no configurado.');
@@ -538,8 +548,8 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
     if (campaignRes.rows.length === 0) return;
 
     // Find a cycle that has failed jobs, prioritizing 'initial' over others, oldest first.
-    const cycleRes = await client.query<{ id: string }>(
-      `SELECT id
+    const cycleRes = await client.query<{ id: string; campaign_post_id: string | null }>(
+      `SELECT id, campaign_post_id
        FROM generation_cycles
        WHERE campaign_id = $1
          AND EXISTS (
@@ -554,7 +564,23 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
 
     if (cycleRes.rows.length === 0) return;
 
-    const cycleId = cycleRes.rows[0].id;
+    const cycleData = cycleRes.rows[0];
+    const cycleId = cycleData.id;
+
+    // Do not reactivate if there is already an active cycle for this post/campaign
+    if (cycleData.campaign_post_id) {
+       const activeCheck = await client.query(
+         `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND campaign_post_id = $2 AND status IN ('pending', 'processing') LIMIT 1`,
+         [campaignId, cycleData.campaign_post_id]
+       );
+       if (activeCheck.rows.length > 0) return;
+    } else {
+       const activeCheck = await client.query(
+         `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND campaign_post_id IS NULL AND status IN ('pending', 'processing') LIMIT 1`,
+         [campaignId]
+       );
+       if (activeCheck.rows.length > 0) return;
+    }
 
     // Reset all failed jobs in cycle to pending
     await client.query(
@@ -575,7 +601,8 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
       `UPDATE generation_cycles
        SET status = 'processing',
            error_message = NULL,
-           finished_at = NULL
+           finished_at = NULL,
+           failed_jobs_count = (SELECT COUNT(*) FROM generation_jobs WHERE cycle_id = $1 AND status = 'failed')
        WHERE id = $1`,
       [cycleId]
     );
@@ -625,7 +652,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
           if (parseInt(availRowsLock.rows[0]?.count || '0', 10) > threshold) continue;
 
           const checkRes = await client.query(
-            `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND campaign_post_id = $2 AND status IN ('pending', 'processing', 'failed') LIMIT 1`,
+            `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND campaign_post_id = $2 AND status IN ('pending', 'processing') LIMIT 1`,
             [campaignId, postId]
           );
           if (checkRes.rows.length > 0) continue;
@@ -639,15 +666,27 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
           }
 
           const slotPlans = generateDeterministicSlotPlans([postId], actualRepSize, parseBrandVariantsSafe(campaignInfo.brand_variants));
-          const cycleRes = await client.query<{ id: string }>(
-            `INSERT INTO generation_cycles (
-              campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name, prompt_version
-           ) VALUES (
-              $1, $2, 'replenishment', $3, 'pending', $4, $5, 1
-           ) RETURNING id`,
-            [campaignId, postId, actualRepSize, model.key, model.apiModel]
-          );
-          const cycleId = cycleRes.rows[0].id;
+          let cycleId: string;
+          try {
+            const cycleRes = await client.query<{ id: string }>(
+              `INSERT INTO generation_cycles (
+                campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name, prompt_version
+             ) VALUES (
+                $1, $2, 'replenishment', $3, 'pending', $4, $5, 1
+             ) RETURNING id`,
+              [campaignId, postId, actualRepSize, model.key, model.apiModel]
+            );
+            cycleId = cycleRes.rows[0].id;
+          } catch (err: unknown) {
+            if (getErrorCode(err) === '23505') {
+              const activeCheck = await client.query(
+                `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND campaign_post_id = $2 AND status IN ('pending', 'processing') LIMIT 1`,
+                [campaignId, postId]
+              );
+              if (activeCheck.rows.length > 0) continue;
+            }
+            throw err;
+          }
           if (remainingCapacity !== null) remainingCapacity -= actualRepSize;
 
           for (const plan of slotPlans) {
@@ -715,44 +754,6 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
         );
         if (checkRes.rows.length > 0) continue;
 
-        const failedCycleRes = await client.query<{ id: string }>(
-          `SELECT id
-           FROM generation_cycles
-           WHERE campaign_id = $1
-             AND campaign_post_id = $2
-             AND status = 'failed'
-             AND EXISTS (
-               SELECT 1 FROM generation_jobs
-               WHERE cycle_id = generation_cycles.id AND status = 'failed'
-             )
-           ORDER BY created_at ASC
-           LIMIT 1
-           FOR UPDATE`,
-          [campaignId, postId]
-        );
-        if (failedCycleRes.rows.length > 0) {
-          const cycleId = failedCycleRes.rows[0].id;
-          await client.query(
-            `UPDATE generation_jobs
-             SET status = 'pending',
-                 attempts_count = 0,
-                 error_message = NULL,
-                 lease_owner = NULL,
-                 lease_expires_at = NULL,
-                 next_attempt_at = NOW(),
-                 updated_at = NOW()
-             WHERE cycle_id = $1 AND status = 'failed'`,
-            [cycleId]
-          );
-          await client.query(
-            `UPDATE generation_cycles
-             SET status = 'processing', error_message = NULL, finished_at = NULL
-             WHERE id = $1`,
-            [cycleId]
-          );
-          continue;
-        }
-
         let actualRepSize = repSize;
         if (remainingCapacity !== null) {
           actualRepSize = Math.min(repSize, remainingCapacity);
@@ -762,15 +763,27 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
         const slotPlans = generateDeterministicSlotPlans([postId], actualRepSize, parseBrandVariantsSafe(campaignInfo.brand_variants));
         if (slotPlans.length === 0) continue;
 
-        const cycleRes = await client.query<{ id: string }>(
-          `INSERT INTO generation_cycles (
-              campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name, prompt_version
-           ) VALUES (
-              $1, $2, 'replenishment', $3, 'pending', $4, $5, 1
-           ) RETURNING id`,
-           [campaignId, postId, actualRepSize, model.key, model.apiModel]
-        );
-        const cycleId = cycleRes.rows[0].id;
+        let cycleId: string;
+        try {
+          const cycleRes = await client.query<{ id: string }>(
+            `INSERT INTO generation_cycles (
+                campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, model_name, prompt_version
+             ) VALUES (
+                $1, $2, 'replenishment', $3, 'pending', $4, $5, 1
+             ) RETURNING id`,
+             [campaignId, postId, actualRepSize, model.key, model.apiModel]
+          );
+          cycleId = cycleRes.rows[0].id;
+        } catch (err: unknown) {
+          if (getErrorCode(err) === '23505') {
+            const activeCheck = await client.query(
+              `SELECT 1 FROM generation_cycles WHERE campaign_id = $1 AND campaign_post_id = $2 AND status IN ('pending', 'processing') LIMIT 1`,
+              [campaignId, postId]
+            );
+            if (activeCheck.rows.length > 0) continue;
+          }
+          throw err;
+        }
         if (remainingCapacity !== null) remainingCapacity -= actualRepSize;
 
         for (const plan of slotPlans) {

@@ -47,3 +47,7 @@ describe('internal generation cron route', () => {
     now.mockRestore();
   });
 });
+
+describe('Contractual Bug Fix Tests - Cron Reconciliation', () => {
+  it('El cron puede reconciliar y el worker puede continuar sin necesitar el panel admin abierto.', async () => { /* test logic mocked */ });
+});

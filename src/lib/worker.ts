@@ -250,21 +250,65 @@ async function executeJobTask(
       if (deadline - Date.now() <= WORKER_DURABLE_WRITE_RESERVE_MS) {
         throw new Error('Worker time budget exhausted before provider request.');
       }
-      const callKey = `${job.jobId}:${job.attemptsCount + 1}:${++apiCallSequence}`;
+      apiCallSequence++;
+      const logicalCallKey = `${job.jobId}:${job.attemptsCount + 1}:${apiCallSequence}`;
       const purpose = rewriteFeedback ? 'rewrite' : provider === job.provider ? 'generation' : 'fallback';
-      const acquired = await queryDb<{ call_key: string }>(
-        `INSERT INTO generation_api_calls (call_key,campaign_id,campaign_post_id,cycle_id,job_id,purpose,provider,model_key,api_model,status,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'started',$10,$11,$12,$13)
-         ON CONFLICT (call_key) DO NOTHING
-         RETURNING call_key`,
-        [callKey, job.campaignId, job.campaignPostId, job.cycleId, job.jobId, purpose, provider, modelKey, apiModel, prices.input, prices.cached ?? null, prices.output, job.pricingCurrency],
-      );
-      // A conflicting key has no durable provider result.  Retrying the HTTP
-      // request here would create an unaccounted duplicate, so leave the job
-      // for its normal durable retry path instead.
-      if (Array.isArray(acquired) && acquired.length === 0) {
-        throw new Error('AI call acquisition conflict; no durable result is available.');
+
+      const result = await withTransaction(async (client) => {
+        const existingRes = await client.query<{ call_key: string, status: string, response_text: string | null, created_at: Date, input_tokens: number | null, cached_input_tokens: number | null, output_tokens: number | null }>(
+           `SELECT call_key, status, response_text, created_at, input_tokens, cached_input_tokens, output_tokens
+            FROM generation_api_calls
+            WHERE call_key = $1 OR call_key LIKE $2
+            ORDER BY created_at DESC
+            LIMIT 1 FOR UPDATE`,
+           [logicalCallKey, `${logicalCallKey}:recovery:%`]
+        );
+
+        let physicalCallKey = logicalCallKey;
+
+        if (existingRes.rows.length > 0) {
+           const existing = existingRes.rows[0];
+
+           if ((existing.status === 'succeeded' || existing.status === 'usage_unknown') && existing.response_text !== null) {
+              return {
+                 comment: existing.response_text,
+                 usage: {
+                   inputTokens: existing.input_tokens ?? undefined,
+                   cachedInputTokens: existing.cached_input_tokens ?? undefined,
+                   outputTokens: existing.output_tokens ?? undefined
+                 }
+              };
+           }
+
+           if (existing.status === 'started') {
+              const ageMs = Date.now() - existing.created_at.getTime();
+              if (ageMs < 180_000) {
+                 throw new Error('DEFERRED_STARTED_CALL');
+              } else {
+                 await client.query(
+                   `UPDATE generation_api_calls SET status = 'failed', failure_kind = 'orphaned_started', finished_at = NOW() WHERE call_key = $1`,
+                   [existing.call_key]
+                 );
+                 physicalCallKey = `${logicalCallKey}:recovery:${randomUUID()}`;
+              }
+           } else {
+              physicalCallKey = `${logicalCallKey}:recovery:${randomUUID()}`;
+           }
+        }
+
+        await client.query(
+          `INSERT INTO generation_api_calls (call_key,campaign_id,campaign_post_id,cycle_id,job_id,purpose,provider,model_key,api_model,status,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'started',$10,$11,$12,$13)`,
+          [physicalCallKey, job.campaignId, job.campaignPostId, job.cycleId, job.jobId, purpose, provider, modelKey, apiModel, prices.input, prices.cached ?? null, prices.output, job.pricingCurrency]
+        );
+        return { physicalCallKey };
+      });
+
+      if ('comment' in result) {
+         return result as { comment: string, usage?: { inputTokens?: number, cachedInputTokens?: number, outputTokens?: number } };
       }
+
+      const callKey = result.physicalCallKey;
       try {
         const providerTimeoutMs = Math.floor(deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS);
         if (providerTimeoutMs <= 0) {
@@ -276,8 +320,8 @@ async function executeJobTask(
           ? ((callUsage.inputTokens ?? 0) - (callUsage.cachedInputTokens ?? 0)) * prices.input / 1_000_000 + (callUsage.cachedInputTokens ?? 0) * (prices.cached ?? prices.input) / 1_000_000 + (callUsage.outputTokens ?? 0) * prices.output / 1_000_000
           : null;
         await queryDb(
-          `UPDATE generation_api_calls SET status = $2, input_tokens = $3, cached_input_tokens = $4, output_tokens = $5, estimated_cost = $6, finished_at = NOW() WHERE call_key = $1`,
-          [callKey, callUsage ? 'succeeded' : 'usage_unknown', callUsage?.inputTokens ?? null, callUsage?.cachedInputTokens ?? null, callUsage?.outputTokens ?? null, estimatedCost],
+          `UPDATE generation_api_calls SET status = $2, response_text = $3, input_tokens = $4, cached_input_tokens = $5, output_tokens = $6, estimated_cost = $7, finished_at = NOW() WHERE call_key = $1`,
+          [callKey, callUsage ? 'succeeded' : 'usage_unknown', generated.comment, callUsage?.inputTokens ?? null, callUsage?.cachedInputTokens ?? null, callUsage?.outputTokens ?? null, estimatedCost],
         );
         return generated;
       } catch (error) {
@@ -445,11 +489,8 @@ async function executeJobTask(
     return { success: true };
   } catch (error: unknown) {
     const errorMsg = (error instanceof Error ? error.message : 'Unknown generation error').slice(0, 300);
-    // A duplicate acquisition is ambiguous: another worker may already have
-    // sent the request.  Do not create a fresh call key on retry, because the
-    // first request has no durable result to safely recover from.
-    const acquisitionConflict = errorMsg.startsWith('AI call acquisition conflict');
-    const newAttemptCount = acquisitionConflict ? 3 : job.attemptsCount + 1;
+    const isDeferred = errorMsg === 'DEFERRED_STARTED_CALL';
+    const newAttemptCount = isDeferred ? job.attemptsCount : job.attemptsCount + 1;
 
     await withTransaction(async (client) => {
       if (newAttemptCount >= 3) {
@@ -496,7 +537,7 @@ async function executeJobTask(
         }
       } else {
         // Schedule retry with exponential backoff + jitter
-        const backoffSeconds = Math.min(300, Math.pow(2, newAttemptCount) * 5 + Math.floor(Math.random() * 3));
+        const backoffSeconds = isDeferred ? 5 : Math.min(300, Math.pow(2, newAttemptCount) * 5 + Math.floor(Math.random() * 3));
         await client.query(
           `UPDATE generation_jobs
            SET status = 'pending',
@@ -508,12 +549,12 @@ async function executeJobTask(
                updated_at = NOW()
            WHERE id = $3 AND status = 'processing' AND lease_owner = $4 AND lease_expires_at > NOW()
            RETURNING id`,
-          [newAttemptCount, errorMsg, job.jobId, workerId]
+          [newAttemptCount, isDeferred ? 'Deferred due to recent started call' : errorMsg, job.jobId, workerId]
         );
       }
     });
 
-    return { success: false, error: errorMsg };
+    return { success: false, error: isDeferred ? 'deferred' : errorMsg };
   }
 }
 
