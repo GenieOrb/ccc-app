@@ -21,25 +21,42 @@ export async function generateMemeImage(
   analysis: MemePreflightAnalysis,
   modelKey: string,
   assetData?: { buffer: Buffer; mimeType: string; instruction?: string },
-  deadline?: number
+  regenerateInstruction?: string
 ): Promise<MemeGenerationResult> {
   const modelDef = resolveImageModel(modelKey);
-  const reqOpts = requestOptionsForDeadline(deadline);
+  const reqOpts = requestOptionsForDeadline();
 
-  const prompt = `Create a meme image based on this concept:
-Concept: ${analysis.concept}
-Mechanism: ${plan.mechanism}
-Format: ${plan.format}
-Tone: ${plan.tone}
-${analysis.suggested_text_top ? `Top Text: "${analysis.suggested_text_top}"` : ''}
-${analysis.suggested_text_bottom ? `Bottom Text: "${analysis.suggested_text_bottom}"` : ''}
+  const basePrompt = `Create a viral meme image based on this analysis:
+Target Audience: ${analysis.a_quien_va_dirigido}
+Conflict/Contradiction: ${analysis.conflicto_o_contradiccion}
+Visual Scene: ${analysis.escena_representada}
+Core Joke: ${analysis.nucleo_del_chiste}
+Archetype: ${analysis.arquetipo_de_meme_mas_adecuado}
+Main Focus: ${analysis.que_elemento_visual_debe_ser_el_foco_principal}
+
+Deterministic Constraints:
+- Text Quantity: ${plan.textQuantity} (If 'no_text', DO NOT RENDER ANY TEXT. If 'short_text', MAXIMUM 5 WORDS TOTAL).
+- Visual Structure: ${plan.visualStructure}
+- Humor Tone: ${plan.humorTone}
+- Scene Complexity: ${plan.sceneComplexity}
 
 IMPORTANT GUIDELINES:
-- No text in the image unless strictly necessary for the meme format.
-- Ensure the image matches the tone and visual style precisely.
+- NO ads.
+- NO infographic.
+- NO presentation.
+- NO explainer graphic.
+- NO product sheet.
+- NO multi-paragraph text.
+- NO tiny unreadable text.
+- NO more than one main joke.
+- AVOID visual clutter.
+- Must be comprehensible on mobile in less than 2 seconds.
 ${plan.requiresAsset ? `- The meme MUST feature the provided brand asset visually integrated.` : ''}
-${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''}
-`;
+${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''}`;
+
+  const prompt = regenerateInstruction 
+    ? `${basePrompt}\n\nCORRECTION INSTRUCTION (CRITICAL):\n${regenerateInstruction}`
+    : basePrompt;
 
   if (modelDef.provider === 'openai') {
     const client = getOpenAIClient('openai');
@@ -47,7 +64,6 @@ ${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''
     
     try {
       if (plan.requiresAsset && assetData) {
-        // Usa image edit si hay asset de referencia
         const file = await toFile(assetData.buffer, 'reference.png', { type: assetData.mimeType });
         const response = await client.images.edit(
           {
@@ -66,7 +82,6 @@ ${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''
         }
         b64 = response.data[0].b64_json;
       } else {
-        // Generación normal
         const response = await client.images.generate(
           {
             model: modelDef.apiModel,

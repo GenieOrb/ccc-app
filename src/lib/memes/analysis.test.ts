@@ -38,10 +38,15 @@ describe('performMemeAnalysis', () => {
 
     mockGenerateContent.mockResolvedValue({
       text: JSON.stringify({
-        concept: 'test concept',
-        subject_type: 'reaction_face',
-        visual_style: 'photorealistic',
-        tone: 'humorous',
+        a_quien_va_dirigido: 'test',
+        conflicto_o_contradiccion: 'test',
+        escena_representada: 'test',
+        como_se_relaciona_la_imagen_con_el_post_y_la_direccion: 'test',
+        nucleo_del_chiste: 'test core joke',
+        disparador_emocional: 'test',
+        arquetipo_de_meme_mas_adecuado: 'test',
+        que_elemento_visual_debe_ser_el_foco_principal: 'test',
+        riesgos_de_sobrecarga_o_de_que_el_meme_necesite_demasiada_explicacion: 'test',
         requires_asset: false
       })
     });
@@ -52,7 +57,7 @@ describe('performMemeAnalysis', () => {
       availableAssets: []
     });
 
-    expect(result.concept).toBe('test concept');
+    expect(result.nucleo_del_chiste).toBe('test core joke');
     expect(mockGenerateContent).toHaveBeenCalledWith({
       model: 'gemini-3.1-flash-lite',
       contents: expect.stringContaining('test post'),

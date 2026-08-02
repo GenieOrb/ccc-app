@@ -76,7 +76,7 @@ export async function POST(req: Request) {
     // Handle DB draft ID
     if (!draftId) {
       const draftRes = await queryDb<{ id: string }>(
-        `INSERT INTO meme_drafts (status, expires_at) VALUES ('active', NOW() + INTERVAL '2 hours') RETURNING id`
+        `INSERT INTO meme_drafts (status, config, inputs_digest, expires_at) VALUES ('active', '{}'::jsonb, '', NOW() + INTERVAL '2 hours') RETURNING id`
       );
       draftId = draftRes[0].id;
     }

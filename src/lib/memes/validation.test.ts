@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { validateMemeImage } from './validation';
 import * as config from '../config';
 import { GoogleGenAI } from '@google/genai';
+import { MemeSlotPlan } from './planner';
 
 vi.mock('../config');
 
@@ -43,10 +44,23 @@ describe('validateMemeImage', () => {
       })
     });
 
+    const plan: MemeSlotPlan = {
+      plannerVersion: 2,
+      seed: 'test',
+      slotIndex: 0,
+      textQuantity: 'short_text',
+      visualStructure: 'single_scene',
+      humorTone: 'subtle',
+      postRelationship: 'direct_reaction',
+      sceneComplexity: 'simple',
+      requiresAsset: false,
+      deliveryOrder: 0
+    };
+
     const result = await validateMemeImage(
       Buffer.from('fake image'),
       'image/jpeg',
-      { format: 'square', tone: 'humorous' },
+      plan,
       'test direction'
     );
 
@@ -58,7 +72,7 @@ describe('validateMemeImage', () => {
         expect.objectContaining({
           role: 'user',
           parts: expect.arrayContaining([
-            expect.objectContaining({ text: 'Verifica esta imagen generada.' }),
+            expect.objectContaining({ text: expect.stringContaining('Verifica esta imagen generada bajo las estrictas reglas de rechazo') }),
             expect.objectContaining({ inlineData: { data: expect.any(String), mimeType: 'image/jpeg' } })
           ])
         })

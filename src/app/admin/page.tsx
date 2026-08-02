@@ -663,8 +663,8 @@ export default function AdminDashboardPage() {
       if (data?.models) {
         setImageModels(data.models);
         const available = data.models.filter((m: { key: string; enabled: boolean; configured: boolean; }) => m.enabled && m.configured);
-        setMemeModelKey((prev: string) => {
-          if (prev && prev !== 'dall-e-3' && available.some((m: { key: string; }) => m.key === prev)) return prev;
+        setMemeModelKey(prev => {
+          if (prev && available.some((m: { key: string; }) => m.key === prev)) return prev;
           const defaultKey = 'gemini-3.1-flash-image';
           if (available.some((m: { key: string; }) => m.key === defaultKey)) return defaultKey;
           if (available.length > 0) return available[0].key;
@@ -683,8 +683,7 @@ export default function AdminDashboardPage() {
   const [includeMemes, setIncludeMemes] = useState(true);
   const [memePercentage, setMemePercentage] = useState('25');
   const [memeModelKey, setMemeModelKey] = useState('');
-  const [checkingMemeModel, setCheckingMemeModel] = useState(false);
-  const [memeModelCheckResult, setMemeModelCheckResult] = useState<{ success: boolean; message: string } | null>(null);
+
 
   const [draftId, setDraftId] = useState<string | null>(null);
   const [memeAssets, setMemeAssets] = useState<Array<{
@@ -704,29 +703,6 @@ export default function AdminDashboardPage() {
   const [previewFormError, setPreviewFormError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [brandVariants, setBrandVariants] = useState<Array<{value: string, percentage: number}>>([]);
-
-  const handleCheckMemeModel = async () => {
-    if (!memeModelKey) return;
-    setCheckingMemeModel(true);
-    setMemeModelCheckResult(null);
-    try {
-      const res = await fetch('/api/admin/image-models/check', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ modelKey: memeModelKey })
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setMemeModelCheckResult({ success: data.success, message: data.message || data.error });
-      } else {
-        setMemeModelCheckResult({ success: false, message: data.error || 'Error desconocido al verificar' });
-      }
-    } catch (e: unknown) {
-      setMemeModelCheckResult({ success: false, message: e instanceof Error ? e.message : 'Error de red' });
-    } finally {
-      setCheckingMemeModel(false);
-    }
-  };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1261,22 +1237,7 @@ export default function AdminDashboardPage() {
                         </option>
                       ))}
                     </select>
-                    <div style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                      <button 
-                        type="button" 
-                        onClick={handleCheckMemeModel} 
-                        disabled={checkingMemeModel || creating || !memeModelKey} 
-                        className="btn-admin btn-secondary"
-                        style={{ padding: '4px 8px', fontSize: '0.85em' }}
-                      >
-                        {checkingMemeModel ? 'Verificando...' : 'Probar acceso'}
-                      </button>
-                      {memeModelCheckResult && (
-                        <span style={{ fontSize: '0.85em', color: memeModelCheckResult.success ? 'green' : 'red' }}>
-                          {memeModelCheckResult.message}
-                        </span>
-                      )}
-                    </div>
+
                   </div>
                   
                   <div style={{ marginTop: '16px', borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>

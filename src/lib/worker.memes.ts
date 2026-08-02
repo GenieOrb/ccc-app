@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { queryDb, withTransaction } from './db';
 import { uploadGeneratedMeme } from './memes/blob';
 import { performMemeAnalysis } from './memes/analysis';
-import { generateMemeImage } from './memes/generation';
+import { generateMemeImage, MemeGenerationResult } from './memes/generation';
 import { validateMemeImage } from './memes/validation';
 import { MemeSlotPlan } from './memes/planner';
 import { ImageModelDefinition } from './ai/image-models';
@@ -64,7 +64,7 @@ export async function processMemeBackgroundQueue(
     }
 
     const settled = await Promise.allSettled(
-      claimedJobs.map((job) => executeMemeJobTask(job, workerId, deadline))
+      claimedJobs.map((job) => executeMemeJobTask(job, workerId))
     );
 
     const results = settled.map((result) => result.status === 'fulfilled'
@@ -183,8 +183,7 @@ async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null
 
 async function executeMemeJobTask(
   job: MemeClaimedJob,
-  workerId: string,
-  deadline: number
+  workerId: string
 ): Promise<{ success: boolean; error?: string; metrics: { regenerations: number, validMemes: number, cost: number, boundedErrors: number } }> {
   const metrics = { regenerations: 0, validMemes: 0, cost: 0, boundedErrors: 0 };
   let currentCost = 0;
@@ -235,14 +234,13 @@ async function executeMemeJobTask(
     }
 
     // 2. GENERATE MEME IMAGE
-    let generation;
+    let generation: MemeGenerationResult;
     try {
       generation = await generateMemeImage(
         job.slotPlan,
         analysis,
         job.modelSnapshot.key,
-        assetData,
-        deadline
+        assetData
       );
       currentCost += parseFloat(generation.cost);
       metrics.cost = currentCost;
@@ -270,12 +268,13 @@ async function executeMemeJobTask(
       
       // Intentamos otra vez
       try {
+        const regenerateInstruction = `FAILED VALIDATION REASON: ${validation.reason}\n\nCRITICAL: Simplify radically, remove all explanations, remove extra labels, reduce scene complexity, express one immediate visual joke. Do NOT render text if no_text was specified!`;
         generation = await generateMemeImage(
           job.slotPlan,
           analysis,
           job.modelSnapshot.key,
           assetData,
-          deadline
+          regenerateInstruction
         );
         currentCost += parseFloat(generation.cost);
         metrics.cost = currentCost;

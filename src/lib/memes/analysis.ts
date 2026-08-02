@@ -6,14 +6,17 @@ import { Type, GoogleGenAI } from '@google/genai';
 import { getConfig } from '../config';
 
 export const MemePreflightAnalysisSchema = z.object({
-  concept: z.string().describe("Idea general del meme y cómo se relaciona con el post original o la campaña."),
-  subject_type: z.enum(['brand_product', 'fictional_character', 'abstract_concept', 'text_only', 'reaction_face', 'animal']),
-  visual_style: z.enum(['photorealistic', 'cartoon', 'illustration', '3d_render', 'pixel_art', 'mixed_media', 'lo-fi']),
-  tone: z.enum(['humorous', 'sarcastic', 'wholesome', 'edgy', 'surreal', 'informative', 'ironic']),
-  suggested_text_top: z.string().optional().describe("Texto superior sugerido para el meme (opcional, máximo 5-7 palabras)."),
-  suggested_text_bottom: z.string().optional().describe("Texto inferior sugerido (opcional, máximo 5-7 palabras)."),
+  a_quien_va_dirigido: z.string().describe("Target audience of the meme."),
+  conflicto_o_contradiccion: z.string().describe("The conflict or contradiction that makes it funny."),
+  escena_representada: z.string().describe("The visual scene to be represented."),
+  como_se_relaciona_la_imagen_con_el_post_y_la_direccion: z.string().describe("How the scene relates to the original post and campaign direction."),
+  nucleo_del_chiste: z.string().describe("The core of the visual joke."),
+  disparador_emocional: z.string().describe("The emotional trigger of the meme."),
+  arquetipo_de_meme_mas_adecuado: z.string().describe("The most suitable meme archetype."),
+  que_elemento_visual_debe_ser_el_foco_principal: z.string().describe("The main visual focus element."),
+  riesgos_de_sobrecarga_o_de_que_el_meme_necesite_demasiada_explicacion: z.string().describe("Risks of visual clutter or requiring too much explanation."),
   requires_asset: z.boolean().describe("Si el concepto requiere un activo de marca específico que se haya proveído."),
-  selected_asset_id: z.string().optional().describe("ID del asset seleccionado, si aplica y requires_asset es true."),
+  selected_asset_id: z.string().optional().describe("ID del asset seleccionado, si aplica y requires_asset es true.")
 });
 
 export type MemePreflightAnalysis = z.infer<typeof MemePreflightAnalysisSchema>;
@@ -42,31 +45,41 @@ export async function performMemeAnalysis(
     : '\n\nNo hay Brand Assets disponibles. Crea un concepto genérico independiente de assets específicos.';
 
   const systemPrompt = `Actúas como un estratega jefe de marketing viral. 
-Tu objetivo es analizar un post de la red social X y la dirección de campaña proporcionada, para conceptualizar un meme que maximice el engagement y cumpla con los objetivos de la marca.
+Tu objetivo es analizar un post de la red social X y la dirección de campaña proporcionada, para conceptualizar un meme viral que maximice el engagement.
 
-Dirección de campaña:
+Dirección de campaña (contexto interno, NO para incluir textualmente):
 ${input.campaignDirection}
 ${assetsContext}
 
 Debes estructurar tu análisis visual usando el esquema proporcionado. 
 Si decides usar un asset, asegúrate de que requires_asset sea true y selected_asset_id coincida exactamente con uno de los IDs provistos.
-Sé creativo, irreverente (si el tono lo permite) y preciso en tus instrucciones visuales.`;
+El meme debe ser extremadamente simple, visual, con una única idea principal y enfocado en la viralidad rápida. No pienses en infografías ni en explicaciones corporativas.`;
 
   const userContent = `Post original de X:\n\n${input.postText}`;
 
   const responseSchema = {
     type: Type.OBJECT,
     properties: {
-      concept: { type: Type.STRING, description: "Idea general del meme y cómo se relaciona con el post original o la campaña." },
-      subject_type: { type: Type.STRING, enum: ['brand_product', 'fictional_character', 'abstract_concept', 'text_only', 'reaction_face', 'animal'] },
-      visual_style: { type: Type.STRING, enum: ['photorealistic', 'cartoon', 'illustration', '3d_render', 'pixel_art', 'mixed_media', 'lo-fi'] },
-      tone: { type: Type.STRING, enum: ['humorous', 'sarcastic', 'wholesome', 'edgy', 'surreal', 'informative', 'ironic'] },
-      suggested_text_top: { type: Type.STRING, description: "Texto superior sugerido para el meme (opcional, máximo 5-7 palabras)." },
-      suggested_text_bottom: { type: Type.STRING, description: "Texto inferior sugerido (opcional, máximo 5-7 palabras)." },
-      requires_asset: { type: Type.BOOLEAN, description: "Si el concepto requiere un activo de marca específico que se haya proveído." },
-      selected_asset_id: { type: Type.STRING, description: "ID del asset seleccionado, si aplica y requires_asset es true." }
+      a_quien_va_dirigido: { type: Type.STRING },
+      conflicto_o_contradiccion: { type: Type.STRING },
+      escena_representada: { type: Type.STRING },
+      como_se_relaciona_la_imagen_con_el_post_y_la_direccion: { type: Type.STRING },
+      nucleo_del_chiste: { type: Type.STRING },
+      disparador_emocional: { type: Type.STRING },
+      arquetipo_de_meme_mas_adecuado: { type: Type.STRING },
+      que_elemento_visual_debe_ser_el_foco_principal: { type: Type.STRING },
+      riesgos_de_sobrecarga_o_de_que_el_meme_necesite_demasiada_explicacion: { type: Type.STRING },
+      requires_asset: { type: Type.BOOLEAN },
+      selected_asset_id: { type: Type.STRING }
     },
-    required: ["concept", "subject_type", "visual_style", "tone", "requires_asset"]
+    required: [
+      "a_quien_va_dirigido", "conflicto_o_contradiccion", "escena_representada", 
+      "como_se_relaciona_la_imagen_con_el_post_y_la_direccion", "nucleo_del_chiste",
+      "disparador_emocional", "arquetipo_de_meme_mas_adecuado", 
+      "que_elemento_visual_debe_ser_el_foco_principal", 
+      "riesgos_de_sobrecarga_o_de_que_el_meme_necesite_demasiada_explicacion",
+      "requires_asset"
+    ]
   };
 
   try {

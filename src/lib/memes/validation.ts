@@ -5,8 +5,8 @@ import { Type, GoogleGenAI } from '@google/genai';
 import { getConfig } from '../config';
 
 export const MemeValidationSchema = z.object({
-  is_valid: z.boolean().describe("True si la imagen cumple con todos los requisitos y es segura, false de lo contrario."),
-  reason: z.string().describe("Razón de la validación o rechazo."),
+  is_valid: z.boolean().describe("True si la imagen cumple con todos los requisitos visuales, de texto y de seguridad. False si viola reglas de diseño o seguridad."),
+  reason: z.string().describe("Razón detallada de la validación o el motivo exacto del rechazo."),
 });
 
 export type MemeValidationResult = z.infer<typeof MemeValidationSchema>;
@@ -26,16 +26,33 @@ export async function validateMemeImage(
   const client = new GoogleGenAI({ apiKey: config.googleAiApiKey });
   const modelName = config.memeValidationModel || 'gemini-3.1-flash-lite';
 
-  const systemPrompt = `Eres un auditor de calidad y seguridad de marketing. 
-Tu tarea es analizar una imagen generada para un meme y asegurarte de que:
-1. No contiene texto ilegible o sin sentido (gibberish).
-2. Es segura (sin contenido NSFW, violencia o elementos inapropiados explícitos).
-3. Tiene coherencia con el formato visual: ${plan.format} y tono: ${plan.tone}.
-4. Respeta la dirección de la campaña: ${campaignDirection}
+  const systemPrompt = `Eres un estricto auditor de calidad visual y seguridad para marketing viral. 
+Tu tarea es auditar críticamente esta imagen generada y rechazarla (is_valid = false) si detectas CUALQUIERA de estos problemas:
 
-Devuelve is_valid = false si hay texto ilegible flagrante, problemas graves de seguridad, o es completamente incoherente con el estilo/tono. De lo contrario, true.`;
+REGLAS DE RECHAZO VISUAL (CRÍTICO):
+1. Demasiado texto o texto ilegible/diminuto.
+2. Texto renderizado cuando la restricción era 'no_text' (${plan.textQuantity === 'no_text' ? '¡ALERTA ROJA! Se esperaba CERO texto' : 'OK'}).
+3. Más de 5 palabras en total (cuando la restricción es 'short_text').
+4. Aspecto de infografía, presentación corporativa o anuncio publicitario.
+5. Más de una idea principal o composición visualmente recargada.
+6. Salida que vuelca textualmente la dirección de la campaña en la imagen.
+7. Parece requerir demasiada lectura o tiempo para entenderse.
 
-  const userContent = `Verifica esta imagen generada.`;
+REGLAS DE SEGURIDAD (CRÍTICO):
+8. Contenido ilegal.
+9. Odio severo.
+10. Sexual explícito no permitido.
+11. Presencia indebida de menores.
+12. Violencia gráfica extrema.
+13. Doxxing o contenido gravemente ofensivo.
+
+Dirección de Campaña (contexto): ${campaignDirection}
+Estructura Visual Esperada: ${plan.visualStructure}
+Complejidad Esperada: ${plan.sceneComplexity}
+
+Se implacable. Si la imagen parece un diagrama explicativo o tiene más de 5 palabras, recházala.`;
+
+  const userContent = `Verifica esta imagen generada bajo las estrictas reglas de rechazo.`;
   
   const base64Image = imageBuffer.toString('base64');
   const imagePart = {
@@ -48,8 +65,8 @@ Devuelve is_valid = false si hay texto ilegible flagrante, problemas graves de s
   const responseSchema = {
     type: Type.OBJECT,
     properties: {
-      is_valid: { type: Type.BOOLEAN, description: "True si la imagen cumple con todos los requisitos y es segura, false de lo contrario." },
-      reason: { type: Type.STRING, description: "Razón de la validación o rechazo." }
+      is_valid: { type: Type.BOOLEAN, description: "True si la imagen cumple con todos los requisitos visuales, de texto y de seguridad. False si viola reglas de diseño o seguridad." },
+      reason: { type: Type.STRING, description: "Razón detallada de la validación o el motivo exacto del rechazo." }
     },
     required: ["is_valid", "reason"]
   };

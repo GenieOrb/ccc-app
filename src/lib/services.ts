@@ -444,7 +444,7 @@ export async function createCampaign(params: {
              )`,
             [
               mCycleId, campaignId, plan.assignedPostId, plan.slotIndex, JSON.stringify(plan),
-              JSON.stringify({ mechanism: plan.mechanism, format: plan.format, tone: plan.tone }),
+              JSON.stringify({ text: plan.textQuantity, structure: plan.visualStructure, tone: plan.humorTone }),
               JSON.stringify(memeModel)
             ]
           );
@@ -805,7 +805,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
                        )`,
                       [
                         mCycleId, campaignId, plan.assignedPostId, plan.slotIndex, JSON.stringify(plan),
-                        JSON.stringify({ mechanism: plan.mechanism, format: plan.format, tone: plan.tone }),
+                        JSON.stringify({ text: plan.textQuantity, structure: plan.visualStructure, tone: plan.humorTone }),
                         JSON.stringify(memeModel)
                       ]
                     );
@@ -976,7 +976,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
                        )`,
                       [
                         mCycleId, campaignId, plan.assignedPostId, plan.slotIndex, JSON.stringify(plan),
-                        JSON.stringify({ mechanism: plan.mechanism, format: plan.format, tone: plan.tone }),
+                        JSON.stringify({ text: plan.textQuantity, structure: plan.visualStructure, tone: plan.humorTone }),
                         JSON.stringify(memeModel)
                       ]
                     );

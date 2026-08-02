@@ -148,7 +148,7 @@ export async function POST(req: Request) {
         );
         
         const imageBlobUrl = `data:${generation.mimeType};base64,${generation.imageBuffer.toString('base64')}`;
-        const prompt = `Concept: ${analysis.concept}\nMechanism: ${plan.mechanism}\nFormat: ${plan.format}\nTone: ${plan.tone}`;
+        const prompt = `Core Joke: ${analysis.nucleo_del_chiste}\nText: ${plan.textQuantity}\nStructure: ${plan.visualStructure}\nTone: ${plan.humorTone}`;
         
         return { imageBlobUrl, prompt, slotIndex: plan.slotIndex, dimensions: plan };
       } catch (error) {
