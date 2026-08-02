@@ -1,7 +1,7 @@
 import 'server-only';
 import { randomUUID, createHash } from 'node:crypto';
 import { queryDb, withTransaction } from './db';
-import type { PoolClient } from '@neondatabase/serverless';
+
 import { parseMultipleXUrls, fetchXPosts, resolveXUsername } from './x-api';
 import { normalizeXAccounts } from './x-accounts';
 import { checkCampaignSafety } from './openai';
@@ -1022,22 +1022,6 @@ type InternalAssignmentResponse =
   | { status: 'no_inventory'; campaignId: string }
   | { status: 'rate_limited' };
 
-async function fetchMemesForPost(client: PoolClient, campaignPostId: string): Promise<MemeAsset[]> {
-  const memesRes = await client.query<{ id: string, storage_url: string, width: number, height: number, mime_type: string, delivery_order: string }>(`
-    SELECT id, storage_url, width, height, mime_type, slot_plan->>'deliveryOrder' as delivery_order
-    FROM memes
-    WHERE campaign_post_id = $1 AND status = 'available'
-  `, [campaignPostId]);
-
-  return memesRes.rows.map((r) => ({
-    id: r.id,
-    url: r.storage_url,
-    width: r.width,
-    height: r.height,
-    mimeType: r.mime_type,
-    deliveryOrder: parseInt(r.delivery_order, 10) || 0
-  })).sort((a: MemeAsset, b: MemeAsset) => a.deliveryOrder - b.deliveryOrder);
-}
 
 export async function assignCommentToVisitor(
   slug: string,
@@ -1187,7 +1171,14 @@ export async function assignCommentToVisitor(
     );
 
     let chosenType: 'meme' | 'comment' | null = null;
-    let claimedItem: any = null;
+    let claimedItem: {
+      suggestion_id?: string;
+      meme_id?: string;
+      campaign_post_id: string;
+      comment_text?: string;
+      canonical_url: string;
+      x_post_id: string;
+    } | null = null;
 
     if (preferMeme) {
       const memeRes = await findAvailableMeme();
@@ -1300,7 +1291,7 @@ export async function assignCommentToVisitor(
         status: 'success',
         type: 'comment',
         assignmentId: newAssignmentId,
-        comment: claimedItem.comment_text,
+        comment: claimedItem.comment_text || '',
         postUrl: claimedItem.canonical_url,
         replyIntentUrl,
         isNewAssignment: true,

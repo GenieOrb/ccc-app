@@ -229,8 +229,9 @@ async function executeMemeJobTask(
       currentCost += parseFloat(generation.cost);
       metrics.cost = currentCost;
       await logCall('generation', parseFloat(generation.cost), job.modelSnapshot.provider, job.modelSnapshot.apiModel, 'succeeded');
-    } catch (e: any) {
-      await logCall('generation', 0, job.modelSnapshot.provider, job.modelSnapshot.apiModel, 'failed', e.message);
+    } catch (e: unknown) {
+      const errorMessage = e instanceof Error ? e.message : String(e);
+      await logCall('generation', 0, job.modelSnapshot.provider, job.modelSnapshot.apiModel, 'failed', errorMessage);
       throw e;
     }
 
@@ -261,8 +262,9 @@ async function executeMemeJobTask(
         currentCost += parseFloat(generation.cost);
         metrics.cost = currentCost;
         await logCall('regeneration', parseFloat(generation.cost), job.modelSnapshot.provider, job.modelSnapshot.apiModel, 'succeeded');
-      } catch (e: any) {
-        await logCall('regeneration', 0, job.modelSnapshot.provider, job.modelSnapshot.apiModel, 'failed', e.message);
+      } catch (e: unknown) {
+        const errorMessage = e instanceof Error ? e.message : String(e);
+        await logCall('regeneration', 0, job.modelSnapshot.provider, job.modelSnapshot.apiModel, 'failed', errorMessage);
         throw e;
       }
 
