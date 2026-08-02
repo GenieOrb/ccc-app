@@ -618,6 +618,23 @@ export async function runGenerationProcessing(
 }> {
   const startTime = Date.now();
   
+  if (memeCycleId) {
+    const workerMemesResult = totalBudgetMs >= MIN_MEME_WORKER_JOB_BUDGET_MS
+      ? await processMemeBackgroundQueue({
+          workerId,
+          budgetMs: totalBudgetMs,
+          cycleId: memeCycleId,
+          maxConcurrency: 1,
+          maxJobs: 3
+        })
+      : { processed: 0, completed: 0, failed: 0, skipped: 'insufficient_time_budget' };
+
+    return {
+      worker: { processed: 0, completed: 0, failed: 0, skipped: 'preview_directed_skip' },
+      workerMemes: workerMemesResult
+    };
+  }
+
   // Split budget roughly evenly if both have budget, or give all to one
   const commentBudget = Math.floor(totalBudgetMs / 2);
 
@@ -631,7 +648,6 @@ export async function runGenerationProcessing(
     ? await processMemeBackgroundQueue({
         workerId,
         budgetMs: remainingBudgetMs,
-        cycleId: memeCycleId,
         maxConcurrency: 3
       })
     : { processed: 0, completed: 0, failed: 0, skipped: 'insufficient_time_budget' };

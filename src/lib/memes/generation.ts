@@ -21,7 +21,8 @@ export async function generateMemeImage(
   analysis: MemePreflightAnalysis,
   modelKey: string,
   assetData?: { buffer: Buffer; mimeType: string; instruction?: string },
-  regenerateInstruction?: string
+  regenerateInstruction?: string,
+  options?: { signal?: AbortSignal; timeoutMs?: number }
 ): Promise<MemeGenerationResult> {
   const modelDef = resolveImageModel(modelKey);
   const reqOpts = requestOptionsForDeadline();
@@ -151,10 +152,22 @@ ${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''
 
     let response;
     try {
-      response = await ai.models.generateContent({
+      let req = ai.models.generateContent({
         model: modelDef.apiModel,
         contents: parts,
       });
+      if (options?.signal) {
+        const sig = options.signal;
+        response = (await Promise.race([
+          req,
+          new Promise<never>((_, reject) => {
+            if (sig.aborted) return reject(new Error('Aborted'));
+            sig.addEventListener('abort', () => reject(new Error('Aborted')));
+          })
+        ])) as any;
+      } else {
+        response = (await req) as any;
+      }
     } catch (error: unknown) {
       const err = error as Error & { status?: number };
       if (err.status === 403) {
@@ -167,7 +180,7 @@ ${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''
     }
 
     const candidate = response.candidates?.[0];
-    const imagePart = candidate?.content?.parts?.find(p => p.inlineData);
+    const imagePart = candidate?.content?.parts?.find((p: any) => p.inlineData);
     
     if (!imagePart || !imagePart.inlineData || !imagePart.inlineData.data) {
       throw new Error('Google GenAI returned empty image data.');

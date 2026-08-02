@@ -23,7 +23,8 @@ export interface MemeAnalysisInput {
 }
 
 export async function performMemeAnalysis(
-  input: MemeAnalysisInput
+  input: MemeAnalysisInput,
+  options?: { signal?: AbortSignal; timeoutMs?: number }
 ): Promise<MemePreflightAnalysis> {
   const config = getConfig();
   
@@ -66,7 +67,8 @@ El meme debe ser extremadamente simple, visual, con una única idea principal y 
   };
 
   try {
-    const response = await client.models.generateContent({
+    let response;
+    const req = client.models.generateContent({
       model: modelName,
       contents: userContent,
       config: {
@@ -75,6 +77,17 @@ El meme debe ser extremadamente simple, visual, con una única idea principal y 
         responseSchema: responseSchema
       }
     });
+    if (options?.signal) {
+      response = await Promise.race([
+        req,
+        new Promise<never>((_, reject) => {
+          if (options.signal!.aborted) return reject(new Error('Aborted'));
+          options.signal!.addEventListener('abort', () => reject(new Error('Aborted')));
+        })
+      ]);
+    } else {
+      response = await req;
+    }
 
     if (!response.text) {
       throw new Error('Empty response from model');

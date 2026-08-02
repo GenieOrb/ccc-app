@@ -99,11 +99,19 @@ export async function GET(req: Request, props: { params: Promise<{ draftId: stri
       [validCycleId, validDraftId]
     );
 
-    const memes = memesRows.map((m) => ({
-      id: m.id,
-      url: `/api/admin/meme-drafts/${validDraftId}/memes/${m.id}/view`,
-      plan: normalizeJsonObject(m.slot_plan)
-    }));
+    const memes = memesRows.map((m) => {
+      let plan;
+      try {
+        plan = normalizeJsonObject(m.slot_plan);
+      } catch {
+        plan = { slotIndex: 0 };
+      }
+      return {
+        id: m.id,
+        url: `/api/admin/meme-drafts/${validDraftId}/memes/${m.id}/view`,
+        plan
+      };
+    });
 
     return NextResponse.json(
       {

@@ -112,12 +112,12 @@ export async function POST(req: Request) {
 
       if (effectiveDraftId && previousDigest === inputs_digest) {
         // Reuse cycle
-        const cycleRes = await client.query(`SELECT id, status FROM meme_generation_cycles WHERE draft_id = $1 AND status IN ('pending', 'processing') LIMIT 1`, [effectiveDraftId]);
+        const cycleRes = await client.query(`SELECT id, status FROM meme_generation_cycles WHERE draft_id = $1 AND status IN ('pending', 'processing') ORDER BY created_at DESC, id DESC LIMIT 1`, [effectiveDraftId]);
         if (cycleRes.rowCount! > 0) {
            return NextResponse.json({ success: true, draftId: effectiveDraftId, cycleId: cycleRes.rows[0].id, targetCount: 3, status: cycleRes.rows[0].status });
         }
         // Check if completed 3 previews for a cycle
-        const completedCycleRes = await client.query(`SELECT id FROM meme_generation_cycles WHERE draft_id = $1 AND status = 'completed' ORDER BY created_at DESC LIMIT 1`, [effectiveDraftId]);
+        const completedCycleRes = await client.query(`SELECT id FROM meme_generation_cycles WHERE draft_id = $1 AND status = 'completed' AND valid_produced_count >= 3 ORDER BY created_at DESC, id DESC LIMIT 1`, [effectiveDraftId]);
         if (completedCycleRes.rowCount! > 0) {
            return NextResponse.json({ success: true, draftId: effectiveDraftId, cycleId: completedCycleRes.rows[0].id, targetCount: 3, status: 'completed' });
         }
@@ -217,10 +217,8 @@ export async function POST(req: Request) {
             hasInternalProcessSecret: !!process.env.INTERNAL_PROCESS_SECRET,
             hasCronSecret: !!process.env.CRON_SECRET
           });
-          return NextResponse.json(
-            { error: 'No se pudo iniciar el procesador de memes. Los trabajos quedaron pendientes y pueden reintentarse.' },
-            { status: 500, headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json' } }
-          );
+          // Fail silently regarding the trigger, cycle is already created
+          return txResult;
         }
       } catch {
         console.error('Internal generation trigger error', {
@@ -230,10 +228,8 @@ export async function POST(req: Request) {
             hasInternalProcessSecret: !!process.env.INTERNAL_PROCESS_SECRET,
             hasCronSecret: !!process.env.CRON_SECRET
         });
-        return NextResponse.json(
-          { error: 'No se pudo iniciar el procesador de memes. Los trabajos quedaron pendientes y pueden reintentarse.' },
-          { status: 500, headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json' } }
-        );
+        // Fail silently regarding the trigger
+        return txResult;
       }
     }
 

@@ -24,7 +24,8 @@ export async function validateMemeImage(
   imageBuffer: Buffer,
   mimeType: string,
   plan: MemeSlotPlan,
-  _campaignDirection: string
+  _campaignDirection: string,
+  options?: { signal?: AbortSignal; timeoutMs?: number }
 ): Promise<MemeValidationResult> {
   const config = getConfig();
   
@@ -67,7 +68,8 @@ No debes decidir si el meme es bueno o malo, solo extraer los siguientes datos c
   };
 
   try {
-    const response = await client.models.generateContent({
+    let response;
+    const req = client.models.generateContent({
       model: modelName,
       contents: [
         { role: 'user', parts: [{ text: userContent }, imagePart] }
@@ -78,6 +80,17 @@ No debes decidir si el meme es bueno o malo, solo extraer los siguientes datos c
         responseSchema: responseSchema
       }
     });
+    if (options?.signal) {
+      response = await Promise.race([
+        req,
+        new Promise<never>((_, reject) => {
+          if (options.signal!.aborted) return reject(new Error('Aborted'));
+          options.signal!.addEventListener('abort', () => reject(new Error('Aborted')));
+        })
+      ]);
+    } else {
+      response = await req;
+    }
 
     if (!response.text) {
       throw new Error('Empty response from model');
