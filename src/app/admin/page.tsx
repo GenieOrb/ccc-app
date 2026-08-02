@@ -659,7 +659,19 @@ export default function AdminDashboardPage() {
 
   useEffect(() => {
     fetch('/api/admin/models').then(r => r.ok ? r.json() : null).then(data => { if (data?.models) setModels(data.models); }).catch(() => {});
-    fetch('/api/admin/image-models').then(r => r.ok ? r.json() : null).then(data => { if (data?.models) setImageModels(data.models); }).catch(() => {});
+    fetch('/api/admin/image-models').then(r => r.ok ? r.json() : null).then(data => { 
+      if (data?.models) {
+        setImageModels(data.models);
+        const available = data.models.filter((m: { key: string; enabled: boolean; configured: boolean; }) => m.enabled && m.configured);
+        setMemeModelKey((prev: string) => {
+          if (prev && prev !== 'dall-e-3' && available.some((m: { key: string; }) => m.key === prev)) return prev;
+          const defaultKey = 'gemini-3.1-flash-image';
+          if (available.some((m: { key: string; }) => m.key === defaultKey)) return defaultKey;
+          if (available.length > 0) return available[0].key;
+          return '';
+        });
+      }
+    }).catch(() => {});
   }, []);
 
   const [urlsInput, setUrlsInput] = useState('');
@@ -670,7 +682,7 @@ export default function AdminDashboardPage() {
 
   const [includeMemes, setIncludeMemes] = useState(true);
   const [memePercentage, setMemePercentage] = useState('25');
-  const [memeModelKey, setMemeModelKey] = useState('dall-e-3');
+  const [memeModelKey, setMemeModelKey] = useState('');
 
   const [creating, setCreating] = useState(false);
   const [generatingPreview, setGeneratingPreview] = useState(false);

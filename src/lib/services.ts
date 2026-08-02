@@ -312,7 +312,7 @@ export async function createCampaign(params: {
   isInactive?: boolean;
   includeMemes?: boolean;
   memePercentage?: number;
-  memeModelKey?: string;
+  memeModelKey: string;
 }): Promise<{ id: string; slug: string }> {
   const attributionKey = randomUUID();
 
@@ -353,7 +353,7 @@ export async function createCampaign(params: {
       [
         slug, params.direction || null, maxCommentsTotal, safetyResult.category, safetyResult.reason,
         displayName, model.key, JSON.stringify(params.brandVariants || []), !params.isInactive,
-        params.includeMemes ?? true, params.memePercentage ?? 25, params.memeModelKey || 'gpt-image-2'
+        params.includeMemes ?? true, params.memePercentage ?? 25, params.memeModelKey || ''
       ]
     );
     const campaignId = campRes.rows[0].id;
@@ -418,7 +418,7 @@ export async function createCampaign(params: {
     if (params.includeMemes !== false) {
       const { resolveImageModel } = await import('./ai/image-models');
       const { generateDeterministicMemeSlotPlans } = await import('./memes/planner');
-      const memeModelKey = params.memeModelKey || 'gpt-image-2';
+      const memeModelKey = params.memeModelKey || '';
       const memeModel = resolveImageModel(memeModelKey);
 
       for (const campaignPostId of campaignPostIds) {
@@ -768,7 +768,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
             if (mCheckRes.rows.length === 0) {
               const { resolveImageModel } = await import('./ai/image-models');
               const { generateDeterministicMemeSlotPlans } = await import('./memes/planner');
-              const memeModelKey = campaignInfo.meme_model_key || 'gpt-image-2';
+              const memeModelKey = campaignInfo.meme_model_key || '';
               const memeModel = resolveImageModel(memeModelKey);
 
               let mRepSize = repSize;
@@ -939,7 +939,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
             if (mCheckRes.rows.length === 0) {
               const { resolveImageModel } = await import('./ai/image-models');
               const { generateDeterministicMemeSlotPlans } = await import('./memes/planner');
-              const memeModelKey = campaignInfo.meme_model_key || 'gpt-image-2';
+              const memeModelKey = campaignInfo.meme_model_key || '';
               const memeModel = resolveImageModel(memeModelKey);
 
               let mRepSize = repSize;
@@ -1350,7 +1350,7 @@ export async function createPerpetualCampaign(params: {
   isInactive?: boolean;
   includeMemes?: boolean;
   memePercentage?: number;
-  memeModelKey?: string;
+  memeModelKey: string;
 }): Promise<{ id: string; slug: string; initialSync: PerpetualMonitorSummary | null }> {
   const attributionKey = randomUUID();
   const normalizedAccounts = normalizeXAccounts(params.accountsInput);
@@ -1388,7 +1388,7 @@ export async function createPerpetualCampaign(params: {
       [
         slug, params.direction || null, params.postActiveLifetimeHours, maxCommentsTotal,
         displayName, model.key, JSON.stringify(params.brandVariants || []), !params.isInactive,
-        params.includeMemes ?? true, params.memePercentage ?? 25, params.memeModelKey || 'gpt-image-2'
+        params.includeMemes ?? true, params.memePercentage ?? 25, params.memeModelKey || ''
       ]
     );
     const campaignId = campRes.rows[0].id;

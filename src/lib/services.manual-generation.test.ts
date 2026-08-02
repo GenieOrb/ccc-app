@@ -73,7 +73,7 @@ describe('manual campaign generation inventory', () => {
       }),
     }));
 
-    await createCampaign({ urlsInput: 'two posts' });
+    await createCampaign({ urlsInput: 'two posts', memeModelKey: 'gemini-3.1-flash-image' });
 
     const campaignInsert = queries.find(({ sql }) => sql.includes('INSERT INTO campaigns'))!;
     expect(campaignInsert.params?.[8]).toBe(true); // is_active
@@ -151,7 +151,7 @@ describe('manual campaign generation inventory', () => {
       }),
     }));
 
-    await createCampaign({ urlsInput: 'one post', isInactive: true });
+    await createCampaign({ urlsInput: 'one post', isInactive: true, memeModelKey: 'gemini-3.1-flash-image' });
 
     const campaignInsert = queries.find(({ sql }) => sql.includes('INSERT INTO campaigns'))!;
     expect(campaignInsert.params?.[8]).toBe(false); // is_active

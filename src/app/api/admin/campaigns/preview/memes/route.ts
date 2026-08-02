@@ -34,7 +34,16 @@ export async function POST(req: Request) {
     }
 
     const { campaignType, urlsInput, accountsInput, direction, memeModelKey } = body;
-    const model = resolveImageModel(memeModelKey || 'dall-e-3');
+    if (!memeModelKey) {
+      return NextResponse.json({ error: 'Debe especificar un modelo de generación (memeModelKey).' }, { status: 400 });
+    }
+    
+    let model;
+    try {
+      model = resolveImageModel(memeModelKey);
+    } catch (e: unknown) {
+      return NextResponse.json({ error: e instanceof Error ? e.message : 'Modelo de imagen desconocido.' }, { status: 400 });
+    }
 
     let postContent: {
       post_id: string;

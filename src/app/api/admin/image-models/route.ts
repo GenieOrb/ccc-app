@@ -16,9 +16,12 @@ export async function GET() {
   const models = Object.values(IMAGE_MODELS).map((model) => {
     let configured = false;
     if (model.provider === 'openai') {
-      configured = !!config.openaiApiKey;
+      // The OpenAI SDK only supports dall-e-2 and dall-e-3 natively for images.
+      // gpt-image-2 is not a valid public model for OpenAI's generate image endpoint.
+      const supportedModels = ['dall-e-2', 'dall-e-3'];
+      configured = !!config.openaiApiKey && supportedModels.includes(model.apiModel);
     } else if (model.provider === 'google') {
-      configured = !!config.geminiApiKey;
+      configured = !!config.googleAiApiKey;
     }
     return {
       key: model.key,

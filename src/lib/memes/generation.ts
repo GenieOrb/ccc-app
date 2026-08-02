@@ -65,29 +65,27 @@ ${plan.requiresAsset ? `- The meme MUST feature the provided brand asset visuall
     };
   } else if (modelDef.provider === 'google') {
     const config = getConfig();
-    if (!config.geminiApiKey) throw new Error('GEMINI_API_KEY is not configured');
-    const ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
+    if (!config.googleAiApiKey) throw new Error('GOOGLE_AI_API_KEY is not configured');
+    const ai = new GoogleGenAI({ apiKey: config.googleAiApiKey });
     
-    // Gemini Imagen model expects aspectRatio
-    const response = await ai.models.generateImages({
+    const response = await ai.models.generateContent({
       model: modelDef.apiModel,
-      prompt: prompt,
-      config: {
-        numberOfImages: 1,
-        outputMimeType: 'image/png',
-        aspectRatio: '1:1',
-      },
+      contents: prompt,
     });
 
-    if (!response.generatedImages || !response.generatedImages[0] || !response.generatedImages[0].image || !response.generatedImages[0].image.imageBytes) {
+    const candidate = response.candidates?.[0];
+    const imagePart = candidate?.content?.parts?.find(p => p.inlineData);
+    
+    if (!imagePart || !imagePart.inlineData || !imagePart.inlineData.data) {
       throw new Error('Google GenAI returned empty image data.');
     }
-    const b64 = response.generatedImages[0].image.imageBytes;
+    const b64 = imagePart.inlineData.data;
+    const returnedMime = imagePart.inlineData.mimeType || 'image/png';
 
     const imageBuffer = Buffer.from(b64, 'base64');
     return {
       imageBuffer,
-      mimeType: 'image/png',
+      mimeType: returnedMime,
       cost: modelDef.resolutions[0].costPerImage,
       width: modelDef.defaultResolution.width,
       height: modelDef.defaultResolution.height,

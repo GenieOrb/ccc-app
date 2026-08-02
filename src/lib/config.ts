@@ -9,7 +9,7 @@ export interface AppConfig {
   deepseekBaseUrl: string;
   dashscopeApiKey: string;
   qwenBaseUrl: string;
-  geminiApiKey: string;
+  googleAiApiKey: string;
   xBearerToken: string;
   adminPasswordHash: string;
   adminSessionSecret: string;
@@ -39,7 +39,7 @@ export function getConfig(): AppConfig {
   const deepseekBaseUrl = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
   const dashscopeApiKey = process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY || '';
   const qwenBaseUrl = process.env.QWEN_BASE_URL || '';
-  const geminiApiKey = process.env.GEMINI_API_KEY || '';
+  const googleAiApiKey = process.env.GOOGLE_AI_API_KEY || '';
   const xBearerToken = process.env.X_BEARER_TOKEN || '';
   const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH || '';
   const adminSessionSecret = process.env.ADMIN_SESSION_SECRET || '';
@@ -57,7 +57,7 @@ export function getConfig(): AppConfig {
     deepseekBaseUrl,
     dashscopeApiKey,
     qwenBaseUrl,
-    geminiApiKey,
+    googleAiApiKey,
     xBearerToken,
     adminPasswordHash,
     adminSessionSecret,
