@@ -14,15 +14,18 @@ export async function GET(req: Request, props: { params: Promise<{ draftId: stri
   const { draftId, memeId } = await props.params;
 
   try {
-    const memeRes = await queryDb<{ storage_key: string, storage_url: string, mime_type: string }>(
-      `SELECT m.storage_key, m.storage_url, m.mime_type FROM memes m 
-       JOIN meme_generation_jobs j ON m.job_id = j.id
-       WHERE m.id = $1 AND j.draft_id = $2`,
+    const memeRes = await queryDb<{ storage_key: string, storage_url: string, mime_type: string, status: string }>(
+      `SELECT storage_key, storage_url, mime_type, status FROM memes
+       WHERE id = $1 AND draft_id = $2`,
       [memeId, draftId]
     );
 
     if (memeRes.length === 0) {
       return new Response('Meme no encontrado', { status: 404 });
+    }
+
+    if (memeRes[0].status !== 'preview') {
+      return new Response('Este meme ya fue promocionado a una campaña o rechazado.', { status: 403 });
     }
 
     const { storage_key, storage_url, mime_type } = memeRes[0];

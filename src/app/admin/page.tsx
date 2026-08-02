@@ -743,20 +743,29 @@ export default function AdminDashboardPage() {
     }
   };
 
-  const handleUpdateAsset = async (assetId: string, field: 'asset_type'|'appearance_percentage'|'instruction', val: string|number) => {
+  const handleUpdateAssetLocal = (assetId: string, field: 'asset_type'|'appearance_percentage'|'instruction', val: string|number) => {
     const updated = memeAssets.map(a => a.id === assetId ? { ...a, [field]: val } : a);
     setMemeAssets(updated);
-    
-    // Check percentage sum before sending (optional but good practice)
-    
+  };
+
+  const handleSaveAsset = async (assetId: string) => {
     try {
-      const asset = updated.find(a => a.id === assetId);
+      const asset = memeAssets.find(a => a.id === assetId);
       if (!asset) return;
-      await fetch(`/api/admin/meme-drafts/${draftId}/assets/${assetId}`, {
+      const sum = memeAssets.reduce((s, a) => s + (Number(a.appearance_percentage) || 0), 0);
+      if (sum > 100) {
+         // Silently ignore or show local alert, don't ping backend if sum > 100
+         return;
+      }
+      const res = await fetch(`/api/admin/meme-drafts/${draftId}/assets/${assetId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ assetType: asset.asset_type, percentage: asset.appearance_percentage, instruction: asset.instruction })
+        body: JSON.stringify({ assetType: asset.asset_type, percentage: Number(asset.appearance_percentage) || 0, instruction: asset.instruction })
       });
+      if (!res.ok) {
+        const d = await res.json();
+        console.error(d.error || 'Error guardando asset');
+      }
     } catch (e) {
       console.error(e);
     }
@@ -1290,7 +1299,8 @@ export default function AdminDashboardPage() {
                                 <select 
                                   className="form-textarea" style={{ minHeight: 'auto', padding: '4px', flex: 1 }}
                                   value={asset.asset_type}
-                                  onChange={e => handleUpdateAsset(asset.id, 'asset_type', e.target.value)}
+                                  onChange={e => handleUpdateAssetLocal(asset.id, 'asset_type', e.target.value)}
+                                  onBlur={() => handleSaveAsset(asset.id)}
                                   disabled={creating}
                                 >
                                   <option value="logo">Logo</option>
@@ -1303,8 +1313,9 @@ export default function AdminDashboardPage() {
                                 <input 
                                   type="number" min="1" max="100" 
                                   className="form-textarea" style={{ width: '80px', minHeight: 'auto', padding: '4px' }}
-                                  value={asset.appearance_percentage}
-                                  onChange={e => handleUpdateAsset(asset.id, 'appearance_percentage', parseInt(e.target.value) || 0)}
+                                  value={asset.appearance_percentage === '' as unknown as number ? '' : asset.appearance_percentage}
+                                  onChange={e => handleUpdateAssetLocal(asset.id, 'appearance_percentage', e.target.value === '' ? ('' as unknown as number) : parseInt(e.target.value) || 0)}
+                                  onBlur={() => handleSaveAsset(asset.id)}
                                   disabled={creating}
                                   title="Porcentaje de aparición"
                                 />
@@ -1315,7 +1326,8 @@ export default function AdminDashboardPage() {
                                 className="form-textarea" style={{ minHeight: 'auto', padding: '4px' }}
                                 placeholder="Instrucciones para la IA (ej. No deformar el logo)"
                                 value={asset.instruction}
-                                onChange={e => handleUpdateAsset(asset.id, 'instruction', e.target.value)}
+                                onChange={e => handleUpdateAssetLocal(asset.id, 'instruction', e.target.value)}
+                                onBlur={() => handleSaveAsset(asset.id)}
                                 disabled={creating}
                               />
                             </div>

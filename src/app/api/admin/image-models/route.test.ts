@@ -53,7 +53,7 @@ describe('GET /api/admin/image-models', () => {
     expect(flash.configured).toBe(false);
   });
 
-  it('no asume gpt-image-2 como válido', async () => {
+  it('habilita gpt-image-2 si OPENAI_API_KEY existe, sin confirmar acceso', async () => {
     vi.mocked(config.getConfig).mockReturnValue({
       databaseUrl: '', appBaseUrl: '', openaiApiKey: 'fake-openai', openaiModel: '', deepseekApiKey: '', deepseekBaseUrl: '', dashscopeApiKey: '', qwenBaseUrl: '',
       googleAiApiKey: '', xBearerToken: '', adminPasswordHash: '', adminSessionSecret: '', visitorCookieSecret: '', securityHmacSecret: '', internalProcessSecret: '', cronSecret: ''
@@ -63,6 +63,6 @@ describe('GET /api/admin/image-models', () => {
     const data = await res.json();
     
     const gpt2 = data.models.find((m: { key: string; configured: boolean; }) => m.key === 'gpt-image-2');
-    expect(gpt2.configured).toBe(false); // Because it is NOT in supportedModels for OpenAI!
+    expect(gpt2.configured).toBe(true);
   });
 });

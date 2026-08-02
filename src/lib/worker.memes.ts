@@ -102,7 +102,7 @@ async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null
 
   return await withTransaction(async (client) => {
     const selectRes = await client.query(`
-       SELECT 
+       SELECT
          j.id as job_id,
          j.cycle_id,
          j.campaign_id,
@@ -114,11 +114,11 @@ async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null
          j.asset_snapshot,
          j.model_snapshot,
          j.attempts_count,
-         COALESCE(p.text_content, md.config->>'post_text') as post_text,
-         p.author_name,
-         p.author_username,
-         p.accessible_context,
-         c.direction
+         COALESCE(p.text_content, md.config->>'postText') as post_text,
+         COALESCE(p.author_name, md.config->>'authorName') as author_name,
+         COALESCE(p.author_username, md.config->>'authorUsername') as author_username,
+         COALESCE(p.accessible_context, (md.config->>'accessibleContext')::jsonb) as accessible_context,
+         COALESCE(c.direction, md.config->>'direction') as direction
        FROM meme_generation_jobs j
        LEFT JOIN campaign_posts p ON j.campaign_post_id = p.id
        LEFT JOIN campaigns c ON j.campaign_id = c.id
@@ -142,7 +142,7 @@ async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null
     const row = selectRes.rows[0];
 
     await client.query(
-      `UPDATE meme_generation_jobs 
+      `UPDATE meme_generation_jobs
        SET status = 'processing',
            lease_owner = $1,
            lease_expires_at = NOW() + INTERVAL '${leaseDurationSeconds} seconds',
@@ -153,7 +153,7 @@ async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null
 
     // Update cycle if it's the first time
     await client.query(
-      `UPDATE meme_generation_cycles 
+      `UPDATE meme_generation_cycles
        SET status = 'processing',
            started_at = COALESCE(started_at, NOW())
        WHERE id = $1 AND status = 'pending'`,
@@ -256,14 +256,14 @@ async function executeMemeJobTask(
       job.slotPlan,
       campaignDirection
     );
-    
+
     let is_valid = validation.is_valid;
-    
+
     // Regeneración controlada
     if (!is_valid) {
       metrics.regenerations++;
       metrics.boundedErrors++;
-      
+
       // Intentamos otra vez
       try {
         const regenerateInstruction = `FAILED VALIDATION REASON: ${validation.reason}\n\nCRITICAL: Simplify radically, remove all explanations, remove extra labels, reduce scene complexity, express one immediate visual joke. Do NOT render text if no_text was specified!`;
@@ -289,13 +289,13 @@ async function executeMemeJobTask(
         job.slotPlan,
         campaignDirection
       );
-      
+
       if (!validation.is_valid) {
         throw new Error('Meme validation failed twice');
       }
       is_valid = true;
     }
-    
+
     if (is_valid) {
       metrics.validMemes = 1;
     }
@@ -314,7 +314,7 @@ async function executeMemeJobTask(
          FOR UPDATE`,
         [job.jobId, workerId]
       );
-      
+
       if (leaseRes.rows.length === 0) return; // Lease expired or taken
 
       // Verify draft or campaign is still valid
@@ -335,23 +335,28 @@ async function executeMemeJobTask(
          }
       }
 
+      const finalDraftId = job.draftId || null;
+      const finalCampaignId = job.campaignId || null;
+      const finalCampaignPostId = job.campaignPostId || null;
+      const finalStatus = finalDraftId ? 'preview' : 'available';
+
       await client.query(
         `INSERT INTO memes (
-           campaign_id, campaign_post_id, job_id,
+           draft_id, campaign_id, campaign_post_id, job_id,
            status, storage_provider, storage_key, storage_url,
            mime_type, size_bytes, width, height, sha256_hash,
-           slot_plan, model_key, accumulated_cost
+           slot_plan, model_key, accumulated_cost, delivery_order, asset_id
          ) VALUES (
-           $1, $2, $3,
-           'available', 'vercel_blob', $4, $5,
-           $6, $7, $8, $9, $10,
-           $11, $12, $13
+           $1, $2, $3, $4,
+           $5, 'vercel_blob', $6, $7,
+           $8, $9, $10, $11, $12,
+           $13, $14, $15, $16, $17
          ) RETURNING id`,
         [
-          job.campaignId, job.campaignPostId, job.jobId,
-          storageResult.pathname, storageResult.url,
+          finalDraftId, finalCampaignId, finalCampaignPostId, job.jobId,
+          finalStatus, storageResult.pathname, storageResult.url,
           generation.mimeType, generation.imageBuffer.length, generation.width, generation.height, storageResult.sha256Hash,
-          JSON.stringify(job.slotPlan), job.modelSnapshot.key, currentCost
+          JSON.stringify(job.slotPlan), job.modelSnapshot.key, currentCost, job.slotIndex, job.assetSnapshot?.id || null
         ]
       );
 
@@ -365,6 +370,16 @@ async function executeMemeJobTask(
              updated_at = NOW()
          WHERE id = $2`,
         [currentCost, job.jobId]
+      );
+
+      await client.query(
+        `UPDATE meme_generation_cycles
+         SET valid_produced_count = valid_produced_count + 1,
+             completed_jobs_count = completed_jobs_count + 1,
+             status = CASE WHEN valid_produced_count + 1 >= target_count THEN 'completed' ELSE status END,
+             finished_at = CASE WHEN valid_produced_count + 1 >= target_count THEN NOW() ELSE finished_at END
+         WHERE id = $1`,
+        [job.cycleId]
       );
     });
 
@@ -381,9 +396,21 @@ async function executeMemeJobTask(
             lease_owner = NULL,
             lease_expires_at = NULL,
             updated_at = NOW()
-        WHERE id = $3`,
+        WHERE id = $3
+        RETURNING status`,
        [err instanceof Error ? err.message : String(err), currentCost, job.jobId]
-    );
+    ).then(async (res) => {
+       if (res[0]?.status === 'failed') {
+         await queryDb(
+           `UPDATE meme_generation_cycles
+            SET failed_jobs_count = failed_jobs_count + 1,
+                status = CASE WHEN valid_produced_count + failed_jobs_count + 1 >= (SELECT COUNT(*) FROM meme_generation_jobs WHERE cycle_id = $1) THEN 'partial' ELSE status END,
+                finished_at = CASE WHEN valid_produced_count + failed_jobs_count + 1 >= (SELECT COUNT(*) FROM meme_generation_jobs WHERE cycle_id = $1) THEN NOW() ELSE finished_at END
+            WHERE id = $1`,
+           [job.cycleId]
+         );
+       }
+    });
     return { success: false, error: err instanceof Error ? err.message : String(err), metrics };
   }
 }

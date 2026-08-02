@@ -422,30 +422,62 @@ export async function createCampaign(params: {
       const memeModelKey = params.memeModelKey || '';
       const memeModel = resolveImageModel(memeModelKey);
 
-      for (const campaignPostId of campaignPostIds) {
-        const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [campaignPostId], 10, []);
+      let existingPreviewsCount = 0;
+
+      if (params.draftId) {
+         await client.query(`UPDATE meme_drafts SET status = 'converted', campaign_id = $1 WHERE id = $2`, [campaignId, params.draftId]);
+         await client.query(`UPDATE meme_assets SET draft_id = NULL, campaign_id = $1 WHERE draft_id = $2`, [campaignId, params.draftId]);
+         await client.query(`UPDATE meme_generation_cycles SET draft_id = NULL, campaign_id = $1, campaign_post_id = $3 WHERE draft_id = $2`, [campaignId, params.draftId, campaignPostIds[0]]);
+         await client.query(`UPDATE meme_generation_jobs SET draft_id = NULL, campaign_id = $1, campaign_post_id = $3 WHERE draft_id = $2`, [campaignId, params.draftId, campaignPostIds[0]]);
+
+         const memesPromoteRes = await client.query(`UPDATE memes SET draft_id = NULL, campaign_id = $1, campaign_post_id = $3, status = 'available', preview_origin_draft_id = $2 WHERE draft_id = $2 RETURNING id`, [campaignId, params.draftId, campaignPostIds[0]]);
+         existingPreviewsCount = memesPromoteRes.rowCount!;
+
+         await client.query(`UPDATE meme_api_calls SET draft_id = NULL, campaign_id = $1 WHERE draft_id = $2`, [campaignId, params.draftId]);
+      }
+
+      const remainingToGenerate = 10 - existingPreviewsCount;
+      if (remainingToGenerate > 0) {
+        // Find existing assets for the campaign
+        const assetsRes = await client.query(
+          `SELECT id, asset_type, appearance_percentage, instruction, storage_key, mime_type, sha256_hash, width, height
+           FROM meme_assets WHERE campaign_id = $1 AND status = 'active'`,
+          [campaignId]
+        );
+        const availableAssets = assetsRes.rows.map(a => ({
+          id: a.id, assetType: a.asset_type, appearancePercentage: a.appearance_percentage,
+          instruction: a.instruction, storageKey: a.storage_key, mimeType: a.mime_type,
+          sha256: a.sha256_hash, width: a.width, height: a.height
+        }));
+
+        const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [campaignPostIds[0]], remainingToGenerate, availableAssets);
         const mCycleRes = await client.query<{ id: string }>(
           `INSERT INTO meme_generation_cycles (
               campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, provider, api_model, planner_version, pricing_snapshot
            ) VALUES (
-              $1, $2, 'initial', 10, 'pending', $3, $4, $5, 1, $6::jsonb
+              $1, $2, 'initial', $3, 'pending', $4, $5, $6, 1, $7::jsonb
            ) RETURNING id`,
-          [campaignId, campaignPostId, memeModel.key, memeModel.provider, memeModel.apiModel, JSON.stringify(memeModel)]
+          [campaignId, campaignPostIds[0], remainingToGenerate, memeModel.key, memeModel.provider, memeModel.apiModel, JSON.stringify(memeModel)]
         );
         const mCycleId = mCycleRes.rows[0].id;
 
         for (const plan of memePlans) {
+          let assetSnapshot = null;
+          if (plan.requiresAsset && plan.assetId) {
+             const matched = availableAssets.find(a => a.id === plan.assetId);
+             if (matched) assetSnapshot = matched;
+          }
           await client.query(
             `INSERT INTO meme_generation_jobs (
                cycle_id, campaign_id, campaign_post_id, slot_index, slot_plan,
-               deterministic_dimensions, model_snapshot, status
+               deterministic_dimensions, model_snapshot, asset_snapshot, status
              ) VALUES (
-               $1, $2, $3, $4, $5, $6, $7, 'pending'
+               $1, $2, $3, $4, $5, $6, $7, $8, 'pending'
              )`,
             [
               mCycleId, campaignId, plan.assignedPostId, plan.slotIndex, JSON.stringify(plan),
               JSON.stringify({ text: plan.textQuantity, structure: plan.visualStructure, tone: plan.humorTone }),
-              JSON.stringify(memeModel)
+              JSON.stringify(memeModel), assetSnapshot ? JSON.stringify(assetSnapshot) : null
             ]
           );
         }
@@ -455,10 +487,9 @@ export async function createCampaign(params: {
     await client.query(`UPDATE generation_api_calls SET campaign_id = $1 WHERE attribution_key = $2 AND campaign_id IS NULL`, [campaignId, attributionKey]);
     await client.query(`UPDATE x_api_calls SET campaign_id = $1 WHERE attribution_key = $2 AND campaign_id IS NULL`, [campaignId, attributionKey]);
 
-    if (params.draftId) {
-      await client.query(`UPDATE meme_assets SET draft_id = NULL, campaign_id = $1 WHERE draft_id = $2`, [campaignId, params.draftId]);
-      await client.query(`DELETE FROM meme_drafts WHERE id = $1`, [params.draftId]);
-    }
+    // Clean up draft if provided (already handled above, but leaving this block to just return or if anything was left)
+    // Actually we just removed the delete query since the draft is now 'converted' and we shouldn't delete it.
+
 
     return { id: campaignId, slug };
   });
@@ -777,9 +808,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
               const memeModelKey = campaignInfo.meme_model_key || '';
               const memeModel = resolveImageModel(memeModelKey);
 
-              let mRepSize = repSize;
-              // Limit meme rep size to a fraction based on percentage
-              mRepSize = Math.max(1, Math.floor(mRepSize * (campaignInfo.meme_percentage / 100)));
+              const mRepSize = repSize;
 
               const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [postId], mRepSize, []);
               if (memePlans.length > 0) {
@@ -948,9 +977,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
               const memeModelKey = campaignInfo.meme_model_key || '';
               const memeModel = resolveImageModel(memeModelKey);
 
-              let mRepSize = repSize;
-              // Limit meme rep size to a fraction based on percentage
-              mRepSize = Math.max(1, Math.floor(mRepSize * (campaignInfo.meme_percentage / 100)));
+              const mRepSize = repSize;
 
               const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [postId], mRepSize, []);
               if (memePlans.length > 0) {

@@ -739,7 +739,7 @@ CREATE TABLE IF NOT EXISTS meme_assets (
     campaign_id UUID REFERENCES campaigns(id) ON DELETE RESTRICT,
     draft_id UUID REFERENCES meme_drafts(id) ON DELETE RESTRICT,
     asset_type TEXT NOT NULL CHECK (asset_type IN ('logo', 'mascot', 'product', 'fictional_character', 'object', 'other')),
-    appearance_percentage INT NOT NULL,
+    appearance_percentage INT NOT NULL CHECK (appearance_percentage BETWEEN 1 AND 100),
     instruction TEXT,
     storage_provider TEXT NOT NULL,
     storage_key TEXT NOT NULL,
@@ -752,15 +752,8 @@ CREATE TABLE IF NOT EXISTS meme_assets (
     status TEXT NOT NULL CHECK (status IN ('active', 'retired')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     retired_at TIMESTAMPTZ,
-    CONSTRAINT chk_campaign_or_draft CHECK ((campaign_id IS NOT NULL AND draft_id IS NULL) OR (campaign_id IS NULL AND draft_id IS NOT NULL)),
-    CONSTRAINT meme_assets_appearance_percentage_check CHECK (appearance_percentage BETWEEN 0 AND 100)
+    CONSTRAINT chk_campaign_or_draft CHECK ((campaign_id IS NOT NULL AND draft_id IS NULL) OR (campaign_id IS NULL AND draft_id IS NOT NULL))
 );
-
-DO $$
-BEGIN
-    ALTER TABLE meme_assets DROP CONSTRAINT IF EXISTS meme_assets_appearance_percentage_check;
-    ALTER TABLE meme_assets ADD CONSTRAINT meme_assets_appearance_percentage_check CHECK (appearance_percentage BETWEEN 0 AND 100);
-END $$;
 CREATE INDEX IF NOT EXISTS meme_assets_active_idx ON meme_assets(campaign_id, status) WHERE status = 'active';
 
 -- 4. Meme Generation Cycles
@@ -788,8 +781,6 @@ CREATE TABLE IF NOT EXISTS meme_generation_cycles (
     finished_at TIMESTAMPTZ,
     CONSTRAINT chk_meme_cycle_campaign_or_draft CHECK ((campaign_id IS NOT NULL AND draft_id IS NULL) OR (campaign_id IS NULL AND draft_id IS NOT NULL))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS meme_generation_cycles_draft_idx ON meme_generation_cycles(draft_id) WHERE draft_id IS NOT NULL AND status IN ('pending', 'processing');
-CREATE UNIQUE INDEX IF NOT EXISTS meme_generation_cycles_campaign_idx ON meme_generation_cycles(campaign_id) WHERE campaign_id IS NOT NULL AND status IN ('pending', 'processing');
 CREATE INDEX IF NOT EXISTS meme_generation_cycles_active_idx ON meme_generation_cycles(campaign_id, status) WHERE status IN ('pending', 'processing');
 
 -- 5. Meme Generation Jobs
@@ -814,41 +805,15 @@ CREATE TABLE IF NOT EXISTS meme_generation_jobs (
     call_key TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT chk_meme_job_campaign_or_draft CHECK ((campaign_id IS NOT NULL AND draft_id IS NULL) OR (campaign_id IS NULL AND draft_id IS NOT NULL)),
-    CONSTRAINT unique_cycle_id_slot_index UNIQUE (cycle_id, slot_index)
+    CONSTRAINT chk_meme_job_campaign_or_draft CHECK ((campaign_id IS NOT NULL AND draft_id IS NULL) OR (campaign_id IS NULL AND draft_id IS NOT NULL))
 );
 CREATE INDEX IF NOT EXISTS meme_generation_jobs_claimable_idx ON meme_generation_jobs(status, next_attempt_at, lease_expires_at) WHERE status IN ('pending', 'processing');
-
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_constraint
-        WHERE conrelid = 'meme_generation_jobs'::regclass
-          AND conname = 'unique_cycle_id_slot_index'
-    ) THEN
-        IF EXISTS (
-            SELECT 1
-            FROM meme_generation_jobs
-            GROUP BY cycle_id, slot_index
-            HAVING COUNT(*) > 1
-        ) THEN
-            RAISE EXCEPTION
-              'Cannot add unique_cycle_id_slot_index: duplicate cycle_id/slot_index rows exist';
-        END IF;
-
-        ALTER TABLE meme_generation_jobs
-        ADD CONSTRAINT unique_cycle_id_slot_index
-        UNIQUE (cycle_id, slot_index);
-    END IF;
-END $$;
 
 -- 6. Memes Table (Inventory)
 CREATE TABLE IF NOT EXISTS memes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    campaign_id UUID REFERENCES campaigns(id) ON DELETE RESTRICT,
-    campaign_post_id UUID REFERENCES campaign_posts(id) ON DELETE RESTRICT,
-    draft_id UUID REFERENCES meme_drafts(id) ON DELETE RESTRICT,
+    campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE RESTRICT,
+    campaign_post_id UUID NOT NULL REFERENCES campaign_posts(id) ON DELETE RESTRICT,
     job_id UUID NOT NULL UNIQUE REFERENCES meme_generation_jobs(id) ON DELETE RESTRICT,
     status TEXT NOT NULL CHECK (status IN ('preview', 'available', 'assigned', 'withdrawn', 'rejected', 'failed')),
     storage_provider TEXT NOT NULL,
@@ -869,51 +834,9 @@ CREATE TABLE IF NOT EXISTS memes (
     delivery_order INT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     assigned_at TIMESTAMPTZ,
-    withdrawn_at TIMESTAMPTZ,
-    CONSTRAINT meme_ownership_check CHECK (
-        (draft_id IS NOT NULL AND campaign_id IS NULL AND campaign_post_id IS NULL) OR
-        (draft_id IS NULL AND campaign_id IS NOT NULL AND campaign_post_id IS NOT NULL)
-    ),
-    CONSTRAINT meme_status_check CHECK (
-        (draft_id IS NOT NULL AND status IN ('preview', 'rejected', 'failed')) OR
-        (campaign_id IS NOT NULL AND status IN ('available', 'assigned', 'withdrawn', 'rejected', 'failed'))
-    ),
-    CONSTRAINT unique_meme_per_campaign_post UNIQUE (id, campaign_id, campaign_post_id)
+    withdrawn_at TIMESTAMPTZ
 );
-
--- Idempotent migrations for existing schemas
-ALTER TABLE memes ADD COLUMN IF NOT EXISTS draft_id UUID;
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_memes_draft' AND conrelid = 'memes'::regclass) THEN
-        ALTER TABLE memes ADD CONSTRAINT fk_memes_draft FOREIGN KEY (draft_id) REFERENCES meme_drafts(id) ON DELETE RESTRICT;
-    END IF;
-END $$;
-
-ALTER TABLE memes ALTER COLUMN campaign_id DROP NOT NULL;
-ALTER TABLE memes ALTER COLUMN campaign_post_id DROP NOT NULL;
-
-DO $$
-BEGIN
-    ALTER TABLE memes DROP CONSTRAINT IF EXISTS meme_ownership_check;
-    ALTER TABLE memes ADD CONSTRAINT meme_ownership_check CHECK (
-        (draft_id IS NOT NULL AND campaign_id IS NULL AND campaign_post_id IS NULL) OR
-        (draft_id IS NULL AND campaign_id IS NOT NULL AND campaign_post_id IS NOT NULL)
-    );
-
-    ALTER TABLE memes DROP CONSTRAINT IF EXISTS meme_status_check;
-    ALTER TABLE memes ADD CONSTRAINT meme_status_check CHECK (
-        (draft_id IS NOT NULL AND status IN ('preview', 'rejected', 'failed')) OR
-        (campaign_id IS NOT NULL AND status IN ('available', 'assigned', 'withdrawn', 'rejected', 'failed'))
-    );
-
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'unique_meme_per_campaign_post' AND conrelid = 'memes'::regclass) THEN
-        ALTER TABLE memes ADD CONSTRAINT unique_meme_per_campaign_post UNIQUE (id, campaign_id, campaign_post_id);
-    END IF;
-END $$;
-CREATE UNIQUE INDEX IF NOT EXISTS unique_meme_hash_per_draft ON memes(draft_id, sha256_hash) WHERE status = 'preview';
 CREATE UNIQUE INDEX IF NOT EXISTS unique_meme_hash_per_campaign ON memes(campaign_id, sha256_hash) WHERE status IN ('available', 'assigned');
-CREATE INDEX IF NOT EXISTS memes_draft_idx ON memes(draft_id, status);
 CREATE INDEX IF NOT EXISTS memes_available_idx ON memes(campaign_id, status, delivery_order) WHERE status = 'available';
 
 -- 7. Meme API Calls (Auditing & Costs)
@@ -955,7 +878,7 @@ CREATE INDEX IF NOT EXISTS meme_api_calls_attribution_idx ON meme_api_calls(draf
 
 -- 8. Alter Assignments to support Memes
 ALTER TABLE assignments ADD COLUMN IF NOT EXISTS content_type TEXT NOT NULL DEFAULT 'comment' CHECK (content_type IN ('comment', 'meme'));
-ALTER TABLE assignments ADD COLUMN IF NOT EXISTS meme_id UUID;
+ALTER TABLE assignments ADD COLUMN IF NOT EXISTS meme_id UUID REFERENCES memes(id) ON DELETE RESTRICT;
 
 ALTER TABLE assignments DISABLE TRIGGER trigger_prevent_assignment_mutation;
 ALTER TABLE assignments ALTER COLUMN suggestion_id DROP NOT NULL;
@@ -973,31 +896,14 @@ ALTER TABLE assignments ENABLE TRIGGER trigger_prevent_assignment_mutation;
 
 -- Create constraint for exact-one suggestion or meme per unique visitor-campaign pair
 DO $$
-DECLARE
-    r RECORD;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'unique_assignment_meme_compound' AND conrelid = 'assignments'::regclass) THEN
         ALTER TABLE assignments ADD CONSTRAINT unique_assignment_meme_compound UNIQUE (id, campaign_id, campaign_post_id);
     END IF;
-
-    -- Drop the old non-compound constraint if it exists (by name or by checking its definition)
-    FOR r IN (
-        SELECT conname
-        FROM pg_constraint
-        WHERE conrelid = 'assignments'::regclass AND contype = 'f'
-          AND pg_get_constraintdef(oid) ILIKE '%FOREIGN KEY (meme_id) REFERENCES memes(id)%'
-    ) LOOP
-        EXECUTE 'ALTER TABLE assignments DROP CONSTRAINT ' || quote_ident(r.conname);
-    END LOOP;
-
-    -- Drop if already exists but we want to ensure it's correct
-    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_assignments_meme_compound' AND conrelid = 'assignments'::regclass) THEN
-        ALTER TABLE assignments DROP CONSTRAINT fk_assignments_meme_compound;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_assignments_meme_compound' AND conrelid = 'assignments'::regclass) THEN
+        ALTER TABLE assignments ADD CONSTRAINT fk_assignments_meme_compound
+        FOREIGN KEY (meme_id) REFERENCES memes (id) ON DELETE RESTRICT;
     END IF;
-
-    ALTER TABLE assignments ADD CONSTRAINT fk_assignments_meme_compound
-    FOREIGN KEY (meme_id, campaign_id, campaign_post_id) REFERENCES memes (id, campaign_id, campaign_post_id) ON DELETE RESTRICT;
 END $$;
-CREATE UNIQUE INDEX IF NOT EXISTS unique_assignment_meme_id ON assignments(meme_id) WHERE meme_id IS NOT NULL;
 
 COMMIT;

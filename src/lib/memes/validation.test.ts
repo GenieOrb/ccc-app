@@ -39,7 +39,10 @@ describe('validateMemeImage', () => {
 
     mockGenerateContent.mockResolvedValue({
       text: JSON.stringify({
-        is_valid: true,
+        detected_word_count: 0,
+        panel_count: 1,
+        looks_like_infographic: false,
+        clutter_score: 3,
         reason: 'Looks good'
       })
     });

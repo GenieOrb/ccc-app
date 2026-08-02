@@ -63,6 +63,50 @@ async function setupDatabase() {
       throw new Error('Critical columns missing in assignments');
     }
 
+    // Verificar memes.draft_id
+    const resMemes = await client.query('SELECT column_name FROM information_schema.columns WHERE table_name = $1 AND column_name = $2', ['memes', 'draft_id']);
+    if (resMemes.rowCount === 0) {
+      throw new Error('Critical column missing: memes.draft_id');
+    }
+
+    // Verificar constraints generales
+    const constraintNames = [
+      'meme_ownership_check',
+      'fk_assignments_meme_compound'
+    ];
+    for (const constraint of constraintNames) {
+      const res = await client.query('SELECT conname FROM pg_constraint WHERE conname = $1', [constraint]);
+      if (res.rowCount === 0) {
+        throw new Error(`Critical constraint missing: ${constraint}`);
+      }
+    }
+
+    // Verificar constraint específica unique_cycle_id_slot_index
+    const uniqueConstraintRes = await client.query(`
+      SELECT pg_get_constraintdef(oid) as cdef
+      FROM pg_constraint
+      WHERE conrelid = 'meme_generation_jobs'::regclass
+        AND conname = 'unique_cycle_id_slot_index'
+    `);
+    if (uniqueConstraintRes.rowCount === 0) {
+      throw new Error('Critical constraint missing: unique_cycle_id_slot_index on meme_generation_jobs');
+    }
+    const cdef = uniqueConstraintRes.rows[0].cdef;
+    if (!cdef.includes('cycle_id') || !cdef.includes('slot_index')) {
+      throw new Error(`Constraint unique_cycle_id_slot_index is malformed: ${cdef}`);
+    }
+
+    // Verificar índices
+    const indexNames = [
+      'meme_generation_cycles_draft_idx'
+    ];
+    for (const idx of indexNames) {
+      const res = await client.query('SELECT indexname FROM pg_indexes WHERE indexname = $1', [idx]);
+      if (res.rowCount === 0) {
+        throw new Error(`Critical index missing: ${idx}`);
+      }
+    }
+
     console.log('Database setup and schema verification completed successfully!');
   } catch (error) {
     console.error('Failed to setup database:', error);
