@@ -27,15 +27,12 @@ export async function generateMemeImage(
   const reqOpts = requestOptionsForDeadline();
 
   const basePrompt = `Create a viral meme image based on this analysis:
-Target Audience: ${analysis.a_quien_va_dirigido}
-Conflict/Contradiction: ${analysis.conflicto_o_contradiccion}
-Visual Scene: ${analysis.escena_representada}
-Core Joke: ${analysis.nucleo_del_chiste}
-Archetype: ${analysis.arquetipo_de_meme_mas_adecuado}
-Main Focus: ${analysis.que_elemento_visual_debe_ser_el_foco_principal}
+Immediate Joke: ${analysis.immediate_joke}
+Single Visual Focus: ${analysis.single_visual_focus}
+Familiar Physical Situation: ${analysis.familiar_physical_situation}
 
 Deterministic Constraints:
-- Text Quantity: ${plan.textQuantity} (If 'no_text', DO NOT RENDER ANY TEXT. If 'short_text', MAXIMUM 5 WORDS TOTAL).
+- Text Quantity: ${plan.textQuantity === 'no_text' ? 'DO NOT RENDER ANY CAPTIONS, LABELS, SIGNS, HEADINGS, OR WORDS.' : plan.textQuantity === 'short_text' ? 'RENDER EXACTLY 1 TO 5 WORDS TOTAL, AND NO OTHER GENERATED TEXT.' : plan.textQuantity}
 - Visual Structure: ${plan.visualStructure}
 - Humor Tone: ${plan.humorTone}
 - Scene Complexity: ${plan.sceneComplexity}
@@ -60,8 +57,7 @@ ${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''
 
   if (modelDef.provider === 'openai') {
     const client = getOpenAIClient('openai');
-    let b64: string;
-    
+    let imageBuffer: Buffer | undefined;
     try {
       if (plan.requiresAsset && assetData) {
         const file = await toFile(assetData.buffer, 'reference.png', { type: assetData.mimeType });
@@ -72,15 +68,24 @@ ${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''
             prompt: prompt,
             n: 1,
             size: '1024x1024',
-            response_format: 'b64_json',
           },
           reqOpts
         );
 
-        if (!response.data || !response.data[0] || !response.data[0].b64_json) {
+        const data = response.data?.[0];
+        if (!data || (!data.b64_json && !data.url)) {
           throw new Error('OpenAI returned empty image data.');
         }
-        b64 = response.data[0].b64_json;
+        
+        if (data.b64_json) {
+          imageBuffer = Buffer.from(data.b64_json, 'base64');
+        } else if (data.url) {
+          const resp = await fetch(data.url);
+          if (!resp.ok) throw new Error('Failed to fetch OpenAI image URL');
+          imageBuffer = Buffer.from(await resp.arrayBuffer());
+        } else {
+          throw new Error('No valid image data found');
+        }
       } else {
         const response = await client.images.generate(
           {
@@ -88,15 +93,24 @@ ${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''
             prompt: prompt,
             n: 1,
             size: '1024x1024',
-            response_format: 'b64_json',
           },
           reqOpts
         );
 
-        if (!response.data || !response.data[0] || !response.data[0].b64_json) {
+        const data = response.data?.[0];
+        if (!data || (!data.b64_json && !data.url)) {
           throw new Error('OpenAI returned empty image data.');
         }
-        b64 = response.data[0].b64_json;
+        
+        if (data.b64_json) {
+          imageBuffer = Buffer.from(data.b64_json, 'base64');
+        } else if (data.url) {
+          const resp = await fetch(data.url);
+          if (!resp.ok) throw new Error('Failed to fetch OpenAI image URL');
+          imageBuffer = Buffer.from(await resp.arrayBuffer());
+        } else {
+          throw new Error('No valid image data found');
+        }
       }
     } catch (error: unknown) {
       const err = error as Error & { status?: number; error?: { code?: string } };
@@ -112,9 +126,8 @@ ${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''
       throw err;
     }
 
-    const imageBuffer = Buffer.from(b64, 'base64');
     return {
-      imageBuffer,
+      imageBuffer: imageBuffer!,
       mimeType: 'image/png',
       cost: modelDef.resolutions[0].costPerImage,
       width: 1024,

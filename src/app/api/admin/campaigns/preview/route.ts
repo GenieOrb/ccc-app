@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { isAdminAuthenticated, validateSameOrigin } from '@/lib/auth';
 import { generateDeterministicSlotPlans } from '@/lib/planner';
 import { parseBrandVariantsSafe } from '@/lib/brand-variants';
-import { generateSingleComment } from '@/lib/openai';
+import { generateSingleComment, generatePreviewCommentsBatch } from '@/lib/openai';
 import { DEFAULT_MODEL_KEY, getAiModel, isProviderConfigured } from '@/lib/ai/models';
 import { parseMultipleXUrls, fetchXPosts } from '@/lib/x-api';
 import { normalizeXAccounts } from '@/lib/x-accounts';
@@ -98,39 +98,52 @@ export async function POST(req: Request) {
 
     const plans = generateDeterministicSlotPlans([postContent.post_id], 7, parseBrandVariantsSafe(brandVariants));
 
-    const generatedPromises = plans.map(async (plan) => {
+    let batchResult;
+    try {
       const remainingTime = PREVIEW_TOTAL_BUDGET_MS - (Date.now() - startTime);
-      if (remainingTime <= 0) {
-        throw new Error('PREVIEW_TIMEOUT');
-      }
+      if (remainingTime <= 0) throw new Error('PREVIEW_TIMEOUT');
       const aiTimeout = Math.min(PREVIEW_AI_TIMEOUT_MS, remainingTime);
 
-      try {
-        const generatedComment = await generateSingleComment({
-          apiModel: model.apiModel,
-          provider: model.provider,
-          postText: postContent!.text_content,
-          authorName: postContent!.author_name || '',
-          authorUsername: postContent!.author_username || '',
-          accessibleContext: (postContent!.accessible_context as Record<string, unknown>) || {},
-          direction: direction || undefined,
-          plan,
-          recentComments: [],
-          timeoutMs: aiTimeout,
-        });
-        return { text: generatedComment.comment, slotIndex: plan.slotIndex, slotPlan: plan };
-      } catch (error) {
-        throw new Error(`La preview con ${model.displayName} falló en el slot ${plan.slotIndex}. Error: ${error instanceof Error ? error.message : 'Unknown'}`);
-      }
-    });
+      batchResult = await generatePreviewCommentsBatch({
+        apiModel: model.apiModel,
+        provider: model.provider,
+        postText: postContent!.text_content,
+        authorName: postContent!.author_name || '',
+        authorUsername: postContent!.author_username || '',
+        accessibleContext: (postContent!.accessible_context as Record<string, unknown>) || {},
+        direction: direction || undefined,
+        plans,
+        timeoutMs: aiTimeout,
+      });
+    } catch (error) {
+      throw new Error(`La preview con ${model.displayName} falló en lote. Error: ${error instanceof Error ? error.message : 'Unknown'}`);
+    }
 
-    const results = await Promise.allSettled(generatedPromises);
     const comments = [];
-    for (const r of results) {
-      if (r.status === 'rejected') {
-         throw r.reason;
+    for (const plan of plans) {
+      const generated = batchResult.comments.find(c => c.slotIndex === plan.slotIndex);
+      if (generated) {
+        comments.push({ text: generated.comment, slotIndex: plan.slotIndex, slotPlan: plan });
+      } else {
+        // Fallback for partial failures (not likely with structured output, but safe)
+        try {
+          const fallback = await generateSingleComment({
+            apiModel: model.apiModel,
+            provider: model.provider,
+            postText: postContent!.text_content,
+            authorName: postContent!.author_name || '',
+            authorUsername: postContent!.author_username || '',
+            accessibleContext: (postContent!.accessible_context as Record<string, unknown>) || {},
+            direction: direction || undefined,
+            plan,
+            recentComments: [],
+            timeoutMs: 5000,
+          });
+          comments.push({ text: fallback.comment, slotIndex: plan.slotIndex, slotPlan: plan });
+        } catch {
+          comments.push({ text: 'Error in generation for this slot.', slotIndex: plan.slotIndex, slotPlan: plan });
+        }
       }
-      comments.push(r.value);
     }
 
     return NextResponse.json(

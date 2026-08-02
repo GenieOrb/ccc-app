@@ -1,5 +1,5 @@
 import 'server-only';
-import { put, del, head } from '@vercel/blob';
+import { put, del, head, get } from '@vercel/blob';
 import { createHash } from 'node:crypto';
 
 export interface BlobUploadResult {
@@ -20,8 +20,9 @@ export async function uploadMemeAsset(
 
   // Store assets in a specific prefix for memes
   const blob = await put(`memes/assets/${uniqueFilename}`, buffer, {
-    access: 'public',
+    access: 'private',
     contentType,
+    token: process.env.BLOB_READ_WRITE_TOKEN,
   });
 
   return {
@@ -42,8 +43,9 @@ export async function uploadGeneratedMeme(
 
   // Store generated memes in their prefix
   const blob = await put(`memes/generated/${filename}`, buffer, {
-    access: 'public',
+    access: 'private',
     contentType,
+    token: process.env.BLOB_READ_WRITE_TOKEN,
   });
 
   return {
@@ -57,7 +59,7 @@ export async function uploadGeneratedMeme(
 
 export async function deleteBlob(pathname: string): Promise<void> {
   try {
-    await del(pathname);
+    await del(pathname, { token: process.env.BLOB_READ_WRITE_TOKEN });
   } catch (error) {
     console.error(`Failed to delete blob ${pathname}:`, error);
   }
@@ -65,9 +67,35 @@ export async function deleteBlob(pathname: string): Promise<void> {
 
 export async function getBlobMetadata(url: string) {
   try {
-    return await head(url);
+    return await head(url, { token: process.env.BLOB_READ_WRITE_TOKEN });
   } catch (error) {
     console.error(`Failed to head blob ${url}:`, error);
     return null;
   }
+}
+
+export async function getMemeBlobStream(pathname: string) {
+  const result = await get(pathname, {
+    access: 'private',
+    token: process.env.BLOB_READ_WRITE_TOKEN,
+    useCache: false
+  });
+  if (!result || result.statusCode === 304 || !result.stream) {
+    throw new Error(`Blob no encontrado o respuesta vacía para: ${pathname}`);
+  }
+  return { stream: result.stream, contentType: result.blob.contentType, size: result.blob.size };
+}
+
+export async function getMemeBlobBuffer(pathname: string): Promise<Buffer> {
+  const { stream } = await getMemeBlobStream(pathname);
+  
+  // Convert ReadableStream to Buffer
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) chunks.push(value);
+  }
+  return Buffer.concat(chunks);
 }

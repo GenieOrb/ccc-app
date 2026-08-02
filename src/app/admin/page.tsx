@@ -941,12 +941,46 @@ export default function AdminDashboardPage() {
       const previewData = await previewResponse.json();
       if (!previewResponse.ok) throw new Error(previewData.error || `Error HTTP ${previewResponse.status}.`);
 
-      const memes = previewData.preview?.memes;
-      if (!Array.isArray(memes) || memes.length !== 3) {
-        throw new Error('La preview devolvió una cantidad incorrecta de memes.');
+      if (!previewData.draftId) {
+        throw new Error('No se recibió el draftId para la preview de memes.');
+      }
+      
+      const newDraftId = previewData.draftId;
+      setDraftId(newDraftId);
+      
+      // Polling
+      let attempts = 0;
+      let finalMemes = null;
+      while (attempts < 60) {
+        const statusRes = await fetch(`/api/admin/meme-drafts/${newDraftId}/status`);
+        if (!statusRes.ok) throw new Error('Error al consultar estado de preview.');
+        const statusData = await statusRes.json();
+        
+        const jobs = statusData.jobs || [];
+        const completedJobs = jobs.filter((j: { status: string }) => j.status === 'completed' || j.status === 'failed');
+        
+        if (completedJobs.length >= 3 || (jobs.length > 0 && completedJobs.length === jobs.length)) {
+          finalMemes = statusData.memes || [];
+          break;
+        }
+        
+        await new Promise(r => setTimeout(r, 2000));
+        attempts++;
       }
 
-      setCreatedMemePreview(memes);
+      if (!finalMemes) {
+        throw new Error('La preview de memes superó el tiempo de espera.');
+      }
+
+      // Map to the expected format for the UI
+      const mappedMemes = finalMemes.map((m: { url: string, id: string, plan: { slotIndex: number, [key: string]: unknown } }) => ({
+        imageBlobUrl: m.url,
+        prompt: `Generado mediante job: ${m.id}`,
+        slotIndex: m.plan.slotIndex,
+        dimensions: m.plan
+      }));
+
+      setCreatedMemePreview(mappedMemes);
     } catch (previewError: unknown) {
       setPreviewFormError(previewError instanceof Error ? previewError.message : 'No se pudo generar el preview de memes.');
       setCreatedMemePreview(null);

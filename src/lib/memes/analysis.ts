@@ -6,15 +6,9 @@ import { Type, GoogleGenAI } from '@google/genai';
 import { getConfig } from '../config';
 
 export const MemePreflightAnalysisSchema = z.object({
-  a_quien_va_dirigido: z.string().describe("Target audience of the meme."),
-  conflicto_o_contradiccion: z.string().describe("The conflict or contradiction that makes it funny."),
-  escena_representada: z.string().describe("The visual scene to be represented."),
-  como_se_relaciona_la_imagen_con_el_post_y_la_direccion: z.string().describe("How the scene relates to the original post and campaign direction."),
-  nucleo_del_chiste: z.string().describe("The core of the visual joke."),
-  disparador_emocional: z.string().describe("The emotional trigger of the meme."),
-  arquetipo_de_meme_mas_adecuado: z.string().describe("The most suitable meme archetype."),
-  que_elemento_visual_debe_ser_el_foco_principal: z.string().describe("The main visual focus element."),
-  riesgos_de_sobrecarga_o_de_que_el_meme_necesite_demasiada_explicacion: z.string().describe("Risks of visual clutter or requiring too much explanation."),
+  immediate_joke: z.string().describe("What is the immediate visual joke that takes 1 second to understand?"),
+  single_visual_focus: z.string().describe("What is the SINGLE main visual focus of the image? (e.g. A cat staring at a screen)"),
+  familiar_physical_situation: z.string().describe("What familiar, physical, real-world situation represents this? NO abstract concepts, NO diagrams, NO text."),
   requires_asset: z.boolean().describe("Si el concepto requiere un activo de marca específico que se haya proveído."),
   selected_asset_id: z.string().optional().describe("ID del asset seleccionado, si aplica y requires_asset es true.")
 });
@@ -60,25 +54,14 @@ El meme debe ser extremadamente simple, visual, con una única idea principal y 
   const responseSchema = {
     type: Type.OBJECT,
     properties: {
-      a_quien_va_dirigido: { type: Type.STRING },
-      conflicto_o_contradiccion: { type: Type.STRING },
-      escena_representada: { type: Type.STRING },
-      como_se_relaciona_la_imagen_con_el_post_y_la_direccion: { type: Type.STRING },
-      nucleo_del_chiste: { type: Type.STRING },
-      disparador_emocional: { type: Type.STRING },
-      arquetipo_de_meme_mas_adecuado: { type: Type.STRING },
-      que_elemento_visual_debe_ser_el_foco_principal: { type: Type.STRING },
-      riesgos_de_sobrecarga_o_de_que_el_meme_necesite_demasiada_explicacion: { type: Type.STRING },
+      immediate_joke: { type: Type.STRING },
+      single_visual_focus: { type: Type.STRING },
+      familiar_physical_situation: { type: Type.STRING },
       requires_asset: { type: Type.BOOLEAN },
       selected_asset_id: { type: Type.STRING }
     },
     required: [
-      "a_quien_va_dirigido", "conflicto_o_contradiccion", "escena_representada", 
-      "como_se_relaciona_la_imagen_con_el_post_y_la_direccion", "nucleo_del_chiste",
-      "disparador_emocional", "arquetipo_de_meme_mas_adecuado", 
-      "que_elemento_visual_debe_ser_el_foco_principal", 
-      "riesgos_de_sobrecarga_o_de_que_el_meme_necesite_demasiada_explicacion",
-      "requires_asset"
+      "immediate_joke", "single_visual_focus", "familiar_physical_situation", "requires_asset"
     ]
   };
 

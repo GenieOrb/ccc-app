@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { isAdminAuthenticated, validateSameOrigin } from '@/lib/auth';
 import { queryDb } from '@/lib/db';
-import { put, del } from '@vercel/blob';
+import { uploadMemeAsset, deleteBlob } from '@/lib/memes/blob';
 import sharp from 'sharp';
 import crypto from 'crypto';
 
@@ -87,16 +87,10 @@ export async function POST(req: Request) {
     
     let blobResult;
     try {
-      // For private visibility, Vercel Blob doesn't have an explicit 'private' access property in all plans,
-      // but passing a token ensures only we can upload. The random suffix makes it unguessable.
-      blobResult = await put(filename, processedBuffer, {
-        access: 'public', // 'public' is required by Vercel Blob unless using advanced features
-        token: process.env.BLOB_READ_WRITE_TOKEN,
-        contentType: 'image/png'
-      });
+      blobResult = await uploadMemeAsset(processedBuffer, filename, 'image/png');
     } catch (e: unknown) {
       console.error('Blob upload error', e);
-      return NextResponse.json({ error: 'Failed to upload to blob storage' }, { status: 500 });
+      return NextResponse.json({ error: 'Fallo al subir a almacenamiento privado' }, { status: 500 });
     }
 
     const finalMetadata = await sharp(processedBuffer).metadata();
@@ -125,13 +119,20 @@ export async function POST(req: Request) {
       return NextResponse.json({
         assetId: assetRes[0].id,
         draftId,
-        url: blobResult.url // used temporarily for preview in admin
+        assetType: 'other',
+        appearancePercentage: 10,
+        instruction: '',
+        mimeType: 'image/png',
+        sizeBytes: finalSize,
+        width: finalMetadata.width,
+        height: finalMetadata.height,
+        viewUrl: `/api/admin/meme-drafts/${draftId}/assets/${assetRes[0].id}/view`
       });
     } catch (e: unknown) {
       // Rollback Blob upload on DB failure
-      await del(blobResult.url, { token: process.env.BLOB_READ_WRITE_TOKEN });
+      await deleteBlob(blobResult.pathname);
       console.error('DB insert error', e);
-      return NextResponse.json({ error: 'Failed to save asset metadata' }, { status: 500 });
+      return NextResponse.json({ error: 'Fallo de persistencia al guardar metadatos' }, { status: 500 });
     }
 
   } catch (error: unknown) {

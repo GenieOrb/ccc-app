@@ -1,7 +1,7 @@
 import 'server-only';
 import { randomUUID } from 'node:crypto';
 import { queryDb, withTransaction } from './db';
-import { uploadGeneratedMeme } from './memes/blob';
+import { uploadGeneratedMeme, getMemeBlobBuffer } from './memes/blob';
 import { performMemeAnalysis } from './memes/analysis';
 import { generateMemeImage, MemeGenerationResult } from './memes/generation';
 import { validateMemeImage } from './memes/validation';
@@ -216,18 +216,16 @@ async function executeMemeJobTask(
       availableAssets
     });
 
-    let assetData;
-    if (job.assetSnapshot && job.assetSnapshot.storage_url) {
+    let assetData: { buffer: Buffer, mimeType: string, instruction: string } | undefined;
+    const storageKeyOrUrl = (job.assetSnapshot?.storage_key || job.assetSnapshot?.storage_url) as string;
+    if (job.assetSnapshot && storageKeyOrUrl) {
       try {
-        const resp = await fetch(job.assetSnapshot.storage_url as string);
-        if (resp.ok) {
-          const buffer = Buffer.from(await resp.arrayBuffer());
-          assetData = {
-            buffer,
-            mimeType: (job.assetSnapshot.mime_type as string) || 'image/png',
-            instruction: (job.assetSnapshot.instruction as string) || ''
-          };
-        }
+        const buffer = await getMemeBlobBuffer(storageKeyOrUrl);
+        assetData = {
+          buffer,
+          mimeType: (job.assetSnapshot.mime_type as string) || 'image/png',
+          instruction: (job.assetSnapshot.instruction as string) || ''
+        };
       } catch (e) {
         console.error('Failed to fetch asset blob', e);
       }

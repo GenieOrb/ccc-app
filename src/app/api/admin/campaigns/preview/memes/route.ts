@@ -1,8 +1,6 @@
 import { NextResponse } from 'next/server';
 import { isAdminAuthenticated, validateSameOrigin } from '@/lib/auth';
 import { generateDeterministicMemeSlotPlans } from '@/lib/memes/planner';
-import { generateMemeImage } from '@/lib/memes/generation';
-import { performMemeAnalysis } from '@/lib/memes/analysis';
 import { resolveImageModel } from '@/lib/ai/image-models';
 import { parseMultipleXUrls, fetchXPosts } from '@/lib/x-api';
 import { normalizeXAccounts } from '@/lib/x-accounts';
@@ -12,7 +10,6 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120; // Generating 3 images could take long
 
-const PREVIEW_TOTAL_BUDGET_MS = 110_000;
 const PREVIEW_X_TIMEOUT_MS = 10_000;
 const PREVIEW_X_USER_TIMEOUT_MS = 8_000;
 
@@ -24,8 +21,6 @@ export async function POST(req: Request) {
   if (!validateSameOrigin(req)) {
     return NextResponse.json({ error: 'Petición de origen no permitida.' }, { status: 403 });
   }
-
-  const startTime = Date.now();
 
   try {
     const body = await req.json().catch(() => null);
@@ -97,90 +92,39 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'No se pudo obtener contenido para la preview.' }, { status: 400 });
     }
 
-    let assets: { id: string, asset_type: string, instruction: string, storage_url: string, mime_type: string }[] = [];
-    if (draftId) {
-      const { queryDb } = await import('@/lib/db');
-      const assetsRes = await queryDb<{ id: string, asset_type: string, instruction: string, storage_url: string, mime_type: string }>(
-        `SELECT id, asset_type, instruction, storage_url, mime_type FROM meme_assets WHERE draft_id = $1 AND status = 'active'`,
-        [draftId]
-      );
-      assets = assetsRes;
+    const { queryDb } = await import('@/lib/db');
+    let effectiveDraftId = draftId;
+    if (!effectiveDraftId) {
+       effectiveDraftId = crypto.randomUUID();
+       // Optionally insert into meme_drafts here if it requires a foreign key
+       // But assuming meme_generation_jobs cascade or just requires draft_id string
     }
 
-    const plans = generateDeterministicMemeSlotPlans(null, 'preview-draft-id', [postContent.post_id], 3, []);
+    const plans = generateDeterministicMemeSlotPlans(null, effectiveDraftId, [postContent.post_id], 3, []);
 
-    const generatedPromises = plans.map(async (plan, index) => {
-      const remainingTime = PREVIEW_TOTAL_BUDGET_MS - (Date.now() - startTime);
-      if (remainingTime <= 0) {
-        throw new Error('PREVIEW_TIMEOUT');
-      }
-
-      let assetData;
-      if (assets.length > 0) {
-        const pickedAsset = assets[index % assets.length];
-        try {
-          const resp = await fetch(pickedAsset.storage_url);
-          if (resp.ok) {
-            const buffer = Buffer.from(await resp.arrayBuffer());
-            assetData = {
-              buffer,
-              mimeType: pickedAsset.mime_type || 'image/png',
-              instruction: pickedAsset.instruction || ''
-            };
-          }
-        } catch (e) {
-          console.error('Preview asset fetch error', e);
-        }
-      }
-
-      try {
-        const analysis = await performMemeAnalysis({
-          postText: postContent!.text_content,
-          campaignDirection: direction || 'Sin dirección específica.',
-          availableAssets: assets.map(a => ({ id: a.id, assetType: a.asset_type, instruction: a.instruction }))
-        });
-
-        const generation = await generateMemeImage(
-          plan,
-          analysis,
-          model.key,
-          assetData
-        );
-        
-        const imageBlobUrl = `data:${generation.mimeType};base64,${generation.imageBuffer.toString('base64')}`;
-        const prompt = `Core Joke: ${analysis.nucleo_del_chiste}\nText: ${plan.textQuantity}\nStructure: ${plan.visualStructure}\nTone: ${plan.humorTone}`;
-        
-        return { imageBlobUrl, prompt, slotIndex: plan.slotIndex, dimensions: plan };
-      } catch (error) {
-        throw new Error(`La preview de meme falló. Error: ${error instanceof Error ? error.message : 'Unknown'}`);
-      }
-    });
-
-    const results = await Promise.allSettled(generatedPromises);
-    const memes = [];
-    for (const r of results) {
-      if (r.status === 'rejected') {
-         throw r.reason;
-      }
-      memes.push(r.value);
+    for (const plan of plans) {
+       await queryDb(
+         `INSERT INTO meme_generation_jobs 
+          (id, assignment_id, model_key, slot_plan, post_context, campaign_direction, created_at, status, draft_id)
+          VALUES (gen_random_uuid(), NULL, $1, $2, $3, $4, NOW(), 'pending', $5)`,
+         [
+           model.key,
+           JSON.stringify(plan),
+           JSON.stringify({ 
+             text: postContent!.text_content, 
+             author: postContent!.author_username 
+           }),
+           direction || 'Sin dirección específica.',
+           effectiveDraftId
+         ]
+       );
     }
 
     return NextResponse.json(
-      { success: true, preview: { memes } },
+      { success: true, draftId: effectiveDraftId },
       { headers: { 'Cache-Control': 'no-store' } }
     );
   } catch (error: unknown) {
-    const timeElapsed = Date.now() - startTime;
-    const isTimeout = timeElapsed >= PREVIEW_TOTAL_BUDGET_MS ||
-      (error instanceof Error && (error.message === 'PREVIEW_TIMEOUT' || error.name === 'AbortError' || error.message.includes('timeout') || error.message.includes('tiempo límite')));
-
-    if (isTimeout) {
-      return NextResponse.json(
-        { error: 'La preview tardó demasiado en generarse. Vuelve a intentarlo.' },
-        { status: 504, headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json' } }
-      );
-    }
-
     return NextResponse.json(
       { error: error instanceof Error ? error.message : 'Error al generar la preview de memes.' },
       { status: 400, headers: { 'Cache-Control': 'no-store', 'Content-Type': 'application/json' } }
