@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { processPerpetualCampaigns, processBackgroundQueue, reconcileCampaignReplenishment } = vi.hoisted(() => ({ processPerpetualCampaigns: vi.fn(), processBackgroundQueue: vi.fn(), reconcileCampaignReplenishment: vi.fn() }));
+const { processPerpetualCampaigns, processBackgroundQueue, reconcileCampaignReplenishment, processMemeBackgroundQueue } = vi.hoisted(() => ({ processPerpetualCampaigns: vi.fn(), processBackgroundQueue: vi.fn(), reconcileCampaignReplenishment: vi.fn(), processMemeBackgroundQueue: vi.fn() }));
 
 vi.mock('@/lib/config', () => ({ getConfig: () => ({ cronSecret: 'cron-only-secret', internalProcessSecret: '' }) }));
 vi.mock('@/lib/crypto', () => ({ safeCompareStrings: (left: string, right: string) => left === right }));
 vi.mock('@/lib/perpetual-monitor', () => ({ processPerpetualCampaigns }));
 vi.mock('@/lib/worker', () => ({ MIN_WORKER_JOB_BUDGET_MS: 15_000, processBackgroundQueue }));
 vi.mock('@/lib/services', () => ({ reconcileCampaignReplenishment }));
+vi.mock('@/lib/worker.memes', () => ({ MIN_MEME_WORKER_JOB_BUDGET_MS: 25_000, processMemeBackgroundQueue }));
 
 import { POST } from './route';
 
@@ -15,6 +16,7 @@ describe('internal generation cron route', () => {
     processPerpetualCampaigns.mockResolvedValue({ accountsProcessed: 1 });
     reconcileCampaignReplenishment.mockResolvedValue({ checked: 1, errors: [] });
     processBackgroundQueue.mockResolvedValue({ processed: 0 });
+    processMemeBackgroundQueue.mockResolvedValue({ processed: 0 });
   });
 
   it('accepts CRON_SECRET when no internal secret is configured and awaits monitor then worker', async () => {
@@ -24,6 +26,7 @@ describe('internal generation cron route', () => {
     expect(processPerpetualCampaigns).toHaveBeenCalledWith(30000);
     expect(reconcileCampaignReplenishment).toHaveBeenCalledOnce();
     expect(processBackgroundQueue).toHaveBeenCalledTimes(1);
+    expect(processMemeBackgroundQueue).toHaveBeenCalledTimes(1);
   });
 
   it('rejects an invalid token without running either processor', async () => {
@@ -33,6 +36,7 @@ describe('internal generation cron route', () => {
     expect(processPerpetualCampaigns).not.toHaveBeenCalled();
     expect(reconcileCampaignReplenishment).not.toHaveBeenCalled();
     expect(processBackgroundQueue).not.toHaveBeenCalled();
+    expect(processMemeBackgroundQueue).not.toHaveBeenCalled();
   });
 
   it('does not start the worker when less than the conservative job budget remains', async () => {

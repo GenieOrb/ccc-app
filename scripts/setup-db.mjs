@@ -1,10 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Pool, neonConfig } from '@neondatabase/serverless';
-import ws from 'ws';
+import pg from 'pg';
 
-neonConfig.webSocketConstructor = ws;
+const { Pool } = pg;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -39,7 +38,32 @@ async function setupDatabase() {
   try {
     console.log('Executing database schema script...');
     await client.query(sql);
-    console.log('Database setup completed successfully!');
+    
+    // Verificar que las tablas críticas existen
+    const tables = ['campaigns', 'meme_drafts', 'meme_assets', 'meme_generation_cycles', 'meme_generation_jobs', 'memes', 'meme_api_calls', 'assignments'];
+    for (const table of tables) {
+      const res = await client.query('SELECT to_regclass($1)', [table]);
+      if (!res.rows[0].to_regclass) {
+        throw new Error(`Critical table missing: ${table}`);
+      }
+    }
+    
+    // Verificar columnas en campaigns
+    const cols = ['include_memes', 'meme_percentage', 'meme_model_key'];
+    for (const col of cols) {
+      const res = await client.query('SELECT column_name FROM information_schema.columns WHERE table_name = $1 AND column_name = $2', ['campaigns', col]);
+      if (res.rowCount === 0) {
+        throw new Error(`Critical column missing: campaigns.${col}`);
+      }
+    }
+    
+    // Verificar columnas en assignments
+    const resAssignments = await client.query('SELECT column_name FROM information_schema.columns WHERE table_name = $1 AND column_name IN ($2, $3)', ['assignments', 'content_type', 'meme_id']);
+    if (resAssignments.rowCount !== 2) {
+      throw new Error('Critical columns missing in assignments');
+    }
+
+    console.log('Database setup and schema verification completed successfully!');
   } catch (error) {
     console.error('Failed to setup database:', error);
     process.exit(1);

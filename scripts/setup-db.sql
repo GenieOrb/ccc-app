@@ -696,4 +696,214 @@ DROP FUNCTION IF EXISTS fill_generation_model_snapshot();
 CREATE TRIGGER trigger_generation_cycle_snapshot BEFORE INSERT ON generation_cycles FOR EACH ROW EXECUTE FUNCTION fill_generation_cycle_model_snapshot();
 CREATE TRIGGER trigger_generation_job_snapshot BEFORE INSERT ON generation_jobs FOR EACH ROW EXECUTE FUNCTION fill_generation_job_model_snapshot();
 
+-- ==========================================
+-- MEME SYSTEM SCHEMA (PHASE 1)
+-- ==========================================
+
+-- 1. Extend campaigns with meme config
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS include_memes BOOLEAN;
+UPDATE campaigns SET include_memes = false WHERE include_memes IS NULL;
+ALTER TABLE campaigns ALTER COLUMN include_memes SET NOT NULL;
+ALTER TABLE campaigns ALTER COLUMN include_memes SET DEFAULT true;
+
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS meme_percentage INT NOT NULL DEFAULT 25 CHECK (meme_percentage BETWEEN 0 AND 100);
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS meme_model_key TEXT NOT NULL DEFAULT 'gpt-image-2';
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS meme_planner_version INT NOT NULL DEFAULT 1;
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS meme_initial_size INT NOT NULL DEFAULT 10 CHECK (meme_initial_size > 0);
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS meme_replenishment_threshold INT NOT NULL DEFAULT 5 CHECK (meme_replenishment_threshold >= 0);
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS meme_replenishment_size INT NOT NULL DEFAULT 10 CHECK (meme_replenishment_size > 0);
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS meme_sequence_state JSONB NOT NULL DEFAULT '{"deficit": 0}'::jsonb;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_meme_replenishment_limits' AND conrelid = 'campaigns'::regclass) THEN
+        ALTER TABLE campaigns ADD CONSTRAINT chk_meme_replenishment_limits CHECK (meme_replenishment_threshold <= meme_initial_size);
+    END IF;
+END $$;
+
+-- 2. Meme Drafts
+CREATE TABLE IF NOT EXISTS meme_drafts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config JSONB NOT NULL,
+    inputs_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'expired', 'converted')),
+    campaign_id UUID REFERENCES campaigns(id) ON DELETE RESTRICT,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS meme_drafts_expired_idx ON meme_drafts(expires_at) WHERE status = 'active';
+
+-- 3. Meme Assets (References)
+CREATE TABLE IF NOT EXISTS meme_assets (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id UUID REFERENCES campaigns(id) ON DELETE RESTRICT,
+    draft_id UUID REFERENCES meme_drafts(id) ON DELETE RESTRICT,
+    asset_type TEXT NOT NULL CHECK (asset_type IN ('logo', 'mascot', 'product', 'fictional_character', 'object', 'other')),
+    appearance_percentage INT NOT NULL CHECK (appearance_percentage BETWEEN 1 AND 100),
+    instruction TEXT,
+    storage_provider TEXT NOT NULL,
+    storage_key TEXT NOT NULL,
+    storage_url TEXT,
+    mime_type TEXT NOT NULL,
+    size_bytes INT NOT NULL,
+    width INT,
+    height INT,
+    sha256_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'retired')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    retired_at TIMESTAMPTZ,
+    CONSTRAINT chk_campaign_or_draft CHECK ((campaign_id IS NOT NULL AND draft_id IS NULL) OR (campaign_id IS NULL AND draft_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS meme_assets_active_idx ON meme_assets(campaign_id, status) WHERE status = 'active';
+
+-- 4. Meme Generation Cycles
+CREATE TABLE IF NOT EXISTS meme_generation_cycles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id UUID REFERENCES campaigns(id) ON DELETE RESTRICT,
+    draft_id UUID REFERENCES meme_drafts(id) ON DELETE RESTRICT,
+    campaign_post_id UUID REFERENCES campaign_posts(id) ON DELETE RESTRICT,
+    cycle_type TEXT NOT NULL CHECK (cycle_type IN ('preview', 'initial', 'replenishment', 'retry')),
+    target_count INT NOT NULL DEFAULT 10,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled', 'partial')),
+    model_key TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    api_model TEXT NOT NULL,
+    planner_version INT NOT NULL,
+    pricing_snapshot JSONB NOT NULL,
+    valid_produced_count INT NOT NULL DEFAULT 0,
+    completed_jobs_count INT NOT NULL DEFAULT 0,
+    failed_jobs_count INT NOT NULL DEFAULT 0,
+    error_message TEXT,
+    lease_owner TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+    CONSTRAINT chk_meme_cycle_campaign_or_draft CHECK ((campaign_id IS NOT NULL AND draft_id IS NULL) OR (campaign_id IS NULL AND draft_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS meme_generation_cycles_active_idx ON meme_generation_cycles(campaign_id, status) WHERE status IN ('pending', 'processing');
+
+-- 5. Meme Generation Jobs
+CREATE TABLE IF NOT EXISTS meme_generation_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cycle_id UUID NOT NULL REFERENCES meme_generation_cycles(id) ON DELETE RESTRICT,
+    campaign_id UUID REFERENCES campaigns(id) ON DELETE RESTRICT,
+    draft_id UUID REFERENCES meme_drafts(id) ON DELETE RESTRICT,
+    campaign_post_id UUID REFERENCES campaign_posts(id) ON DELETE RESTRICT,
+    slot_index INT NOT NULL,
+    slot_plan JSONB NOT NULL,
+    deterministic_dimensions JSONB NOT NULL,
+    asset_snapshot JSONB,
+    model_snapshot JSONB NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled')),
+    attempts_count INT NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    lease_owner TEXT,
+    lease_expires_at TIMESTAMPTZ,
+    error_message TEXT,
+    accumulated_cost NUMERIC(16,8) NOT NULL DEFAULT 0,
+    call_key TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_meme_job_campaign_or_draft CHECK ((campaign_id IS NOT NULL AND draft_id IS NULL) OR (campaign_id IS NULL AND draft_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS meme_generation_jobs_claimable_idx ON meme_generation_jobs(status, next_attempt_at, lease_expires_at) WHERE status IN ('pending', 'processing');
+
+-- 6. Memes Table (Inventory)
+CREATE TABLE IF NOT EXISTS memes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE RESTRICT,
+    campaign_post_id UUID NOT NULL REFERENCES campaign_posts(id) ON DELETE RESTRICT,
+    job_id UUID NOT NULL UNIQUE REFERENCES meme_generation_jobs(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN ('preview', 'available', 'assigned', 'withdrawn', 'rejected', 'failed')),
+    storage_provider TEXT NOT NULL,
+    storage_key TEXT NOT NULL,
+    storage_url TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    size_bytes INT NOT NULL,
+    width INT NOT NULL,
+    height INT NOT NULL,
+    sha256_hash TEXT NOT NULL,
+    expected_text TEXT,
+    slot_plan JSONB NOT NULL,
+    model_key TEXT NOT NULL,
+    asset_id UUID REFERENCES meme_assets(id) ON DELETE RESTRICT,
+    accumulated_cost NUMERIC(16,8) NOT NULL DEFAULT 0,
+    preview_origin_draft_id UUID REFERENCES meme_drafts(id) ON DELETE RESTRICT,
+    rejection_reason TEXT,
+    delivery_order INT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    assigned_at TIMESTAMPTZ,
+    withdrawn_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS unique_meme_hash_per_campaign ON memes(campaign_id, sha256_hash) WHERE status IN ('available', 'assigned');
+CREATE INDEX IF NOT EXISTS memes_available_idx ON memes(campaign_id, status, delivery_order) WHERE status = 'available';
+
+-- 7. Meme API Calls (Auditing & Costs)
+CREATE TABLE IF NOT EXISTS meme_api_calls (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    call_key TEXT NOT NULL UNIQUE,
+    campaign_id UUID REFERENCES campaigns(id) ON DELETE RESTRICT,
+    draft_id UUID REFERENCES meme_drafts(id) ON DELETE RESTRICT,
+    cycle_id UUID REFERENCES meme_generation_cycles(id) ON DELETE RESTRICT,
+    job_id UUID REFERENCES meme_generation_jobs(id) ON DELETE RESTRICT,
+    meme_id UUID REFERENCES memes(id) ON DELETE RESTRICT,
+    purpose TEXT NOT NULL CHECK (purpose IN ('analysis', 'concept', 'moderation', 'generation', 'validation', 'preview', 'regeneration')),
+    provider TEXT NOT NULL,
+    model_key TEXT NOT NULL,
+    api_model TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('started', 'succeeded', 'failed', 'cancelled', 'usage_unknown')),
+    provider_request_id TEXT,
+    attempt INT NOT NULL DEFAULT 1,
+    input_text_tokens INTEGER,
+    input_image_tokens INTEGER,
+    cached_tokens INTEGER,
+    output_text_tokens INTEGER,
+    output_image_tokens INTEGER,
+    reference_images_count INTEGER,
+    quality TEXT,
+    resolution TEXT,
+    pricing_snapshot JSONB NOT NULL,
+    cost_components JSONB,
+    total_cost NUMERIC(16,8),
+    currency TEXT NOT NULL DEFAULT 'USD',
+    is_estimated BOOLEAN NOT NULL DEFAULT true,
+    error_message TEXT,
+    durable_result_path TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS meme_api_calls_campaign_idx ON meme_api_calls(campaign_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS meme_api_calls_attribution_idx ON meme_api_calls(draft_id) WHERE campaign_id IS NULL;
+
+-- 8. Alter Assignments to support Memes
+ALTER TABLE assignments ADD COLUMN IF NOT EXISTS content_type TEXT NOT NULL DEFAULT 'comment' CHECK (content_type IN ('comment', 'meme'));
+ALTER TABLE assignments ADD COLUMN IF NOT EXISTS meme_id UUID REFERENCES memes(id) ON DELETE RESTRICT;
+
+ALTER TABLE assignments DISABLE TRIGGER trigger_prevent_assignment_mutation;
+ALTER TABLE assignments ALTER COLUMN suggestion_id DROP NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_assignment_exact_content' AND conrelid = 'assignments'::regclass) THEN
+        ALTER TABLE assignments ADD CONSTRAINT chk_assignment_exact_content CHECK (
+            (content_type = 'comment' AND suggestion_id IS NOT NULL AND meme_id IS NULL) OR
+            (content_type = 'meme' AND meme_id IS NOT NULL AND suggestion_id IS NULL)
+        );
+    END IF;
+END $$;
+ALTER TABLE assignments ENABLE TRIGGER trigger_prevent_assignment_mutation;
+
+-- Create constraint for exact-one suggestion or meme per unique visitor-campaign pair
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'unique_assignment_meme_compound' AND conrelid = 'assignments'::regclass) THEN
+        ALTER TABLE assignments ADD CONSTRAINT unique_assignment_meme_compound UNIQUE (id, campaign_id, campaign_post_id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_assignments_meme_compound' AND conrelid = 'assignments'::regclass) THEN
+        ALTER TABLE assignments ADD CONSTRAINT fk_assignments_meme_compound
+        FOREIGN KEY (meme_id) REFERENCES memes (id) ON DELETE RESTRICT;
+    END IF;
+END $$;
+
 COMMIT;

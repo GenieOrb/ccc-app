@@ -16,7 +16,9 @@
     "admin:hash-password": "node scripts/hash-admin-password.mjs"
   },
   "dependencies": {
+    "@google/genai": "^2.15.0",
     "@neondatabase/serverless": "^0.10.4",
+    "@vercel/blob": "^2.6.1",
     "next": "^15.1.7",
     "openai": "^4.85.4",
     "postcss": "^8.5.22",

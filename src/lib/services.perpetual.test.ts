@@ -98,7 +98,7 @@ describe('createPerpetualCampaign initial synchronization', () => {
 });
 
 describe('triggerReplenishmentIfNeeded for perpetual campaigns', () => {
-  it('reactivates the same failed replenishment cycle without inserting another cycle', async () => {
+  it('creates a new cycle instead of reactivating failed ones', async () => {
     queryDb.mockResolvedValue([{ campaign_type: 'perpetual', replenishment_threshold: 5, replenishment_size: 1, model_key: 'test-model' }]);
     generateDeterministicSlotPlans.mockReturnValue([{ assignedPostId: 'post-1', slotIndex: 0, lengthMode: 'short', emojiPolicy: 'none', rhetoricalForm: 'statement', texture: 'plain' }]);
     const insertCycle = vi.fn();
@@ -106,7 +106,7 @@ describe('triggerReplenishmentIfNeeded for perpetual campaigns', () => {
     const reactivateCycle = vi.fn();
     withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
       query: vi.fn(async (sql: string) => {
-        if (sql.includes('FROM campaigns WHERE id = $1')) return { rows: [{ id: 'campaign-1' }] };
+        if (sql.includes('FROM campaigns WHERE id = $1')) return { rows: [{ id: 'campaign-1', max_comments_total: null }] };
         if (sql.includes('FROM campaign_posts WHERE campaign_id')) return { rows: [{ id: 'post-1' }] };
         if (sql.includes('FROM campaign_posts WHERE id = $1 FOR UPDATE')) return { rows: [{ id: 'post-1' }] };
         if (sql.includes('FROM suggestions')) return { rows: [{ count: '0' }] };
@@ -128,40 +128,19 @@ describe('triggerReplenishmentIfNeeded for perpetual campaigns', () => {
 
     await triggerReplenishmentIfNeeded('campaign-1');
 
-    expect(insertCycle).not.toHaveBeenCalled();
-    expect(resetFailedJobs).toHaveBeenCalledOnce();
-    expect(reactivateCycle).toHaveBeenCalledOnce();
+    expect(insertCycle).toHaveBeenCalledOnce();
+    expect(resetFailedJobs).not.toHaveBeenCalled();
+    expect(reactivateCycle).not.toHaveBeenCalled();
   });
 
-  it('clears finished_at whenever a failed cycle is reactivated', async () => {
-    queryDb.mockResolvedValue([{ campaign_type: 'perpetual', replenishment_threshold: 5, replenishment_size: 1, model_key: 'test-model' }]);
-    let automaticReactivationSql = '';
-    withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
-      query: vi.fn(async (sql: string) => {
-        if (sql.includes('FROM campaigns WHERE id = $1')) return { rows: [{ id: 'campaign-1' }] };
-        if (sql.includes('FROM campaign_posts WHERE campaign_id')) return { rows: [{ id: 'post-1' }] };
-        if (sql.includes('FROM campaign_posts WHERE id = $1 FOR UPDATE')) return { rows: [{ id: 'post-1' }] };
-        if (sql.includes('FROM suggestions')) return { rows: [{ count: '0' }] };
-        if (sql.includes("status IN ('pending', 'processing')")) return { rows: [] };
-        if (sql.includes('FROM generation_cycles') && sql.includes("status = 'failed'")) return { rows: [{ id: 'failed-cycle' }] };
-        if (sql.includes('UPDATE generation_jobs')) return { rows: [] };
-        if (sql.includes('UPDATE generation_cycles')) {
-          automaticReactivationSql = sql;
-          return { rows: [] };
-        }
-        throw new Error(`Unexpected SQL in test: ${sql}`);
-      }),
-    }));
-
-    await triggerReplenishmentIfNeeded('campaign-1');
-
-    expect(automaticReactivationSql).toMatch(/finished_at\s*=\s*NULL/i);
+  it('retryFailedCampaignJobs clears finished_at whenever a failed cycle is reactivated', async () => {
 
     let manualReactivationSql = '';
     withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
       query: vi.fn(async (sql: string) => {
         if (sql.includes('FROM campaigns WHERE id = $1 FOR UPDATE')) return { rows: [{ id: 'campaign-1' }] };
-        if (sql.includes('FROM generation_cycles')) return { rows: [{ id: 'failed-cycle' }] };
+        if (sql.includes('FROM generation_cycles') && sql.includes("status = 'failed'")) return { rows: [{ id: 'failed-cycle' }] };
+        if (sql.includes('FROM generation_cycles') && sql.includes("status IN ('pending', 'processing')")) return { rows: [] };
         if (sql.includes('UPDATE generation_jobs')) return { rows: [] };
         if (sql.includes('UPDATE generation_cycles')) {
           manualReactivationSql = sql;
@@ -219,11 +198,9 @@ describe('triggerReplenishmentIfNeeded for perpetual campaigns', () => {
     const postLockIndex = queryOrder.findIndex((sql) => sql.includes('FROM campaign_posts WHERE id = $1 FOR UPDATE'));
     const availabilityIndex = queryOrder.findIndex((sql) => sql.includes('FROM suggestions') && sql.includes('campaign_post_id'));
     const activeCycleIndex = queryOrder.findIndex((sql) => sql.includes('FROM generation_cycles'));
-    const failedCycleIndex = queryOrder.findIndex((sql) => sql.includes("status = 'failed'"));
     expect(postLockIndex).toBeGreaterThan(-1);
     expect(postLockIndex).toBeLessThan(availabilityIndex);
     expect(postLockIndex).toBeLessThan(activeCycleIndex);
-    expect(failedCycleIndex).toBe(-1);
   });
 
   it('makes retry idempotent when the failed cycle has already been recovered', async () => {
@@ -232,7 +209,8 @@ describe('triggerReplenishmentIfNeeded for perpetual campaigns', () => {
       query: vi.fn(async (sql: string) => {
         queryOrder.push(sql);
         if (sql.includes('FROM campaigns WHERE id = $1 FOR UPDATE')) return { rows: [{ id: 'campaign-1' }] };
-        if (sql.includes('FROM generation_cycles')) return { rows: [] };
+        if (sql.includes('FROM generation_cycles') && sql.includes("status = 'failed'")) return { rows: [] };
+        if (sql.includes('FROM generation_cycles') && sql.includes("status IN ('pending', 'processing')")) return { rows: [] };
         throw new Error(`Unexpected SQL in test: ${sql}`);
       }),
     }));

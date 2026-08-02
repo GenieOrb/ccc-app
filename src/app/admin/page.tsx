@@ -655,12 +655,23 @@ export default function AdminDashboardPage() {
   const [displayName, setDisplayName] = useState('');
   const [modelKey, setModelKey] = useState('deepseek-v4-flash');
   const [models, setModels] = useState<Array<{key:string;displayName:string;inputPricePerMillion:number;outputPricePerMillion:number;configured:boolean;enabled:boolean}>>([]);
-  useEffect(() => { fetch('/api/admin/models').then(r => r.ok ? r.json() : null).then(data => { if (data?.models) setModels(data.models); }).catch(() => {}); }, []);
+  const [imageModels, setImageModels] = useState<Array<{key:string;displayName:string;costPerImage:number;configured:boolean;enabled:boolean}>>([]);
+
+  useEffect(() => {
+    fetch('/api/admin/models').then(r => r.ok ? r.json() : null).then(data => { if (data?.models) setModels(data.models); }).catch(() => {});
+    fetch('/api/admin/image-models').then(r => r.ok ? r.json() : null).then(data => { if (data?.models) setImageModels(data.models); }).catch(() => {});
+  }, []);
+
   const [urlsInput, setUrlsInput] = useState('');
   const [accountsInput, setAccountsInput] = useState('');
   const [postActiveLifetimeHours, setPostActiveLifetimeHours] = useState('24');
   const [maxCommentsTotalInput, setMaxCommentsTotalInput] = useState('');
   const [direction, setDirection] = useState('');
+
+  const [includeMemes, setIncludeMemes] = useState(true);
+  const [memePercentage, setMemePercentage] = useState('25');
+  const [memeModelKey, setMemeModelKey] = useState('dall-e-3');
+
   const [creating, setCreating] = useState(false);
   const [generatingPreview, setGeneratingPreview] = useState(false);
   const [createdPreview, setCreatedPreview] = useState<string[] | null>(null);
@@ -737,6 +748,8 @@ export default function AdminDashboardPage() {
     router.refresh();
   }
 
+  const [createdMemePreview, setCreatedMemePreview] = useState<Array<{imageBlobUrl: string; prompt: string; dimensions: {subjectType: string, visualStyle: string, tone: string}}> | null>(null);
+
   async function generatePreview(e: React.MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
@@ -746,6 +759,8 @@ export default function AdminDashboardPage() {
 
     setPreviewFormError(null);
     setGeneratingPreview(true);
+    setCreatedPreview(null);
+    setCreatedMemePreview(null);
 
     try {
       const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, displayName, modelKey };
@@ -794,6 +809,59 @@ export default function AdminDashboardPage() {
     }
   }
 
+  async function generateMemePreview(e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
+    if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
+
+    setPreviewFormError(null);
+    setGeneratingPreview(true);
+    setCreatedPreview(null);
+    setCreatedMemePreview(null);
+
+    try {
+      const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, memeModelKey };
+      if (campaignTypeToCreate === 'manual') {
+        payload.urlsInput = urlsInput;
+      } else {
+        payload.accountsInput = accountsInput;
+      }
+
+      const previewResponse = await fetch(`/api/admin/campaigns/preview/memes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (previewResponse.status === 504) {
+        throw new Error('La preview de memes tardó demasiado. Vuelve a intentarlo.');
+      }
+
+      const contentType = previewResponse.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        await previewResponse.text();
+        throw new Error(`Respuesta inesperada (HTTP ${previewResponse.status}).`);
+      }
+
+      const previewData = await previewResponse.json();
+      if (!previewResponse.ok) throw new Error(previewData.error || `Error HTTP ${previewResponse.status}.`);
+
+      const memes = previewData.preview?.memes;
+      if (!Array.isArray(memes) || memes.length !== 3) {
+        throw new Error('La preview devolvió una cantidad incorrecta de memes.');
+      }
+
+      setCreatedMemePreview(memes);
+    } catch (previewError: unknown) {
+      setPreviewFormError(previewError instanceof Error ? previewError.message : 'No se pudo generar el preview de memes.');
+      setCreatedMemePreview(null);
+    } finally {
+      setGeneratingPreview(false);
+    }
+  }
+
   async function handleCreateCampaign(creationMode: 'active' | 'inactive') {
     if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
     if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
@@ -804,7 +872,17 @@ export default function AdminDashboardPage() {
     setCreating(true);
 
     try {
-      const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, displayName, modelKey, creationMode };
+      const payload: Record<string, unknown> = {
+        campaignType: campaignTypeToCreate,
+        direction,
+        displayName,
+        modelKey,
+        creationMode,
+        includeMemes,
+        memePercentage: Number(memePercentage),
+        memeModelKey
+      };
+
       const trimmedMax = maxCommentsTotalInput.trim();
       if (trimmedMax !== '') {
         const parsedMaxTotal = Number(trimmedMax);
@@ -1044,6 +1122,32 @@ export default function AdminDashboardPage() {
               </p>
             </div>
 
+            <div className="form-group" style={{ padding: '16px', background: 'var(--surface-sunken)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+                <input type="checkbox" id="include-memes" checked={includeMemes} onChange={(e) => setIncludeMemes(e.target.checked)} disabled={creating} />
+                <label htmlFor="include-memes" className="form-label" style={{ marginBottom: 0, fontWeight: 'bold' }}>Habilitar Sistema de Memes Multimodal</label>
+              </div>
+
+              {includeMemes && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  <div>
+                    <label className="form-label">Porcentaje de Memes (%)</label>
+                    <input type="number" min="0" max="100" className="form-textarea" style={{ minHeight: 'auto', padding: '8px' }} value={memePercentage} onChange={(e) => setMemePercentage(e.target.value)} disabled={creating} />
+                  </div>
+                  <div>
+                    <label className="form-label">Modelo Generador de Imágenes</label>
+                    <select className="form-textarea" style={{ minHeight: 'auto', padding: '8px' }} value={memeModelKey} onChange={(e) => setMemeModelKey(e.target.value)} disabled={creating}>
+                      {imageModels.map(model => (
+                        <option key={model.key} value={model.key} disabled={!model.enabled || !model.configured}>
+                          {model.displayName} — Base Cost ${model.costPerImage} {!model.configured ? '(No config)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <div className="form-group">
               <label htmlFor="direction-input" className="form-label">
                 Dirección de los comentarios (opcional)
@@ -1073,7 +1177,7 @@ export default function AdminDashboardPage() {
               </div>
             </div>
 
-            <div style={{ display: 'flex', gap: '8px' }}>
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
               <button
                 type="submit"
                 className="btn-admin btn-primary"
@@ -1095,8 +1199,18 @@ export default function AdminDashboardPage() {
                 disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
                 onClick={generatePreview}
               >
-                {generatingPreview ? 'Generando preview...' : 'Generar preview'}
+                {generatingPreview ? 'Generando preview...' : 'Generar preview de comentarios'}
               </button>
+              {includeMemes && (
+                <button
+                  type="button"
+                  className="btn-admin btn-secondary"
+                  disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
+                  onClick={generateMemePreview}
+                >
+                  {generatingPreview ? 'Generando preview...' : 'Generar preview de memes'}
+                </button>
+              )}
             </div>
             {previewFormError && (
               <div style={{ marginTop: '16px', color: 'var(--error-color)' }}>
@@ -1109,6 +1223,26 @@ export default function AdminDashboardPage() {
                 <ol style={{ whiteSpace: 'pre-wrap', listStyleType: 'decimal', paddingLeft: '20px' }}>
                   {createdPreview.map((comment, index) => <li key={index} style={{ marginBottom: '12px' }}>{comment}</li>)}
                 </ol>
+              </section>
+            )}
+            {createdMemePreview && (
+              <section aria-label="Preview de memes generados" style={{ marginTop: '16px' }}>
+                <strong>Preview de memes</strong>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: '16px', marginTop: '12px' }}>
+                  {createdMemePreview.map((meme, index) => (
+                    <div key={index} style={{ border: '1px solid var(--border-color)', borderRadius: '8px', overflow: 'hidden' }}>
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={meme.imageBlobUrl} alt={`Meme ${index + 1}`} style={{ width: '100%', height: 'auto', display: 'block' }} />
+                      <div style={{ padding: '12px', fontSize: '0.8rem', background: 'var(--surface-sunken)' }}>
+                        <p style={{ margin: '0 0 8px 0', fontWeight: 'bold' }}>Prompt:</p>
+                        <p style={{ margin: 0, color: 'var(--text-muted)' }}>{meme.prompt}</p>
+                        <div style={{ marginTop: '8px', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                          <em>Dimensiones: {meme.dimensions.subjectType} / {meme.dimensions.visualStyle} / {meme.dimensions.tone}</em>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </section>
             )}
           </form>

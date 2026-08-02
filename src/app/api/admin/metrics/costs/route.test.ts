@@ -38,6 +38,7 @@ describe('Costs Route', () => {
     vi.mocked(isAdminAuthenticated).mockResolvedValue(true);
     vi.mocked(queryDb).mockResolvedValue([{
       ai_cost: '10.50',
+      ai_memes_cost: '2.00',
       x_cost: '2.00',
       unknown_ai: '0',
       unknown_x: '0'
@@ -51,8 +52,9 @@ describe('Costs Route', () => {
       periodDays: 30,
       currency: "USD",
       aiCost: 10.50,
+      aiMemesCost: 2.00,
       xCost: 2.00,
-      totalCost: 12.50,
+      totalCost: 14.50,
       costIsComplete: true,
       unknownAiCostCalls: 0,
       unknownXCostCalls: 0
@@ -64,6 +66,7 @@ describe('Costs Route', () => {
     vi.mocked(isAdminAuthenticated).mockResolvedValue(true);
     vi.mocked(queryDb).mockResolvedValue([{
       ai_cost: '0',
+      ai_memes_cost: null,
       x_cost: null,
       unknown_ai: '1',
       unknown_x: '5'
@@ -77,6 +80,7 @@ describe('Costs Route', () => {
       periodDays: 30,
       currency: "USD",
       aiCost: 0,
+      aiMemesCost: 0,
       xCost: 0,
       totalCost: 0,
       costIsComplete: false,

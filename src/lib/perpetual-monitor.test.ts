@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { PoolClient } from '@neondatabase/serverless';
+
 
 const { queryDb, withTransaction, fetchNewXPostsForAccount, checkCampaignSafety } = vi.hoisted(() => ({ queryDb: vi.fn(), withTransaction: vi.fn(), fetchNewXPostsForAccount: vi.fn(), checkCampaignSafety: vi.fn() }));
 

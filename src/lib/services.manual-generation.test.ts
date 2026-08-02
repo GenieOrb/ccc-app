@@ -67,6 +67,7 @@ describe('manual campaign generation inventory', () => {
         queries.push({ sql, params });
         if (sql.includes('INSERT INTO campaigns')) return { rows: [{ id: 'campaign-1' }] };
         if (sql.includes('INSERT INTO campaign_posts')) return { rows: [{ id: `post-${++insertedPosts}` }] };
+        if (sql.includes('INSERT INTO meme_generation_cycles')) return { rows: [{ id: `mcycle-${++insertedCycles}` }] };
         if (sql.includes('INSERT INTO generation_cycles')) return { rows: [{ id: `cycle-${++insertedCycles}` }] };
         return { rows: [] };
       }),
@@ -95,6 +96,7 @@ describe('manual campaign generation inventory', () => {
         if (sql.includes('FROM suggestions')) return { rows: [{ count: params?.[1] === 'stocked-post' ? '6' : '5' }] };
         if (sql.includes('SELECT 1 FROM generation_cycles')) return { rows: [] };
         if (sql.includes('FOR UPDATE')) return { rows: [{ id: params?.[0] }] };
+        if (sql.includes('INSERT INTO meme_generation_cycles')) return { rows: [{ id: 'mcycle-depleted' }] };
         if (sql.includes('INSERT INTO generation_cycles')) return { rows: [{ id: 'cycle-depleted' }] };
         return { rows: [] };
       }),
@@ -143,6 +145,7 @@ describe('manual campaign generation inventory', () => {
         queries.push({ sql, params });
         if (sql.includes('INSERT INTO campaigns')) return { rows: [{ id: 'campaign-inactive' }] };
         if (sql.includes('INSERT INTO campaign_posts')) return { rows: [{ id: 'post-inactive' }] };
+        if (sql.includes('INSERT INTO meme_generation_cycles')) return { rows: [{ id: 'mcycle-inactive' }] };
         if (sql.includes('INSERT INTO generation_cycles')) return { rows: [{ id: 'cycle-inactive' }] };
         return { rows: [] };
       }),

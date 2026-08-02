@@ -1,3 +1,4 @@
+/* eslint-disable @next/next/no-img-element */
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
@@ -15,6 +16,9 @@ export default function PublicCommentView({ slug }: Props) {
   const [postUrl, setPostUrl] = useState('');
   const [replyIntentUrl, setReplyIntentUrl] = useState('');
   const [comment, setComment] = useState('');
+  const [assignmentType, setAssignmentType] = useState<'comment' | 'meme'>('comment');
+  const [memeViewUrl, setMemeViewUrl] = useState('');
+  const [memeDownloadUrl, setMemeDownloadUrl] = useState('');
   const [hasCopied, setHasCopied] = useState(false);
   const [isCompleted, setIsCompleted] = useState(false);
   const [, setIsPosting] = useState(false);
@@ -38,8 +42,15 @@ export default function PublicCommentView({ slug }: Props) {
         if (res.ok && data.status === 'success') {
           setAssignmentId(data.assignmentId || '');
           setPostUrl(data.postUrl || '');
-          setReplyIntentUrl(data.replyIntentUrl || '');
-          setComment(data.comment || '');
+          if (data.type === 'meme') {
+            setAssignmentType('meme');
+            setMemeViewUrl(data.viewUrl || '');
+            setMemeDownloadUrl(data.downloadUrl || '');
+          } else {
+            setAssignmentType('comment');
+            setReplyIntentUrl(data.replyIntentUrl || '');
+            setComment(data.comment || '');
+          }
           setStatus('success');
         } else if (data.status === 'expired') {
           setStatus('expired');
@@ -182,7 +193,7 @@ export default function PublicCommentView({ slug }: Props) {
 
   if (status === 'generating') return shell(<div className="public-card"><div className="status-message"><span className="spinner" />{waitLong ? 'This should only take a moment.' : 'Wait please...'}</div></div>);
 
-  if (status === 'error' || !comment) {
+  if (status === 'error' || (assignmentType === 'comment' && !comment) || (assignmentType === 'meme' && !memeViewUrl)) {
     return (
       shell(<>
         <div className="public-card">
@@ -201,13 +212,34 @@ export default function PublicCommentView({ slug }: Props) {
       <div className="public-card">
         {/* Instructions in English */}
         <ol className="instructions-list">
-          <li className="instruction-item">1. Tap “Copy”</li>
-          <li className="instruction-item">2. Tap “Post”</li>
-          <li className="instruction-item">3. Paste the comment and post it</li>
+          {assignmentType === 'meme' ? (
+            <>
+              <li className="instruction-item">1. Tap “Download” to save the image</li>
+              <li className="instruction-item">2. Tap “Post”</li>
+              <li className="instruction-item">3. Reply with the downloaded image</li>
+            </>
+          ) : (
+            <>
+              <li className="instruction-item">1. Tap “Copy”</li>
+              <li className="instruction-item">2. Tap “Post”</li>
+              <li className="instruction-item">3. Paste the comment and post it</li>
+            </>
+          )}
         </ol>
 
-        {/* Plain text uneditable comment display */}
-        <div className="comment-box">{comment}</div>
+        {assignmentType === 'comment' ? (
+          <div className="comment-box">{comment}</div>
+        ) : (
+          <div className="memes-container" style={{ marginTop: '15px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {memeViewUrl ? (
+              <img src={memeViewUrl} alt="Meme" style={{ width: '100%', borderRadius: '8px' }} />
+            ) : (
+              <div style={{ width: '100%', height: '200px', backgroundColor: '#e2e8f0', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b' }}>
+                Placeholder Estético
+              </div>
+            )}
+          </div>
+        )}
 
         {postError && (
           <div className="status-message" style={{ fontSize: '0.9rem', marginBottom: '10px' }}>
@@ -217,13 +249,11 @@ export default function PublicCommentView({ slug }: Props) {
 
         {/* Public Action Buttons */}
         <div className="public-actions">
-          <button
-            type="button"
-            onClick={handleCopy}
-            className="btn-public btn-copy"
-          >
-            Copy
-          </button>
+          {assignmentType === 'comment' ? (
+            <button type="button" onClick={handleCopy} className="btn-public btn-copy">Copy</button>
+          ) : (
+            <a href={memeDownloadUrl} download className="btn-public btn-copy" style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', textDecoration: 'none' }} onClick={() => setHasCopied(true)}>Download</a>
+          )}
 
           {!canPost ? (
             <button

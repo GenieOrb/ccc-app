@@ -9,20 +9,20 @@ import { ALLOWED_EMOJIS } from './planner';
 
 const cachedClients = new Map<string, OpenAI>();
 
-function createRequestDeadline(timeoutMs?: number): number | undefined {
+export function createRequestDeadline(timeoutMs?: number): number | undefined {
   if (timeoutMs === undefined) return undefined;
   const timeout = Number.isFinite(timeoutMs) ? Math.max(1, Math.floor(timeoutMs)) : 1;
   return Date.now() + timeout;
 }
 
-function requestOptionsForDeadline(deadline?: number) {
+export function requestOptionsForDeadline(deadline?: number) {
   if (deadline === undefined) return undefined;
   const timeout = Math.floor(deadline - Date.now());
   if (timeout <= 0) throw new Error('Provider request time budget exhausted.');
   return { timeout, maxRetries: 0 };
 }
 
-function getOpenAIClient(provider: 'openai' | 'deepseek' | 'qwen' = 'openai'): OpenAI {
+export function getOpenAIClient(provider: 'openai' | 'deepseek' | 'qwen' = 'openai'): OpenAI {
   const cached = cachedClients.get(provider);
   if (cached) return cached;
     const config = getConfig();

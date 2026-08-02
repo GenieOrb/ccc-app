@@ -17,18 +17,21 @@ export async function GET() {
   try {
     const res = await queryDb<{
       ai_cost: string | null,
+      ai_memes_cost: string | null,
       x_cost: string | null,
       unknown_ai: string | null,
       unknown_x: string | null
     }>(`
       SELECT
         (SELECT SUM(estimated_cost) FROM generation_api_calls WHERE estimated_cost IS NOT NULL AND status = 'succeeded' AND created_at >= NOW() - INTERVAL '30 days') as ai_cost,
+        (SELECT SUM(accumulated_cost) FROM meme_generation_jobs WHERE created_at >= NOW() - INTERVAL '30 days') as ai_memes_cost,
         (SELECT SUM(estimated_cost) FROM x_api_calls WHERE estimated_cost IS NOT NULL AND status = 'succeeded' AND created_at >= NOW() - INTERVAL '30 days') as x_cost,
         (SELECT COUNT(*) FROM generation_api_calls WHERE estimated_cost IS NULL AND status = 'succeeded' AND created_at >= NOW() - INTERVAL '30 days') as unknown_ai,
         (SELECT COUNT(*) FROM x_api_calls WHERE estimated_cost IS NULL AND status = 'succeeded' AND created_at >= NOW() - INTERVAL '30 days') as unknown_x
     `);
 
     const aiCost = isFinite(Number(res[0]?.ai_cost)) ? Number(res[0]?.ai_cost) || 0 : 0;
+    const aiMemesCost = isFinite(Number(res[0]?.ai_memes_cost)) ? Number(res[0]?.ai_memes_cost) || 0 : 0;
     const xCost = isFinite(Number(res[0]?.x_cost)) ? Number(res[0]?.x_cost) || 0 : 0;
     const unknownAiCostCalls = parseInt(res[0]?.unknown_ai || '0', 10);
     const unknownXCostCalls = parseInt(res[0]?.unknown_x || '0', 10);
@@ -39,8 +42,9 @@ export async function GET() {
       periodDays: 30,
       currency: "USD",
       aiCost,
+      aiMemesCost,
       xCost,
-      totalCost: aiCost + xCost,
+      totalCost: aiCost + aiMemesCost + xCost,
       costIsComplete,
       unknownAiCostCalls,
       unknownXCostCalls

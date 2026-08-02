@@ -66,9 +66,24 @@ export async function POST(
       );
     }
 
+    if (result.type === 'meme') {
+      return NextResponse.json(
+        {
+          status: 'success',
+          type: 'meme',
+          assignmentId: result.assignmentId,
+          postUrl: result.postUrl,
+          viewUrl: result.viewUrl,
+          downloadUrl: result.downloadUrl,
+        },
+        { status: 200, headers: { 'Cache-Control': 'no-store' } }
+      );
+    }
+
     return NextResponse.json(
       {
         status: 'success',
+        type: 'comment',
         assignmentId: result.assignmentId,
         comment: result.comment,
         postUrl: result.postUrl,

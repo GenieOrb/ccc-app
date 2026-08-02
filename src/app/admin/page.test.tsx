@@ -253,7 +253,7 @@ describe('administration campaign cards', () => {
 
     fireEvent.click(
       screen.getByRole('button', {
-        name: /^generar preview$/i,
+        name: /^generar preview de comentarios$/i,
       })
     );
 
