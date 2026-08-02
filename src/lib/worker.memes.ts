@@ -6,7 +6,7 @@ import { performMemeAnalysis } from './memes/analysis';
 import { generateMemeImage, MemeGenerationResult } from './memes/generation';
 import { validateMemeImage } from './memes/validation';
 import { MemeSlotPlan } from './memes/planner';
-import { ImageModelDefinition } from './ai/image-models';
+import { ImageModelSnapshot } from './ai/image-models';
 
 export interface MemeClaimedJob {
   jobId: string;
@@ -18,7 +18,7 @@ export interface MemeClaimedJob {
   slotPlan: MemeSlotPlan;
   deterministicDimensions: unknown;
   assetSnapshot: Record<string, unknown> | null;
-  modelSnapshot: ImageModelDefinition;
+  modelSnapshot: ImageModelSnapshot;
   attemptsCount: number;
   postText?: string;
   authorName?: string;
@@ -118,11 +118,15 @@ async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null
          COALESCE(p.author_name, md.config->>'authorName') as author_name,
          COALESCE(p.author_username, md.config->>'authorUsername') as author_username,
          COALESCE(p.accessible_context, (md.config->>'accessibleContext')::jsonb) as accessible_context,
-         COALESCE(c.direction, md.config->>'direction') as direction
+         COALESCE(c.direction, md.config->>'direction') as direction,
+         cy.model_key as cycle_model_key,
+         cy.provider as cycle_provider,
+         cy.api_model as cycle_api_model
        FROM meme_generation_jobs j
        LEFT JOIN campaign_posts p ON j.campaign_post_id = p.id
        LEFT JOIN campaigns c ON j.campaign_id = c.id
        LEFT JOIN meme_drafts md ON j.draft_id = md.id
+       LEFT JOIN meme_generation_cycles cy ON j.cycle_id = cy.id
        WHERE (
          (j.status = 'pending' AND j.next_attempt_at <= NOW())
          OR (j.status = 'processing' AND j.lease_expires_at < NOW())
@@ -141,14 +145,29 @@ async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null
 
     const row = selectRes.rows[0];
 
+    const rawSnap = (typeof row.model_snapshot === 'object' && row.model_snapshot !== null) 
+       ? (row.model_snapshot as Record<string, unknown>) 
+       : {};
+
+    const normKey = String(rawSnap.key || rawSnap.modelKey || rawSnap.model_key || row.cycle_model_key || '');
+    const normProvider = String(rawSnap.provider || row.cycle_provider || '');
+    const normApiModel = String(rawSnap.apiModel || rawSnap.api_model || rawSnap.model_name || row.cycle_api_model || '');
+
+    const canonicalSnapshot: ImageModelSnapshot = {
+       key: normKey,
+       provider: normProvider as 'openai' | 'google',
+       apiModel: normApiModel
+    };
+
     await client.query(
       `UPDATE meme_generation_jobs
        SET status = 'processing',
            lease_owner = $1,
            lease_expires_at = NOW() + INTERVAL '${leaseDurationSeconds} seconds',
+           model_snapshot = $2,
            updated_at = NOW()
-       WHERE id = $2`,
-      [workerId, row.job_id]
+       WHERE id = $3`,
+      [workerId, JSON.stringify(canonicalSnapshot), row.job_id]
     );
 
     // Update cycle if it's the first time
@@ -170,7 +189,7 @@ async function claimNextMemeJob(workerId: string): Promise<MemeClaimedJob | null
       slotPlan: row.slot_plan,
       deterministicDimensions: row.deterministic_dimensions,
       assetSnapshot: row.asset_snapshot,
-      modelSnapshot: row.model_snapshot,
+      modelSnapshot: canonicalSnapshot,
       attemptsCount: row.attempts_count,
       postText: row.post_text,
       authorName: row.author_name,
@@ -189,18 +208,36 @@ async function executeMemeJobTask(
   let currentCost = 0;
 
   try {
+  try {
+    if (!job.modelSnapshot.key || !job.modelSnapshot.provider || !job.modelSnapshot.apiModel) {
+      console.error(`Invalid meme model snapshot: apiModel is missing for job ${job.jobId}`);
+      job.attemptsCount = 99; // Prevents indefinite retries
+      throw new Error('No se pudo recuperar el modelo de imagen asociado al trabajo.');
+    }
+
     const postText = job.postText || '';
     const campaignDirection = job.campaignDirection || 'General campaign';
+    const callKeyBase = `${job.jobId}:${job.attemptsCount + 1}`;
 
-    const logCall = async (purpose: string, cost: number, provider: string, apiModel: string, status: string, error?: string) => {
-      await queryDb(`
+    const startApiCall = async (purpose: string): Promise<string> => {
+       const callKey = `${callKeyBase}:${purpose}`;
+       await queryDb(`
          INSERT INTO meme_api_calls (
-           call_key, campaign_id, draft_id, cycle_id, job_id, purpose, provider, model_key, api_model, status, total_cost, pricing_snapshot, currency, error_message, finished_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'USD', $13, NOW())
+           call_key, campaign_id, draft_id, cycle_id, job_id, purpose, provider, model_key, api_model, status, total_cost, pricing_snapshot, currency
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'started', 0, $10, 'USD')
+         ON CONFLICT (call_key) DO NOTHING
        `, [
-         `${job.jobId}:${job.attemptsCount + 1}:${purpose}:${randomUUID()}`,
-         job.campaignId || null, job.draftId || null, job.cycleId, job.jobId, purpose, provider, job.modelSnapshot.key, apiModel, status, cost, JSON.stringify(job.modelSnapshot), error || null
+         callKey, job.campaignId || null, job.draftId || null, job.cycleId, job.jobId, purpose, job.modelSnapshot.provider, job.modelSnapshot.key, job.modelSnapshot.apiModel, JSON.stringify(job.modelSnapshot)
        ]);
+       return callKey;
+    };
+
+    const finishApiCall = async (callKey: string, cost: number, status: string, error?: string) => {
+       await queryDb(`
+         UPDATE meme_api_calls
+         SET status = $1, total_cost = $2, error_message = $3, finished_at = NOW()
+         WHERE call_key = $4
+       `, [status, cost, error || null, callKey]);
     };
 
     // 1. ANÁLISIS SEMÁNTICO PREVIO
@@ -233,7 +270,9 @@ async function executeMemeJobTask(
 
     // 2. GENERATE MEME IMAGE
     let generation: MemeGenerationResult;
+    let currentCallKey = `${callKeyBase}:generation`;
     try {
+      await startApiCall('generation');
       generation = await generateMemeImage(
         job.slotPlan,
         analysis,
@@ -242,10 +281,10 @@ async function executeMemeJobTask(
       );
       currentCost += parseFloat(generation.cost);
       metrics.cost = currentCost;
-      await logCall('generation', parseFloat(generation.cost), job.modelSnapshot.provider, job.modelSnapshot.apiModel, 'succeeded');
+      await finishApiCall(currentCallKey, parseFloat(generation.cost), 'succeeded');
     } catch (e: unknown) {
       const errorMessage = e instanceof Error ? e.message : String(e);
-      await logCall('generation', 0, job.modelSnapshot.provider, job.modelSnapshot.apiModel, 'failed', errorMessage);
+      await finishApiCall(currentCallKey, 0, 'failed', errorMessage);
       throw e;
     }
 
@@ -265,23 +304,25 @@ async function executeMemeJobTask(
       metrics.boundedErrors++;
 
       // Intentamos otra vez
-      try {
-        const regenerateInstruction = `FAILED VALIDATION REASON: ${validation.reason}\n\nCRITICAL: Simplify radically, remove all explanations, remove extra labels, reduce scene complexity, express one immediate visual joke. Do NOT render text if no_text was specified!`;
-        generation = await generateMemeImage(
-          job.slotPlan,
-          analysis,
-          job.modelSnapshot.key,
-          assetData,
-          regenerateInstruction
-        );
-        currentCost += parseFloat(generation.cost);
-        metrics.cost = currentCost;
-        await logCall('regeneration', parseFloat(generation.cost), job.modelSnapshot.provider, job.modelSnapshot.apiModel, 'succeeded');
-      } catch (e: unknown) {
-        const errorMessage = e instanceof Error ? e.message : String(e);
-        await logCall('regeneration', 0, job.modelSnapshot.provider, job.modelSnapshot.apiModel, 'failed', errorMessage);
-        throw e;
-      }
+        currentCallKey = `${callKeyBase}:regeneration`;
+        try {
+          await startApiCall('regeneration');
+          const regenerateInstruction = `FAILED VALIDATION REASON: ${validation.reason}\n\nCRITICAL: Simplify radically, remove all explanations, remove extra labels, reduce scene complexity, express one immediate visual joke. Do NOT render text if no_text was specified!`;
+          generation = await generateMemeImage(
+            job.slotPlan,
+            analysis,
+            job.modelSnapshot.key,
+            assetData,
+            regenerateInstruction
+          );
+          currentCost += parseFloat(generation.cost);
+          metrics.cost = currentCost;
+          await finishApiCall(currentCallKey, parseFloat(generation.cost), 'succeeded');
+        } catch (e: unknown) {
+          const errorMessage = e instanceof Error ? e.message : String(e);
+          await finishApiCall(currentCallKey, 0, 'failed', errorMessage);
+          throw e;
+        }
 
       validation = await validateMemeImage(
         generation.imageBuffer,

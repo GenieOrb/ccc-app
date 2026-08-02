@@ -13,6 +13,20 @@ export interface ImageModelDefinition {
   defaultResolution: { width: number; height: number };
 }
 
+export interface ImageModelSnapshot {
+  key: string;
+  provider: 'openai' | 'google';
+  apiModel: string;
+}
+
+export function createImageModelSnapshot(model: ImageModelDefinition): ImageModelSnapshot {
+  return {
+    key: model.key,
+    provider: model.provider,
+    apiModel: model.apiModel
+  };
+}
+
 export const IMAGE_MODELS: Record<string, ImageModelDefinition> = {
   'gpt-image-2': {
     key: 'gpt-image-2',

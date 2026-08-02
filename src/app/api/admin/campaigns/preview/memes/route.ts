@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { isAdminAuthenticated, validateSameOrigin } from '@/lib/auth';
 import { generateDeterministicMemeSlotPlans } from '@/lib/memes/planner';
-import { resolveImageModel } from '@/lib/ai/image-models';
+import { resolveImageModel, createImageModelSnapshot } from '@/lib/ai/image-models';
 import { parseMultipleXUrls, fetchXPosts, resolveXUsername, fetchNewXPostsForAccount } from '@/lib/x-api';
 import { normalizeXAccounts } from '@/lib/x-accounts';
 import { z } from 'zod';
@@ -181,7 +181,7 @@ export async function POST(req: Request) {
             JSON.stringify(plan),
             JSON.stringify({}),
             assetSnapshot ? JSON.stringify(assetSnapshot) : null,
-            JSON.stringify({ key: model.key, provider: model.provider, model_name: model.apiModel })
+            JSON.stringify(createImageModelSnapshot(model))
           ]
         );
       }
