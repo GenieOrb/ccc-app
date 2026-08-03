@@ -31,12 +31,15 @@ export async function generateMemeImage(
 Immediate Joke: ${analysis.immediate_joke}
 Single Visual Focus: ${analysis.single_visual_focus}
 Familiar Physical Situation: ${analysis.familiar_physical_situation}
+Post Connection (must be visually clear): ${analysis.post_connection}
 
 Deterministic Constraints:
-- Text Quantity: ${plan.textQuantity === 'no_text' ? 'DO NOT RENDER ANY CAPTIONS, LABELS, SIGNS, HEADINGS, OR WORDS.' : plan.textQuantity === 'short_text' ? 'RENDER EXACTLY 1 TO 5 WORDS TOTAL, AND NO OTHER GENERATED TEXT.' : plan.textQuantity}
+- Text Quantity: ${plan.textQuantity === 'no_text' ? (plan.brandText ? 'DO NOT RENDER ANY TEXT EXCEPT THE REQUIRED BRAND TEXT BELOW.' : 'DO NOT RENDER ANY CAPTIONS, LABELS, SIGNS, HEADINGS, OR WORDS.') : plan.textQuantity === 'short_text' ? 'RENDER EXACTLY 1 TO 5 WORDS TOTAL, AND NO OTHER GENERATED TEXT.' : plan.textQuantity}
 - Visual Structure: ${plan.visualStructure}
 - Humor Tone: ${plan.humorTone}
 - Scene Complexity: ${plan.sceneComplexity}
+- Post Relationship: ${plan.postRelationship}
+${plan.brandText ? `- REQUIRED BRAND TEXT: Include "${plan.brandText}" exactly, with identical spelling and casing. Do not alter, omit, translate, or duplicate it.` : ''}
 
 IMPORTANT GUIDELINES:
 - NO ads.

@@ -8,6 +8,16 @@ import { checkCampaignSafety } from './openai';
 import { generateSecureSlug } from './crypto';
 import { generateDeterministicSlotPlans } from './planner';
 import { parseBrandVariantsSafe } from './brand-variants';
+
+function createMemeAssetSnapshot(
+  plan: { assetId?: string; secondaryAssetId?: string },
+  availableAssets: Array<{ id: string }>
+) {
+  const primaryAsset = availableAssets.find((asset) => asset.id === plan.assetId);
+  if (!primaryAsset) return null;
+  const secondaryAsset = availableAssets.find((asset) => asset.id === plan.secondaryAssetId);
+  return { primaryAsset, secondaryAsset: secondaryAsset || null };
+}
 import { DEFAULT_MODEL_KEY, getAiModel, isProviderConfigured } from './ai/models';
 import { generateSingleComment } from './openai';
 import { processPerpetualCampaigns, type PerpetualMonitorSummary } from './perpetual-monitor';
@@ -450,7 +460,7 @@ export async function createCampaign(params: {
           sha256: a.sha256_hash, width: a.width, height: a.height
         }));
 
-        const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [campaignPostIds[0]], remainingToGenerate, availableAssets);
+        const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [campaignPostIds[0]], remainingToGenerate, availableAssets, params.brandVariants || []);
         const mCycleRes = await client.query<{ id: string }>(
           `INSERT INTO meme_generation_cycles (
               campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, provider, api_model, planner_version, pricing_snapshot
@@ -462,11 +472,7 @@ export async function createCampaign(params: {
         const mCycleId = mCycleRes.rows[0].id;
 
         for (const plan of memePlans) {
-          let assetSnapshot = null;
-          if (plan.requiresAsset && plan.assetId) {
-             const matched = availableAssets.find(a => a.id === plan.assetId);
-             if (matched) assetSnapshot = matched;
-          }
+          const assetSnapshot = createMemeAssetSnapshot(plan, availableAssets);
           await client.query(
             `INSERT INTO meme_generation_jobs (
                cycle_id, campaign_id, campaign_post_id, slot_index, slot_plan,
@@ -810,7 +816,17 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
 
               const mRepSize = repSize;
 
-              const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [postId], mRepSize, []);
+              const memeAssetsRes = await client.query(
+                `SELECT id, asset_type, appearance_percentage, instruction, storage_key, mime_type, sha256_hash, width, height
+                 FROM meme_assets WHERE campaign_id = $1 AND status = 'active'`,
+                [campaignId]
+              );
+              const availableMemeAssets = memeAssetsRes.rows.map((asset) => ({
+                id: asset.id, assetType: asset.asset_type, appearancePercentage: asset.appearance_percentage,
+                instruction: asset.instruction, storageKey: asset.storage_key, mimeType: asset.mime_type,
+                sha256: asset.sha256_hash, width: asset.width, height: asset.height,
+              }));
+              const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [postId], mRepSize, availableMemeAssets, parseBrandVariantsSafe(campaignInfo.brand_variants));
               if (memePlans.length > 0) {
                 let mCycleId: string;
                 try {
@@ -828,14 +844,15 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
                     await client.query(
                       `INSERT INTO meme_generation_jobs (
                          cycle_id, campaign_id, campaign_post_id, slot_index, slot_plan,
-                         deterministic_dimensions, model_snapshot, status
+                         deterministic_dimensions, model_snapshot, asset_snapshot, status
                        ) VALUES (
-                         $1, $2, $3, $4, $5, $6, $7, 'pending'
+                         $1, $2, $3, $4, $5, $6, $7, $8, 'pending'
                        )`,
                       [
                         mCycleId, campaignId, plan.assignedPostId, plan.slotIndex, JSON.stringify(plan),
                         JSON.stringify({ text: plan.textQuantity, structure: plan.visualStructure, tone: plan.humorTone }),
-                        JSON.stringify(memeModel)
+                        JSON.stringify(memeModel),
+                        JSON.stringify(createMemeAssetSnapshot(plan, availableMemeAssets))
                       ]
                     );
                   }
@@ -979,7 +996,17 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
 
               const mRepSize = repSize;
 
-              const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [postId], mRepSize, []);
+              const memeAssetsRes = await client.query(
+                `SELECT id, asset_type, appearance_percentage, instruction, storage_key, mime_type, sha256_hash, width, height
+                 FROM meme_assets WHERE campaign_id = $1 AND status = 'active'`,
+                [campaignId]
+              );
+              const availableMemeAssets = memeAssetsRes.rows.map((asset) => ({
+                id: asset.id, assetType: asset.asset_type, appearancePercentage: asset.appearance_percentage,
+                instruction: asset.instruction, storageKey: asset.storage_key, mimeType: asset.mime_type,
+                sha256: asset.sha256_hash, width: asset.width, height: asset.height,
+              }));
+              const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [postId], mRepSize, availableMemeAssets, parseBrandVariantsSafe(campaignInfo.brand_variants));
               if (memePlans.length > 0) {
                 let mCycleId: string;
                 try {
@@ -997,14 +1024,15 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
                     await client.query(
                       `INSERT INTO meme_generation_jobs (
                          cycle_id, campaign_id, campaign_post_id, slot_index, slot_plan,
-                         deterministic_dimensions, model_snapshot, status
+                         deterministic_dimensions, model_snapshot, asset_snapshot, status
                        ) VALUES (
-                         $1, $2, $3, $4, $5, $6, $7, 'pending'
+                         $1, $2, $3, $4, $5, $6, $7, $8, 'pending'
                        )`,
                       [
                         mCycleId, campaignId, plan.assignedPostId, plan.slotIndex, JSON.stringify(plan),
                         JSON.stringify({ text: plan.textQuantity, structure: plan.visualStructure, tone: plan.humorTone }),
-                        JSON.stringify(memeModel)
+                        JSON.stringify(memeModel),
+                        JSON.stringify(createMemeAssetSnapshot(plan, availableMemeAssets))
                       ]
                     );
                   }

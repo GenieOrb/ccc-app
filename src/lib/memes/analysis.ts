@@ -9,6 +9,7 @@ export const MemePreflightAnalysisSchema = z.object({
   immediate_joke: z.string().describe("What is the immediate visual joke that takes 1 second to understand?"),
   single_visual_focus: z.string().describe("What is the SINGLE main visual focus of the image? (e.g. A cat staring at a screen)"),
   familiar_physical_situation: z.string().describe("What familiar, physical, real-world situation represents this? NO abstract concepts, NO diagrams, NO text."),
+  post_connection: z.string().min(1).describe("The specific detail from the original post that the visual joke reacts to."),
   requires_asset: z.boolean().describe("Si el concepto requiere un activo de marca específico que se haya proveído."),
   selected_asset_id: z.string().optional().describe("ID del asset seleccionado, si aplica y requires_asset es true.")
 });
@@ -58,11 +59,12 @@ El meme debe ser extremadamente simple, visual, con una única idea principal y 
       immediate_joke: { type: Type.STRING },
       single_visual_focus: { type: Type.STRING },
       familiar_physical_situation: { type: Type.STRING },
+      post_connection: { type: Type.STRING },
       requires_asset: { type: Type.BOOLEAN },
       selected_asset_id: { type: Type.STRING }
     },
     required: [
-      "immediate_joke", "single_visual_focus", "familiar_physical_situation", "requires_asset"
+      "immediate_joke", "single_visual_focus", "familiar_physical_situation", "post_connection", "requires_asset"
     ]
   };
 

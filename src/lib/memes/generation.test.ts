@@ -63,4 +63,26 @@ describe('generateMemeImage (Gemini adapter)', () => {
     // Check generateImages was NOT called
     expect(genAiInstance.models.generateImages).not.toHaveBeenCalled();
   });
+
+  it('incluye la marca exacta y la relaciÃ³n obligatoria con el post en el prompt', async () => {
+    vi.mocked(config.getConfig).mockReturnValue({
+      databaseUrl: '', appBaseUrl: '', openaiApiKey: '', openaiModel: '', deepseekApiKey: '', deepseekBaseUrl: '', dashscopeApiKey: '', qwenBaseUrl: '',
+      googleAiApiKey: 'valid-key', xBearerToken: '', adminPasswordHash: '', adminSessionSecret: '', visitorCookieSecret: '', securityHmacSecret: '', internalProcessSecret: '', cronSecret: '',
+      memeAnalysisModel: '', memeValidationModel: ''
+    });
+    const genAiInstance = new GoogleGenAI({ apiKey: 'valid-key' });
+    const mockGenerateContent = genAiInstance.models.generateContent as unknown as ReturnType<typeof vi.fn>;
+    mockGenerateContent.mockResolvedValue({ candidates: [{ content: { parts: [{ inlineData: { data: 'aW1hZ2U=', mimeType: 'image/png' } }] } }] });
+
+    await generateMemeImage(
+      { textQuantity: 'short_text', visualStructure: 'single_scene', humorTone: 'subtle', sceneComplexity: 'simple', postRelationship: 'direct_reaction', requiresAsset: false, brandText: 'GenieOrb™' } as never,
+      { immediate_joke: 'joke', single_visual_focus: 'focus', familiar_physical_situation: 'situation', post_connection: 'React to the post\'s delayed launch.', requires_asset: false },
+      'gemini-3.1-flash-image'
+    );
+
+    const prompt = (mockGenerateContent.mock.calls[0][0].contents[0] as { text: string }).text;
+    expect(prompt).toContain('GenieOrb™');
+    expect(prompt).toContain("React to the post's delayed launch.");
+    expect(prompt).toContain('direct_reaction');
+  });
 });

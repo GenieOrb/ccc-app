@@ -41,6 +41,7 @@ describe('performMemeAnalysis', () => {
         immediate_joke: 'test joke',
         single_visual_focus: 'test focus',
         familiar_physical_situation: 'test situation',
+        post_connection: 'reacts to the post',
         requires_asset: false
       })
     });

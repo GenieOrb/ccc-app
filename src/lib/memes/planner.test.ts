@@ -35,8 +35,43 @@ describe('Planner Deterministic Generation', () => {
     expect(plans.length).toBe(10);
     expect(plans[0].plannerVersion).toBe(2);
     
-    // Check asset distribution
+    // A supplied asset is now the required primary image for every slot.
     const withAsset = plans.filter(p => p.requiresAsset).length;
-    expect(withAsset).toBe(3); // 30% of 10
+    expect(withAsset).toBe(10);
+  });
+
+  it('requiere el activo primario y conserva la marca exacta en cada slot cuando se proporcionan', () => {
+    const plans = generateDeterministicMemeSlotPlans(
+      'camp-1',
+      'draft-1',
+      ['post1'],
+      3,
+      [
+        { id: 'product-1', assetType: 'product', appearancePercentage: 100 },
+        { id: 'logo-1', assetType: 'logo', appearancePercentage: 1 },
+      ],
+      [{ value: 'GenieOrb™', percentage: 100 }]
+    );
+
+    expect(plans).toEqual(expect.arrayContaining([
+      expect.objectContaining({ requiresAsset: true, assetId: 'logo-1', brandText: 'GenieOrb™' }),
+    ]));
+    expect(plans.every((plan) => plan.requiresAsset && plan.assetId === 'logo-1' && plan.brandText === 'GenieOrb™')).toBe(true);
+  });
+
+  it('retiene el activo primario y distribuye los secundarios por su porcentaje de aparición', () => {
+    const plans = generateDeterministicMemeSlotPlans(
+      'camp-1',
+      'draft-1',
+      ['post1'],
+      10,
+      [
+        { id: 'logo-1', assetType: 'logo', appearancePercentage: 100 },
+        { id: 'product-1', assetType: 'product', appearancePercentage: 30 },
+      ],
+    );
+
+    expect(plans.every((plan) => plan.requiresAsset && plan.assetId === 'logo-1')).toBe(true);
+    expect(plans.filter((plan) => plan.secondaryAssetId === 'product-1')).toHaveLength(3);
   });
 });

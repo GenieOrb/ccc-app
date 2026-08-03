@@ -68,7 +68,20 @@ export interface MemeSlotPlan {
   
   requiresAsset: boolean;
   assetId?: string;
+  secondaryAssetId?: string;
+  brandText?: string;
   deliveryOrder: number;
+}
+
+export interface MemePlanAsset {
+  id: string;
+  appearancePercentage: number;
+  assetType?: string;
+}
+
+export interface MemeBrandVariant {
+  value: string;
+  percentage: number;
 }
 
 export const TEXT_QUANTITIES: { id: TextQuantity, weight: number }[] = [
@@ -132,7 +145,8 @@ export function generateDeterministicMemeSlotPlans(
   draftId: string | null,
   campaignPostIds: string[],
   totalSlots: number,
-  availableAssets: { id: string, appearancePercentage: number }[]
+  availableAssets: MemePlanAsset[],
+  brandVariants: MemeBrandVariant[] = []
 ): MemeSlotPlan[] {
   const seedString = `${campaignId || 'none'}-${draftId || 'none'}-${campaignPostIds.join('-')}-${totalSlots}`;
   const prng = new DeterministicPRNG(seedString);
@@ -178,22 +192,37 @@ export function generateDeterministicMemeSlotPlans(
     });
   }
 
-  const assetWeights = availableAssets.map(a => ({ id: a.id, weight: a.appearancePercentage }));
-  const totalAssetPercentage = assetWeights.reduce((s, a) => s + a.weight, 0);
-  if (totalAssetPercentage < 100) {
-    assetWeights.push({ id: 'NONE', weight: 100 - totalAssetPercentage });
+  if (availableAssets.length > 0) {
+    const primaryAsset = availableAssets.find((asset) => asset.assetType === 'logo')
+      || [...availableAssets].sort((a, b) => b.appearancePercentage - a.appearancePercentage || a.id.localeCompare(b.id))[0];
+    for (const plan of plans) {
+      plan.requiresAsset = true;
+      plan.assetId = primaryAsset.id;
+    }
+
+    const secondaryWeights = availableAssets
+      .filter((asset) => asset.id !== primaryAsset.id)
+      .map((asset) => ({ id: asset.id, weight: asset.appearancePercentage }));
+    const totalSecondaryPercentage = secondaryWeights.reduce((sum, asset) => sum + asset.weight, 0);
+    if (totalSecondaryPercentage < 100) secondaryWeights.push({ id: 'NONE', weight: 100 - totalSecondaryPercentage });
+    const secondaryBag = deterministicShuffle(
+      allocateByLargestRemainder(secondaryWeights, totalSlots)
+        .flatMap((asset) => Array(asset.count).fill(asset.id)),
+      prng
+    );
+    for (let i = 0; i < totalSlots; i++) {
+      if (secondaryBag[i] && secondaryBag[i] !== 'NONE') plans[i].secondaryAssetId = secondaryBag[i];
+    }
   }
 
-  const assetAlloc = allocateByLargestRemainder(assetWeights, totalSlots);
-  let assetsBag = assetAlloc.flatMap(a => Array(a.count).fill(a.id));
-  assetsBag = deterministicShuffle(assetsBag, prng);
-
-  for (let i = 0; i < totalSlots; i++) {
-    const assetId = assetsBag[i];
-    if (assetId && assetId !== 'NONE') {
-      plans[i].requiresAsset = true;
-      plans[i].assetId = assetId;
-    }
+  const normalizedBrands = brandVariants.filter((brand) => brand.value.trim());
+  if (normalizedBrands.length > 0) {
+    const brandBag = deterministicShuffle(
+      allocateByLargestRemainder(normalizedBrands.map((brand) => ({ id: brand.value, weight: brand.percentage })), totalSlots)
+        .flatMap((brand) => Array(brand.count).fill(brand.id)),
+      prng
+    );
+    for (let i = 0; i < totalSlots; i++) plans[i].brandText = brandBag[i] || normalizedBrands[0].value;
   }
 
   return plans;

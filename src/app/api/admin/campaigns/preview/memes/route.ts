@@ -21,6 +21,7 @@ const previewSchema = z.object({
   urlsInput: z.string().optional(),
   accountsInput: z.string().optional(),
   direction: z.string().optional(),
+  brandVariants: z.array(z.object({ value: z.string(), percentage: z.number().finite().min(0).max(100) })).optional(),
   memeModelKey: z.string(),
   draftId: z.string().uuid().optional(),
 });
@@ -41,7 +42,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Cuerpo de petición no válido.' }, { status: 400 });
     }
 
-    const { campaignType, urlsInput, accountsInput, direction, memeModelKey, draftId } = parseResult.data;
+    const { campaignType, urlsInput, accountsInput, direction, memeModelKey, draftId, brandVariants } = parseResult.data;
     const PLANNER_VERSION = 1;
 
     let model;
@@ -76,6 +77,7 @@ export async function POST(req: Request) {
       accessibleContext: postContent.accessibleContext,
       direction: direction || 'Sin dirección específica.',
       memeModelKey: model.key,
+      brandVariants: brandVariants || [],
       plannerVersion: PLANNER_VERSION
     };
 
@@ -161,14 +163,12 @@ export async function POST(req: Request) {
         height: a.height
       }));
 
-      const plans = generateDeterministicMemeSlotPlans(null, effectiveDraftId || null, [postContent.postId], 3, availableAssets);
+      const plans = generateDeterministicMemeSlotPlans(null, effectiveDraftId || null, [postContent.postId], 3, availableAssets, brandVariants || []);
 
       for (const plan of plans) {
-        let assetSnapshot = null;
-        if (plan.requiresAsset && plan.assetId) {
-          const matched = availableAssets.find(a => a.id === plan.assetId);
-          if (matched) assetSnapshot = matched;
-        }
+        const primaryAsset = availableAssets.find((asset) => asset.id === plan.assetId);
+        const secondaryAsset = availableAssets.find((asset) => asset.id === plan.secondaryAssetId);
+        const assetSnapshot = primaryAsset ? { primaryAsset, secondaryAsset: secondaryAsset || null } : null;
 
         await client.query(
           `INSERT INTO meme_generation_jobs
