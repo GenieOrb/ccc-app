@@ -939,6 +939,10 @@ export default function AdminDashboardPage() {
         payload.accountsInput = accountsInput;
       }
 
+      if (brandVariants.length > 0) {
+        payload.brandVariants = brandVariants.map(bv => ({ value: bv.value.trim(), percentage: bv.percentage })).filter(bv => bv.value);
+      }
+
       const previewResponse = await fetch(`/api/admin/campaigns/preview/memes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

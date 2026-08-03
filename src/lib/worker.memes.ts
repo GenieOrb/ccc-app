@@ -7,6 +7,7 @@ import { performMemeAnalysis } from './memes/analysis';
 import { generateMemeImage, MemeGenerationResult } from './memes/generation';
 import { validateMemeImage } from './memes/validation';
 import { MemeSlotPlan } from './memes/planner';
+import { ResolvedEntityLogo, resolveEntityLogos } from './memes/entity-logo-resolver';
 import { ImageModelSnapshot } from './ai/image-models';
 import { classifyMemeProviderError } from './memes/errors';
 
@@ -91,6 +92,76 @@ async function composeRequiredLogo(generation: MemeGenerationResult, assetData?:
     mimeType: 'image/png',
     width,
     height
+  };
+}
+
+function escapeXml(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[character]!);
+}
+
+export function composeBrandTextSvg(brandText: string, width: number = 1024, height: number = 1024): string {
+  const fontSize = Math.max(12, Math.floor(Math.min(width, height) * 0.045));
+  const padding = Math.max(8, Math.floor(fontSize * 0.45));
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><text x="${padding}" y="${height - padding}" fill="#ffffff" stroke="#000000" stroke-width="${Math.max(1, Math.floor(fontSize / 12))}" paint-order="stroke" font-family="Arial, sans-serif" font-size="${fontSize}" font-weight="700">${escapeXml(brandText)}</text></svg>`;
+}
+
+async function composeBrandText(generation: MemeGenerationResult, brandText?: string): Promise<MemeGenerationResult> {
+  if (!brandText) return generation;
+  try {
+    const metadata = await sharp(generation.imageBuffer).metadata();
+    const width = metadata.width || generation.width;
+    const height = metadata.height || generation.height;
+    if (!width || !height) throw new Error('Generated image dimensions are unavailable for brand composition');
+    return {
+      ...generation,
+      imageBuffer: await sharp(generation.imageBuffer).composite([{ input: Buffer.from(composeBrandTextSvg(brandText, width, height)) }]).png().toBuffer(),
+      mimeType: 'image/png',
+      width,
+      height,
+    };
+  } catch {
+    return generation;
+  }
+}
+
+export async function composeResolvedEntityLogos(
+  generation: MemeGenerationResult,
+  logos: readonly ResolvedEntityLogo[],
+  clientAsset?: { buffer: Buffer; assetType: string }
+): Promise<MemeGenerationResult> {
+  const withClientAsset = await composeRequiredLogo(generation, clientAsset);
+  if (logos.length === 0) return withClientAsset;
+
+  const metadata = await sharp(withClientAsset.imageBuffer).metadata();
+  const width = metadata.width || withClientAsset.width;
+  const height = metadata.height || withClientAsset.height;
+  if (!width || !height) throw new Error('Generated image dimensions are unavailable for entity logo composition');
+
+  if (width < 2 || height < 2) {
+    return {
+      ...withClientAsset,
+      imageBuffer: await sharp({ create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } }).png().toBuffer(),
+      mimeType: 'image/png',
+      width,
+      height,
+    };
+  }
+
+  const smallestDimension = Math.min(width, height);
+  const logoSize = Math.min(smallestDimension, Math.max(1, Math.floor(smallestDimension * 0.14)));
+  const margin = Math.min(Math.max(0, smallestDimension - logoSize), Math.max(0, Math.floor(smallestDimension * 0.03)));
+  const composites = await Promise.all(logos.slice(0, 2).map(async (logo, index) => ({
+    input: await sharp(Buffer.from(logo.svg)).resize({ width: logoSize, height: logoSize, fit: 'inside' }).png().toBuffer(),
+    left: margin + index * (logoSize + margin),
+    top: Math.max(0, height - logoSize - margin),
+  })));
+
+  return {
+    ...withClientAsset,
+    imageBuffer: await sharp(withClientAsset.imageBuffer).composite(composites).png().toBuffer(),
+    mimeType: 'image/png',
+    width,
+    height,
   };
 }
 
@@ -590,7 +661,7 @@ async function executeMemeJobTask(
     let analysis;
     ensureShouldExecute(analysisCall, 'analysis');
     try {
-      analysis = await performMemeAnalysis({ postText, campaignDirection, availableAssets }, { signal: abortController.signal, timeoutMs: deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS });
+      analysis = await performMemeAnalysis({ postText, campaignDirection, availableAssets, brandContext: job.slotPlan.brandText }, { signal: abortController.signal, timeoutMs: deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS });
       await finishApiCall(analysisCall.callKey, 0, 'succeeded');
     } catch (e: unknown) {
       await finishApiCall(analysisCall.callKey, 0, 'failed', e instanceof Error ? e.message : String(e));
@@ -622,12 +693,24 @@ async function executeMemeJobTask(
       return { success: false, error: 'Insufficient budget for image generation', metrics };
     }
 
+    const analysisEvidence = analysis.entityEvidence as (typeof analysis.entityEvidence & { entities?: Array<{ canonicalEntity?: string; postJustification?: string }> }) | undefined;
+    const entityEvidence = analysisEvidence?.entities
+      ? analysisEvidence.entities.flatMap((entity) => typeof entity.canonicalEntity === 'string' && typeof entity.postJustification === 'string'
+        ? [{ canonicalEntity: entity.canonicalEntity, postJustification: entity.postJustification }]
+        : [])
+      : (analysis.canonicalEntities || []).map((canonicalEntity) => ({ canonicalEntity, postJustification: analysis.entityEvidence?.postJustification || '' }));
+    const resolvedEntityLogos = resolveEntityLogos({
+      postText,
+      externalLogoIntent: analysis.entityEvidence?.externalLogoIntent === true,
+      entityEvidence,
+    });
     const genCall = await startApiCall('generation', job.modelSnapshot.provider, job.modelSnapshot.key, job.modelSnapshot.apiModel);
     let generation: MemeGenerationResult;
     ensureShouldExecute(genCall, 'generation');
     try {
       generation = await generateMemeImage(job.slotPlan, analysis, job.modelSnapshot.key, assetData, undefined, { signal: abortController.signal, timeoutMs: deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS });
-      generation = await composeRequiredLogo(generation, primaryAssetData);
+      generation = await composeResolvedEntityLogos(generation, resolvedEntityLogos, primaryAssetData);
+      generation = await composeBrandText(generation, job.slotPlan.brandText);
       currentCost += parseFloat(generation.cost);
       metrics.cost = currentCost;
       await finishApiCall(genCall.callKey, parseFloat(generation.cost), 'succeeded');
@@ -667,7 +750,8 @@ async function executeMemeJobTask(
       try {
         const regenerateInstruction = `FAILED VALIDATION REASON: ${validation.reason}\n\nCRITICAL: Simplify radically, remove all explanations, remove extra labels, reduce scene complexity, express one immediate visual joke. Do NOT render text if no_text was specified!`;
         generation = await generateMemeImage(job.slotPlan, analysis, job.modelSnapshot.key, assetData, regenerateInstruction, { signal: abortController.signal, timeoutMs: deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS });
-        generation = await composeRequiredLogo(generation, primaryAssetData);
+        generation = await composeResolvedEntityLogos(generation, resolvedEntityLogos, primaryAssetData);
+        generation = await composeBrandText(generation, job.slotPlan.brandText);
         currentCost += parseFloat(generation.cost);
         metrics.cost = currentCost;
         await finishApiCall(regenCall.callKey, parseFloat(generation.cost), 'succeeded');
@@ -753,7 +837,7 @@ async function executeMemeJobTask(
            ) VALUES (
              $1, $2, $3, $4, $5, 'vercel_blob', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
            ) RETURNING id`,
-          [finalDraftId, finalCampaignId, finalCampaignPostId, job.jobId, finalStatus, storageResult.pathname, storageResult.url, generation.mimeType, generation.imageBuffer.length, generation.width, generation.height, storageResult.sha256Hash, JSON.stringify(job.slotPlan), job.modelSnapshot.key, currentCost, job.slotIndex, primaryAssetSnapshot?.id || null]
+          [finalDraftId, finalCampaignId, finalCampaignPostId, job.jobId, finalStatus, storageResult.pathname, storageResult.url, generation.mimeType, generation.imageBuffer.length, generation.width, generation.height, storageResult.sha256Hash, JSON.stringify({ ...job.slotPlan, analysisEvidence: analysis.entityEvidence, entityLogoResolution: resolvedEntityLogos.map(({ entity, slug }) => ({ entity, slug })) }), job.modelSnapshot.key, currentCost, job.slotIndex, primaryAssetSnapshot?.id || null]
         );
 
         await client.query(

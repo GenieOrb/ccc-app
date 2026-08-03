@@ -11,7 +11,12 @@ export const MemePreflightAnalysisSchema = z.object({
   familiar_physical_situation: z.string().describe("What familiar, physical, real-world situation represents this? NO abstract concepts, NO diagrams, NO text."),
   post_connection: z.string().min(1).describe("The specific detail from the original post that the visual joke reacts to."),
   requires_asset: z.boolean().describe("Si el concepto requiere un activo de marca específico que se haya proveído."),
-  selected_asset_id: z.string().optional().describe("ID del asset seleccionado, si aplica y requires_asset es true.")
+  selected_asset_id: z.string().optional().describe("ID del asset seleccionado, si aplica y requires_asset es true."),
+  entityEvidence: z.object({
+    postJustification: z.string().min(1),
+    externalLogoIntent: z.boolean()
+  }).optional(),
+  canonicalEntities: z.array(z.string().min(1)).max(2).optional()
 });
 
 export type MemePreflightAnalysis = z.infer<typeof MemePreflightAnalysisSchema>;
@@ -21,6 +26,7 @@ export interface MemeAnalysisInput {
   postImageUrls?: string[];
   campaignDirection: string;
   availableAssets: { id: string; instruction: string; assetType: string }[];
+  brandContext?: string;
 }
 
 export async function performMemeAnalysis(
@@ -45,13 +51,15 @@ Tu objetivo es analizar un post de la red social X y la dirección de campaña p
 
 Dirección de campaña (contexto interno, NO para incluir textualmente):
 ${input.campaignDirection}
+${input.brandContext ? `\nSelected brand (internal context only):\n${input.brandContext}` : ''}
 ${assetsContext}
+canonicalEntities may contain at most two exact canonical organization names from the post, only when externalLogoIntent is true. Do not infer aliases, competitors, or entities not explicitly supported by the post.
 
 Debes estructurar tu análisis visual usando el esquema proporcionado. 
 Si decides usar un asset, asegúrate de que requires_asset sea true y selected_asset_id coincida exactamente con uno de los IDs provistos.
 El meme debe ser extremadamente simple, visual, con una única idea principal y enfocado en la viralidad rápida. No pienses en infografías ni en explicaciones corporativas.`;
 
-  const userContent = `Post original de X:\n\n${input.postText}`;
+  const userContent = `Post original de X:\n\n${input.postText}\n\nEntity evidence requirements: postJustification must identify the exact post detail that justifies the concept; externalLogoIntent is true only when the selected brand or logo is intended for use.`;
 
   const responseSchema = {
     type: Type.OBJECT,
@@ -61,10 +69,19 @@ El meme debe ser extremadamente simple, visual, con una única idea principal y 
       familiar_physical_situation: { type: Type.STRING },
       post_connection: { type: Type.STRING },
       requires_asset: { type: Type.BOOLEAN },
-      selected_asset_id: { type: Type.STRING }
+      selected_asset_id: { type: Type.STRING },
+      entityEvidence: {
+        type: Type.OBJECT,
+        properties: {
+          postJustification: { type: Type.STRING },
+          externalLogoIntent: { type: Type.BOOLEAN }
+        },
+        required: ["postJustification", "externalLogoIntent"]
+      },
+      canonicalEntities: { type: Type.ARRAY, items: { type: Type.STRING }, maxItems: 2 }
     },
     required: [
-      "immediate_joke", "single_visual_focus", "familiar_physical_situation", "post_connection", "requires_asset"
+      "immediate_joke", "single_visual_focus", "familiar_physical_situation", "post_connection", "requires_asset", "entityEvidence"
     ]
   };
 
@@ -115,7 +132,8 @@ export function hashMemeInputs(input: MemeAnalysisInput): string {
     pt: input.postText,
     pi: input.postImageUrls || [],
     cd: input.campaignDirection,
-    as: input.availableAssets.map(a => a.id).sort()
+    as: input.availableAssets.map(a => a.id).sort(),
+    bc: input.brandContext || ''
   });
   return createHash('sha256').update(str).digest('hex');
 }

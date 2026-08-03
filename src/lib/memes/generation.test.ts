@@ -81,7 +81,7 @@ describe('generateMemeImage (Gemini adapter)', () => {
     );
 
     const prompt = (mockGenerateContent.mock.calls[0][0].contents[0] as { text: string }).text;
-    expect(prompt).toContain('GenieOrb™');
+    expect(prompt).not.toContain('GenieOrb™');
     expect(prompt).toContain("React to the post's delayed launch.");
     expect(prompt).toContain('direct_reaction');
   });

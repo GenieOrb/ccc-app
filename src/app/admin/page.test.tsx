@@ -38,6 +38,11 @@ describe('administration campaign cards', () => {
     vi.stubGlobal('fetch', fetchMock);
   });
 
+  it('enables the meme system by default', async () => {
+    render(<AdminDashboardPage />);
+    expect((await screen.findByLabelText(/habilitar sistema de memes/i) as HTMLInputElement).checked).toBe(true);
+  });
+
   it('starts collapsed, exposes an accessible arrow, and only fetches preview after expansion', async () => {
     render(<AdminDashboardPage />);
     const arrow = await screen.findByRole('button', { name: /expandir/i });
@@ -277,6 +282,26 @@ describe('administration campaign cards', () => {
         (url) => url === '/api/admin/campaigns'
       )
     ).toBe(false);
+  });
+
+  it('includes existing brand variants in the meme preview request', async () => {
+    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input === '/api/admin/campaigns/preview/memes' && init?.method === 'POST') return Promise.resolve(json({ error: 'stop after payload' }, false));
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+    render(<AdminDashboardPage />);
+    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
+    fireEvent.click(screen.getByRole('button', { name: /añadir variante/i }));
+    fireEvent.change(screen.getByPlaceholderText(/texto exacto/i), { target: { value: 'GenieOrb' } });
+    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([url, init]) => String(url) === '/api/admin/campaigns/preview/memes' && (init as RequestInit)?.method === 'POST');
+      expect(call).toBeTruthy();
+      expect(JSON.parse((call?.[1] as RequestInit).body as string)).toMatchObject({ brandVariants: [{ value: 'GenieOrb', percentage: 100 }] });
+    });
   });
 
   describe('maxCommentsTotal optional field', () => {

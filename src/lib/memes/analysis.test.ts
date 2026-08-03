@@ -62,6 +62,57 @@ describe('performMemeAnalysis', () => {
     });
   });
 
+  it('requires structured entity evidence and gives the selected brand context to the analysis', async () => {
+    vi.mocked(config.getConfig).mockReturnValue({
+      databaseUrl: '', appBaseUrl: '', openaiApiKey: '', openaiModel: '', deepseekApiKey: '', deepseekBaseUrl: '', dashscopeApiKey: '', qwenBaseUrl: '',
+      googleAiApiKey: 'fake-google-key', xBearerToken: '', adminPasswordHash: '', adminSessionSecret: '', visitorCookieSecret: '', securityHmacSecret: '', internalProcessSecret: '', cronSecret: '',
+      memeAnalysisModel: 'gemini-3.1-flash-lite', memeValidationModel: ''
+    });
+    const genAiInstance = new GoogleGenAI({ apiKey: 'fake-google-key' });
+    const mockGenerateContent = genAiInstance.models.generateContent as unknown as ReturnType<typeof vi.fn>;
+    mockGenerateContent.mockResolvedValue({
+      text: JSON.stringify({
+        immediate_joke: 'test joke',
+        single_visual_focus: 'test focus',
+        familiar_physical_situation: 'test situation',
+        post_connection: 'reacts to the post',
+        requires_asset: false,
+        entityEvidence: {
+          postJustification: 'The post names the launch delay.',
+          externalLogoIntent: true
+        }
+      })
+    });
+
+    await expect(performMemeAnalysis({
+      postText: 'test post', campaignDirection: 'test direction', availableAssets: [], brandContext: 'GenieOrb'
+    })).resolves.toMatchObject({
+      entityEvidence: { postJustification: 'The post names the launch delay.', externalLogoIntent: true }
+    });
+    expect(mockGenerateContent).toHaveBeenCalledWith(expect.objectContaining({
+      config: expect.objectContaining({ systemInstruction: expect.stringContaining('GenieOrb') })
+    }));
+  });
+
+  it('requires up to two canonical entities and instructs the analysis to use only canonical names', async () => {
+    vi.mocked(config.getConfig).mockReturnValue({
+      databaseUrl: '', appBaseUrl: '', openaiApiKey: '', openaiModel: '', deepseekApiKey: '', deepseekBaseUrl: '', dashscopeApiKey: '', qwenBaseUrl: '',
+      googleAiApiKey: 'fake-google-key', xBearerToken: '', adminPasswordHash: '', adminSessionSecret: '', visitorCookieSecret: '', securityHmacSecret: '', internalProcessSecret: '', cronSecret: '',
+      memeAnalysisModel: 'gemini-3.1-flash-lite', memeValidationModel: ''
+    });
+    const genAiInstance = new GoogleGenAI({ apiKey: 'fake-google-key' });
+    const mockGenerateContent = genAiInstance.models.generateContent as unknown as ReturnType<typeof vi.fn>;
+    mockGenerateContent.mockResolvedValue({ text: JSON.stringify({
+      immediate_joke: 'test joke', single_visual_focus: 'test focus', familiar_physical_situation: 'test situation', post_connection: 'reacts to the post', requires_asset: false,
+      entityEvidence: { postJustification: 'The post names both companies.', externalLogoIntent: true }, canonicalEntities: ['OpenAI', 'Google']
+    }) });
+
+    await expect(performMemeAnalysis({ postText: 'test post', campaignDirection: 'test direction', availableAssets: [] })).resolves.toMatchObject({ canonicalEntities: ['OpenAI', 'Google'] });
+    const request = mockGenerateContent.mock.calls[0][0];
+    expect(request.config.systemInstruction).toContain('canonicalEntities');
+    expect(request.config.responseSchema.properties.canonicalEntities).toEqual(expect.objectContaining({ maxItems: 2 }));
+  });
+
   it('sanitiza los errores de GoogleGenAI', async () => {
     vi.mocked(config.getConfig).mockReturnValue({
       databaseUrl: '', appBaseUrl: '', openaiApiKey: '', openaiModel: '', deepseekApiKey: '', deepseekBaseUrl: '', dashscopeApiKey: '', qwenBaseUrl: '',
