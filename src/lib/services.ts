@@ -21,6 +21,18 @@ function createMemeAssetSnapshot(
 import { DEFAULT_MODEL_KEY, getAiModel, isProviderConfigured } from './ai/models';
 import { generateSingleComment } from './openai';
 import { processPerpetualCampaigns, type PerpetualMonitorSummary } from './perpetual-monitor';
+import { reconcilePerpetualScheduler } from './perpetual-scheduler';
+
+async function reconcilePerpetualSchedulerBestEffort(context: string): Promise<void> {
+  try {
+    await reconcilePerpetualScheduler();
+  } catch (error) {
+    console.error('Perpetual scheduler reconciliation failed after campaign commit.', {
+      context,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
 
 function getErrorCode(error: unknown): string | undefined {
   if (typeof error === 'object' && error !== null && 'code' in error) {
@@ -517,7 +529,7 @@ export async function toggleCampaignStatus(campaignId: string, desiredStatus: bo
     const campaignType = campRes.rows[0].campaign_type;
 
     if (currentStatus === desiredStatus) {
-      return { isActive: currentStatus, synchronizePerpetualCampaign: false, triggerManualReplenishment: false };
+      return { isActive: currentStatus, synchronizePerpetualCampaign: false, triggerManualReplenishment: false, reconcileScheduler: campaignType === 'perpetual' };
     }
 
     if (desiredStatus) {
@@ -604,12 +616,12 @@ export async function toggleCampaignStatus(campaignId: string, desiredStatus: bo
       await client.query(`UPDATE campaigns SET is_active = true, updated_at = NOW() WHERE id = $1`, [
         campaignId,
       ]);
-      return { isActive: true, synchronizePerpetualCampaign: campaignType === 'perpetual', triggerManualReplenishment: campaignType === 'manual' };
+      return { isActive: true, synchronizePerpetualCampaign: campaignType === 'perpetual', triggerManualReplenishment: campaignType === 'manual', reconcileScheduler: campaignType === 'perpetual' };
     } else {
       await client.query(`UPDATE campaigns SET is_active = false, updated_at = NOW() WHERE id = $1`, [
         campaignId,
       ]);
-      return { isActive: false, synchronizePerpetualCampaign: false, triggerManualReplenishment: false };
+      return { isActive: false, synchronizePerpetualCampaign: false, triggerManualReplenishment: false, reconcileScheduler: campaignType === 'perpetual' };
     }
   });
 
@@ -617,6 +629,9 @@ export async function toggleCampaignStatus(campaignId: string, desiredStatus: bo
   // reads the campaign's active state and imports the first posts immediately.
   if (result.synchronizePerpetualCampaign) {
     await processPerpetualCampaigns({ campaignId, timeBudgetMs: 30_000 });
+  }
+  if (result.reconcileScheduler) {
+    await reconcilePerpetualSchedulerBestEffort(`toggle:${campaignId}`);
   }
   if (result.triggerManualReplenishment) {
     // Retry failed jobs in case it was stuck on errors
@@ -1481,6 +1496,9 @@ export async function createPerpetualCampaign(params: {
       accountIds: created.accountIds,
       timeBudgetMs: 30_000,
     });
+  }
+  if (!params.isInactive) {
+    await reconcilePerpetualSchedulerBestEffort(`create:${created.id}`);
   }
   return { id: created.id, slug: created.slug, initialSync };
 }

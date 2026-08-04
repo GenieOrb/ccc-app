@@ -17,6 +17,9 @@ export interface AppConfig {
   securityHmacSecret: string;
   internalProcessSecret: string;
   cronSecret: string;
+  qstashToken: string;
+  qstashCurrentSigningKey: string;
+  qstashNextSigningKey: string;
   memeAnalysisModel: string;
   memeValidationModel: string;
 }
@@ -49,6 +52,9 @@ export function getConfig(): AppConfig {
   const securityHmacSecret = process.env.SECURITY_HMAC_SECRET || '';
   const internalProcessSecret = process.env.INTERNAL_PROCESS_SECRET || '';
   const cronSecret = process.env.CRON_SECRET || '';
+  const qstashToken = process.env.QSTASH_TOKEN || '';
+  const qstashCurrentSigningKey = process.env.QSTASH_CURRENT_SIGNING_KEY || '';
+  const qstashNextSigningKey = process.env.QSTASH_NEXT_SIGNING_KEY || '';
   const memeAnalysisModel = process.env.MEME_ANALYSIS_MODEL || 'gemini-3.1-flash-lite';
   const memeValidationModel = process.env.MEME_VALIDATION_MODEL || 'gemini-3.1-flash-lite';
 
@@ -69,6 +75,9 @@ export function getConfig(): AppConfig {
     securityHmacSecret,
     internalProcessSecret,
     cronSecret,
+    qstashToken,
+    qstashCurrentSigningKey,
+    qstashNextSigningKey,
     memeAnalysisModel,
     memeValidationModel,
   };

@@ -58,6 +58,42 @@ export async function withTransaction<T>(
   }
 }
 
+export async function withAdvisoryLock<T>(
+  lockId: number,
+  callback: () => Promise<T>
+): Promise<T> {
+  const pool = createDbPool();
+  let client: PoolClient;
+  let acquired = false;
+
+  try {
+    client = await pool.connect();
+  } catch (error) {
+    try { await pool.end(); } catch {}
+    throw error;
+  }
+
+  try {
+    await client.query('SELECT pg_advisory_lock($1)', [lockId]);
+    acquired = true;
+    return await callback();
+  } finally {
+    if (acquired) {
+      try {
+        await client.query('SELECT pg_advisory_unlock($1)', [lockId]);
+      } catch {
+        // Release the connection even when the unlock query fails.
+      }
+    }
+    client.release();
+    try {
+      await pool.end();
+    } catch {
+      // ignore
+    }
+  }
+}
+
 export async function queryDb<T = Record<string, unknown>>(
   text: string,
   params: unknown[] = [],

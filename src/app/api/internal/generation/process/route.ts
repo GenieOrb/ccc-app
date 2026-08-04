@@ -1,8 +1,7 @@
 import { NextResponse } from 'next/server';
 import { isAuthorizedInternalProcessRequest } from '@/lib/internal-process-auth';
 import { runGenerationProcessing } from '@/lib/worker';
-import { processPerpetualCampaigns } from '@/lib/perpetual-monitor';
-import { reconcileCampaignReplenishment } from '@/lib/services';
+import { runGlobalGenerationProcessing } from '@/lib/generation-processing';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 
@@ -61,25 +60,14 @@ async function handleProcess(req: Request) {
         { headers: { 'Cache-Control': 'no-store' } }
       );
     } else {
-      phase = 'perpetual_monitor';
-      const startPerpetual = Date.now();
-      const perpetualResult = await processPerpetualCampaigns(30000);
-
-      phase = 'replenishment';
-      const replenishmentResult = await reconcileCampaignReplenishment();
-
-      phase = 'global_generation_worker';
-      const workerId = randomUUID();
-      const workerBudgetMs = Math.max(0, 50000 - (Date.now() - startPerpetual));
-      const generationResult = await runGenerationProcessing(workerId, workerBudgetMs);
+      phase = 'global_generation';
+      const generationResult = await runGlobalGenerationProcessing();
 
       phase = 'response_serialization';
       return NextResponse.json(
         {
           success: true,
           mode,
-          monitor: perpetualResult,
-          replenishment: replenishmentResult,
           ...generationResult
         },
         { headers: { 'Cache-Control': 'no-store' } }

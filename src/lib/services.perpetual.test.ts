@@ -1,7 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { queryDb, withTransaction, normalizeXAccounts, generateSecureSlug, generateDeterministicSlotPlans, processPerpetualCampaigns } = vi.hoisted(() => ({
-  queryDb: vi.fn(), withTransaction: vi.fn(), normalizeXAccounts: vi.fn(), generateSecureSlug: vi.fn(), generateDeterministicSlotPlans: vi.fn(), processPerpetualCampaigns: vi.fn(),
+const { queryDb, withTransaction, normalizeXAccounts, generateSecureSlug, generateDeterministicSlotPlans, processPerpetualCampaigns, reconcilePerpetualScheduler } = vi.hoisted(() => ({
+  queryDb: vi.fn(), withTransaction: vi.fn(), normalizeXAccounts: vi.fn(), generateSecureSlug: vi.fn(), generateDeterministicSlotPlans: vi.fn(), processPerpetualCampaigns: vi.fn(), reconcilePerpetualScheduler: vi.fn(),
 }));
 vi.mock('./db', () => ({ queryDb, withTransaction }));
 vi.mock('./x-api', () => ({ parseMultipleXUrls: vi.fn(), fetchXPosts: vi.fn(), resolveXUsername: vi.fn().mockResolvedValue('x-123') }));
@@ -10,9 +10,14 @@ vi.mock('./openai', () => ({ checkCampaignSafety: vi.fn(), generateSingleComment
 vi.mock('./crypto', () => ({ generateSecureSlug }));
 vi.mock('./planner', () => ({ generateDeterministicSlotPlans }));
 vi.mock('./perpetual-monitor', () => ({ processPerpetualCampaigns }));
+vi.mock('./perpetual-scheduler', () => ({ reconcilePerpetualScheduler }));
 vi.mock('./ai/models', () => ({ DEFAULT_MODEL_KEY: 'test-model', getAiModel: () => ({ key: 'test-model', enabled: true, provider: 'openai', apiModel: 'test-model' }), isProviderConfigured: () => true }));
 
 import { createPerpetualCampaign, retryFailedCampaignJobs, toggleCampaignStatus, triggerReplenishmentIfNeeded } from './services';
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
 
 describe('toggleCampaignStatus perpetual activation recovery', () => {
   it('awaits a campaign-scoped monitor only after the activation transaction commits', async () => {
@@ -59,6 +64,24 @@ describe('toggleCampaignStatus perpetual activation recovery', () => {
 
     expect(processPerpetualCampaigns).not.toHaveBeenCalled();
   });
+
+  it('does not report a false failure after a perpetual campaign commit when QStash is temporarily unavailable', async () => {
+    withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes('SELECT is_active, campaign_type')) return { rows: [{ is_active: true, campaign_type: 'perpetual' }] };
+        if (sql.includes('UPDATE campaigns SET is_active')) return { rows: [] };
+        throw new Error(`Unexpected SQL in test: ${sql}`);
+      }),
+    }));
+    reconcilePerpetualScheduler.mockRejectedValueOnce(new Error('QStash unavailable'));
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    await expect(toggleCampaignStatus('campaign-1', false)).resolves.toBe(false);
+
+    expect(reconcilePerpetualScheduler).toHaveBeenCalledOnce();
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('scheduler reconciliation failed'), expect.objectContaining({ context: 'toggle:campaign-1' }));
+    consoleError.mockRestore();
+  });
 });
 
 describe('createPerpetualCampaign initial synchronization', () => {
@@ -82,6 +105,8 @@ describe('createPerpetualCampaign initial synchronization', () => {
     });
     let resolveSync!: (value: { accountsProcessed: number; postsDetected: number; postsImported: number; postsRejected: number; postsExpired: number; cyclesCreated: number; errors: string[] }) => void;
     processPerpetualCampaigns.mockReturnValue(new Promise((resolve) => { resolveSync = resolve; }));
+    reconcilePerpetualScheduler.mockRejectedValueOnce(new Error('QStash unavailable'));
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
     let settled = false;
     const pending = createPerpetualCampaign({ accountsInput: '@Author', postActiveLifetimeHours: 24 }).then((value) => { settled = true; return value; });
@@ -94,6 +119,9 @@ describe('createPerpetualCampaign initial synchronization', () => {
 
     resolveSync({ accountsProcessed: 1, postsDetected: 1, postsImported: 1, postsRejected: 0, postsExpired: 0, cyclesCreated: 1, errors: [] });
     await expect(pending).resolves.toMatchObject({ id: 'campaign-1', slug: 'new-slug', initialSync: { postsImported: 1 } });
+    expect(reconcilePerpetualScheduler).toHaveBeenCalledOnce();
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('scheduler reconciliation failed'), expect.objectContaining({ context: 'create:campaign-1' }));
+    consoleError.mockRestore();
   });
 });
 

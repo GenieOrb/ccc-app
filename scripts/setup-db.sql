@@ -1000,4 +1000,11 @@ BEGIN
 END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS unique_assignment_meme_id ON assignments(meme_id) WHERE meme_id IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS perpetual_scheduler_state (
+    singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
+    schedule_id TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+INSERT INTO perpetual_scheduler_state (singleton) VALUES (true) ON CONFLICT (singleton) DO NOTHING;
+
 COMMIT;
