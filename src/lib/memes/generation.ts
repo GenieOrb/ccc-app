@@ -5,6 +5,7 @@ import { GoogleGenAI } from '@google/genai';
 import { getConfig } from '../config';
 import { MemeSlotPlan } from './planner';
 import { MemePreflightAnalysis } from './analysis';
+import { getReadyMemeTemplateMetadata } from './templates';
 
 import { toFile } from 'openai';
 
@@ -26,6 +27,11 @@ export async function generateMemeImage(
 ): Promise<MemeGenerationResult> {
   const modelDef = resolveImageModel(modelKey);
   const reqOpts = requestOptionsForDeadline();
+
+  const readyMetadata = plan.assetId ? getReadyMemeTemplateMetadata(plan.assetId) : null;
+  const templateInstructionsText = readyMetadata
+    ? `\n\nTemplate Specific Instructions (${readyMetadata.status}):\n- Meaning: ${readyMetadata.templateMeaning}\n- Intention: ${readyMetadata.intention}\n- Tone: ${readyMetadata.tone}\n- Instruction: ${readyMetadata.generalInstruction}\n- Avoid: ${readyMetadata.negativeInstruction}`
+    : '';
 
   const basePrompt = `Create a viral meme image based on this analysis:
 Immediate Joke: ${analysis.immediate_joke}
@@ -53,7 +59,7 @@ IMPORTANT GUIDELINES:
 - AVOID visual clutter.
 - Must be comprehensible on mobile in less than 2 seconds.
 ${plan.requiresAsset ? `- The meme MUST feature the provided brand asset visually integrated.` : ''}
-${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''}`;
+${assetData?.instruction ? `- Asset Instructions: ${assetData.instruction}` : ''}${templateInstructionsText}`;
 
   const prompt = regenerateInstruction 
     ? `${basePrompt}\n\nCORRECTION INSTRUCTION (CRITICAL):\n${regenerateInstruction}`

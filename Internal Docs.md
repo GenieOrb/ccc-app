@@ -322,13 +322,19 @@ El archivo `vercel.json` estipula una ejecución programada (`* * * * *`) cada m
 - Tipografías utilizadas: Fredoka (títulos y botones) y Nunito (cuerpo y formularios).
 - Variables visuales centralizadas en `globals.css` (ej. `--bg-primary`, `--bg-card`, `--color-primary`).
 - El banner promocional visible conserva el texto comercial original; los metadatos sociales usan branding neutral ccc-app; ambos contenidos tienen finalidades distintas y no deben sustituirse entre sí.
-
-## 36. Botón Post como Enlace a Web Intent
-- El botón Post usa un enlace directo al Web Intent oficial.
-- El formato de la URL es `/intent/tweet?in_reply_to=<post_id>`.
-- No se incluye `text` en la URL; el usuario copia y pega manualmente.
-- El clic de finalización se registra de forma paralela y no bloqueante mediante `fetch(..., { keepalive: true })`.
 - El enlace implementa protección de procedencia estricta usando `noopener`, `noreferrer` y la política `no-referrer` tanto en el tag HTML, como en la cabecera HTTP y meta tag.
 - No se cargan recursos (scripts/widgets) de X antes del clic del visitante.
 - Este cambio no requiere migración de base de datos.
 - No se garantiza anonimato absoluto, solo minimización estándar del referrer a través del navegador.
+
+## 37. Fichas Estructuradas de Plantillas de Memes y Adaptador de Contexto Común
+- **Fuente de verdad única**: Registro estático `src/lib/memes/templates.ts` (`MEME_TEMPLATES`) que centraliza las 30 plantillas de memes canónicas con sus identificadores estables (`drake`, `distracted-boyfriend`, `two-buttons`, etc.), nombres humanos e imágenes de referencia (`LICENCIA PENDIENTE DE REVISAR`).
+- **Ficha de metadatos estructurados**: Cada plantilla dispone de una ficha `MemeTemplateMetadata` que incluye `schemaVersion`, `status` (`'draft'` | `'ready'`), campos de instrucciones (`templateMeaning`, `intention`, `tone`, `generalInstruction`, `negativeInstruction`), zonas de marca promocionada (`promotedBrandZones`), zonas de competidores (`competitorZones`), zonas de texto (`textZoneCount`, `textZones`), reglas de interpretación de post (`postInterpretationRules`) y `additionalData: Record<string, unknown>`.
+- **Estado inicial en borrador**: Todas las 30 plantillas inician en `status: 'draft'` con campos de instrucciones vacíos (`''`, `[]`, `null`). Se irán completando posteriormente en grupos de cinco plantillas.
+- **Validación draft vs ready**:
+  - `validateMemeTemplateMetadata` e `isMemeTemplateMetadataReady` garantizan que una ficha en `draft` sea inofensiva y válida sin alterar el prompt ni provocar errores.
+  - Una ficha `ready` exige obligatoriamente instrucciones completas, al menos una zona de marca promocionada requerida (sin opción a omitir marca `'none'`), IDs de zonas únicos y coherencia exacta entre `textZoneCount` y `textZones.length`.
+- **Adaptador común de contexto de post**: `MemeTemplatePostContext` y `buildMemeTemplatePostContext` abstraen los datos del post persistido en `campaign_posts` para campañas manuales y perpetuas, ofreciendo una estructura común con entidades explícitas/implícitas, grupos colectivos y competidores sin realizar llamadas externas adicionales a X o a la IA.
+- **Generación multimodal por IA**: La composición visual completa (composición, personajes, textos, estilo) sigue siendo 100 % generada por IA. Las fichas en `'draft'` conservan íntegramente el prompt actual de `src/lib/memes/generation.ts`.
+- **Ampliación futura de plantillas**: Para añadir una nueva plantilla en el futuro basta con agregar una entrada en `MEME_TEMPLATES` con su ficha correspondiente y su versión de esquema (`schemaVersion`), sin duplicar catálogos ni alterar la interfaz del worker.
+- **Historial de cambios**: `v1.7.0`: Introducción del registro estático de 30 plantillas de memes, fichas de metadatos estructurados en estado `'draft'`, validación de estados y adaptador de contexto común `MemeTemplatePostContext`.
