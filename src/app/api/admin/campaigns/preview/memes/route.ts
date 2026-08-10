@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { createHash } from 'crypto';
 import { withTransaction } from '@/lib/db';
 import { buildInternalProcessAuthorizationHeader } from '@/lib/internal-process-auth';
+import { getMemeTemplatesForProvider } from '@/lib/memes/templates';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -15,6 +16,18 @@ export const maxDuration = 120;
 
 const PREVIEW_X_TIMEOUT_MS = 10_000;
 const PREVIEW_X_USER_TIMEOUT_MS = 8_000;
+
+export function isSuccessfulPreviewTrigger(responseOk: boolean, payload: unknown): boolean {
+  return responseOk && typeof payload === 'object' && payload !== null
+    && 'success' in payload && payload.success === true;
+}
+
+function previewTriggerFailure(draftId: string, cycleId: string, status: string) {
+  return NextResponse.json(
+    { error: 'No se pudo iniciar la generación de la preview.', draftId, cycleId, status, retryable: true },
+    { status: 502, headers: { 'Cache-Control': 'no-store' } }
+  );
+}
 
 const previewSchema = z.object({
   campaignType: z.enum(['manual', 'perpetual']),
@@ -43,7 +56,7 @@ export async function POST(req: Request) {
     }
 
     const { campaignType, urlsInput, accountsInput, direction, memeModelKey, draftId, brandVariants } = parseResult.data;
-    const PLANNER_VERSION = 1;
+    const PLANNER_VERSION = 3;
 
     let model;
     try {
@@ -163,7 +176,7 @@ export async function POST(req: Request) {
         height: a.height
       }));
 
-      const plans = generateDeterministicMemeSlotPlans(null, effectiveDraftId || null, [postContent.postId], 3, availableAssets, brandVariants || []);
+      const plans = generateDeterministicMemeSlotPlans(null, effectiveDraftId || null, [postContent.postId], 3, availableAssets, brandVariants || [], getMemeTemplatesForProvider(model.provider).map((template) => template.id));
 
       for (const plan of plans) {
         const primaryAsset = availableAssets.find((asset) => asset.id === plan.assetId);
@@ -196,7 +209,7 @@ export async function POST(req: Request) {
     const finalDraftId = resultData.draftId;
     const finalCycleId = resultData.cycleId;
 
-    if (resultData.status !== 'completed' && finalDraftId && finalCycleId) {
+    if ((resultData.status === 'pending' || resultData.status === 'processing') && typeof finalDraftId === 'string' && typeof finalCycleId === 'string') {
       try {
         const triggerUrl = new URL('/api/internal/generation/process', req.url).toString();
         const triggerRes = await fetch(triggerUrl, {
@@ -209,7 +222,8 @@ export async function POST(req: Request) {
           body: JSON.stringify({ memeCycleId: finalCycleId })
         });
         
-        if (!triggerRes.ok) {
+        const triggerData: unknown = await triggerRes.json().catch(() => null);
+        if (!isSuccessfulPreviewTrigger(triggerRes.ok, triggerData)) {
           console.error('Internal generation trigger rejected', {
             route: '/api/internal/generation/process',
             status: triggerRes.status,
@@ -217,8 +231,7 @@ export async function POST(req: Request) {
             hasInternalProcessSecret: !!process.env.INTERNAL_PROCESS_SECRET,
             hasCronSecret: !!process.env.CRON_SECRET
           });
-          // Fail silently regarding the trigger, cycle is already created
-          return txResult;
+          return previewTriggerFailure(finalDraftId, finalCycleId, resultData.status);
         }
       } catch {
         console.error('Internal generation trigger error', {
@@ -228,8 +241,7 @@ export async function POST(req: Request) {
             hasInternalProcessSecret: !!process.env.INTERNAL_PROCESS_SECRET,
             hasCronSecret: !!process.env.CRON_SECRET
         });
-        // Fail silently regarding the trigger
-        return txResult;
+        return previewTriggerFailure(finalDraftId, finalCycleId, resultData.status);
       }
     }
 

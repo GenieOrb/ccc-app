@@ -28,14 +28,17 @@ async function handleProcess(req: Request) {
     if (req.method === 'POST') {
       try {
         const body = await req.json();
-        if (body && typeof body.memeCycleId === 'string') {
-           const parsed = uuidSchema.safeParse(body.memeCycleId);
-           if (parsed.success) {
-             requestMemeCycleId = parsed.data;
-             mode = 'directed_preview';
-           } else {
-             return NextResponse.json({ error: 'Invalid UUID' }, { status: 400, headers: { 'Cache-Control': 'no-store' } });
-           }
+        if (body && typeof body === 'object' && 'memeCycleId' in body) {
+          if (typeof body.memeCycleId !== 'string') {
+            return NextResponse.json({ error: 'Invalid memeCycleId' }, { status: 400, headers: { 'Cache-Control': 'no-store' } });
+          }
+          const parsed = uuidSchema.safeParse(body.memeCycleId);
+          if (parsed.success) {
+            requestMemeCycleId = parsed.data;
+            mode = 'directed_preview';
+          } else {
+            return NextResponse.json({ error: 'Invalid UUID' }, { status: 400, headers: { 'Cache-Control': 'no-store' } });
+          }
         }
       } catch (err) {
         if (err instanceof SyntaxError) {
@@ -51,10 +54,27 @@ async function handleProcess(req: Request) {
       const generationResult = await runGenerationProcessing(workerId, 50000, requestMemeCycleId);
 
       phase = 'response_serialization';
+      const memeWorker = generationResult.workerMemes;
+      if (memeWorker.failed > 0) {
+        return NextResponse.json(
+          {
+            success: false,
+            mode,
+            error: 'Directed preview generation failed',
+            workerMemes: {
+              processed: memeWorker.processed,
+              completed: memeWorker.completed,
+              failed: memeWorker.failed,
+            },
+          },
+          { status: 502, headers: { 'Cache-Control': 'no-store' } }
+        );
+      }
       return NextResponse.json(
         {
           success: true,
           mode,
+          noOp: memeWorker.processed === 0,
           ...generationResult
         },
         { headers: { 'Cache-Control': 'no-store' } }

@@ -28,12 +28,34 @@ describe('Planner Matrix', () => {
 });
 
 describe('Planner Deterministic Generation', () => {
+  it('la longitud del catalogo de plantillas no altera la secuencia historica del plan', () => {
+    const assets = [
+      { id: 'logo-1', assetType: 'logo' as const, appearancePercentage: 100 },
+      { id: 'product-1', assetType: 'product' as const, appearancePercentage: 35 },
+      { id: 'character-1', assetType: 'character' as const, appearancePercentage: 25 },
+    ];
+    const brands = [
+      { value: 'Brand A', percentage: 60 },
+      { value: 'Brand B', percentage: 40 },
+    ];
+    const shortCatalog = ['template-a', 'template-b'];
+    const longCatalog = ['template-a', 'template-b', 'template-c', 'template-d', 'template-e', 'template-f', 'template-g'];
+    const shortPlans = generateDeterministicMemeSlotPlans('camp-history', 'draft-history', ['post-1', 'post-2'], 10, assets, brands, shortCatalog);
+    const longPlans = generateDeterministicMemeSlotPlans('camp-history', 'draft-history', ['post-1', 'post-2'], 10, assets, brands, longCatalog);
+    const withoutTemplate = (plans: typeof shortPlans) => plans.map(({ templateId: _templateId, templateVersion: _templateVersion, ...plan }) => plan);
+
+    expect(shortPlans.every((plan) => shortCatalog.includes(plan.templateId!))).toBe(true);
+    expect(longPlans.every((plan) => longCatalog.includes(plan.templateId!))).toBe(true);
+    expect(withoutTemplate(shortPlans)).toEqual(withoutTemplate(longPlans));
+  });
+
   it('genera planes consistentes y distribuidos', () => {
     const plans = generateDeterministicMemeSlotPlans(
       'camp-1', 'draft-1', ['post1', 'post2'], 10, [{ id: 'asset-1', appearancePercentage: 30 }]
     );
     expect(plans.length).toBe(10);
-    expect(plans[0].plannerVersion).toBe(2);
+    expect(plans.map((plan) => plan.plannerVersion)).toEqual(Array(10).fill(3));
+    expect(plans.every((plan) => plan.templateId && plan.templateVersion === 1)).toBe(true);
     
     // A supplied asset is now the required primary image for every slot.
     const withAsset = plans.filter(p => p.requiresAsset).length;

@@ -56,7 +56,7 @@ describe('GET /api/admin/meme-drafts/[draftId]/status', () => {
       ])
       // 2. jobs query
       .mockResolvedValueOnce([
-        { id: 'job-1', status: 'completed', slot_index: 0, error_message: null, attempts_count: 1, next_attempt_at: null, lease_expires_at: null, updated_at: '2026-08-02T22:00:00Z', latest_call_status: 'succeeded', latest_call_purpose: 'generation', latest_call_updated: '2026-08-02T22:00:00Z' },
+        { id: 'job-1', status: 'completed', slot_index: 0, error_message: null, attempts_count: 1, next_attempt_at: null, lease_expires_at: null, updated_at: '2026-08-02T22:00:00Z', latest_call_status: 'succeeded', latest_call_purpose: 'generation', latest_call_updated: '2026-08-02T22:00:00Z', latest_call_checkpoint: 'checkpoint=db_persisted;template=classic-01' },
         { id: 'job-2', status: 'completed', slot_index: 1, error_message: null, attempts_count: 1, next_attempt_at: null, lease_expires_at: null, updated_at: '2026-08-02T22:00:00Z', latest_call_status: 'succeeded', latest_call_purpose: 'generation', latest_call_updated: '2026-08-02T22:00:00Z' },
         { id: 'job-3', status: 'completed', slot_index: 2, error_message: null, attempts_count: 1, next_attempt_at: null, lease_expires_at: null, updated_at: '2026-08-02T22:00:00Z', latest_call_status: 'succeeded', latest_call_purpose: 'generation', latest_call_updated: '2026-08-02T22:00:00Z' }
       ])
@@ -79,6 +79,7 @@ describe('GET /api/admin/meme-drafts/[draftId]/status', () => {
     expect(data.memes).toHaveLength(1);
     expect(data.memes[0].plan.slotIndex).toBe(0);
     expect(data.memes[0].url).toContain(`/api/admin/meme-drafts/${validDraftId}/memes/meme-1/view`);
+    expect(data.jobs[0].latestCheckpoint).toBe('checkpoint=db_persisted;template=classic-01');
   });
 
   it('logs sanitized error and returns 500 when database throws an exception', async () => {

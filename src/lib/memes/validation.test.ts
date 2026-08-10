@@ -48,7 +48,7 @@ describe('validateMemeImage', () => {
     });
 
     const plan: MemeSlotPlan = {
-      plannerVersion: 2,
+      plannerVersion: 3,
       seed: 'test',
       slotIndex: 0,
       textQuantity: 'short_text',

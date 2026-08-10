@@ -15,7 +15,7 @@ describe('internal generation cron route', () => {
     vi.clearAllMocks();
     processPerpetualCampaigns.mockResolvedValue({ accountsProcessed: 1 });
     reconcileCampaignReplenishment.mockResolvedValue({ checked: 1, errors: [] });
-    runGenerationProcessing.mockResolvedValue({ worker: { processed: 0, completed: 0, failed: 0 }, workerMemes: { processed: 0, completed: 0, failed: 0 } });
+    runGenerationProcessing.mockResolvedValue({ worker: { processed: 0, completed: 0, failed: 0 }, workerMemes: { processed: 1, completed: 1, failed: 0 } });
   });
 
   it('rejects an invalid token without running either processor', async () => {
@@ -58,6 +58,38 @@ describe('internal generation cron route', () => {
       method: 'POST',
       headers: { authorization: 'Bearer cron-only-secret', 'content-type': 'application/json' },
       body: '{ invalid_json'
+    }));
+
+    expect(response.status).toBe(400);
+    expect(runGenerationProcessing).not.toHaveBeenCalled();
+    expect(processPerpetualCampaigns).not.toHaveBeenCalled();
+    expect(reconcileCampaignReplenishment).not.toHaveBeenCalled();
+  });
+
+  it('reports a directed preview failure when the meme worker failed jobs', async () => {
+    runGenerationProcessing.mockResolvedValue({ worker: { processed: 0, completed: 0, failed: 0 }, workerMemes: { processed: 3, completed: 0, failed: 3 } });
+    const response = await POST(new Request('http://localhost/api/internal/generation/process', {
+      method: 'POST', headers: { authorization: 'Bearer cron-only-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ memeCycleId: '11111111-1111-4111-8111-111111111111' })
+    }));
+    expect(response.ok).toBe(false);
+    expect((await response.json()).success).toBe(false);
+  });
+
+  it('treats a directed 0/0/0 result as a successful no-op', async () => {
+    runGenerationProcessing.mockResolvedValue({ worker: { processed: 0, completed: 0, failed: 0 }, workerMemes: { processed: 0, completed: 0, failed: 0 } });
+    const response = await POST(new Request('http://localhost/api/internal/generation/process', {
+      method: 'POST', headers: { authorization: 'Bearer cron-only-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ memeCycleId: '11111111-1111-4111-8111-111111111111' })
+    }));
+    expect(response.ok).toBe(true);
+    expect((await response.json()).success).toBe(true);
+  });
+
+  it.each([null, 42])('rejects memeCycleId=%j without invoking processors', async (memeCycleId) => {
+    const response = await POST(new Request('http://localhost/api/internal/generation/process', {
+      method: 'POST', headers: { authorization: 'Bearer cron-only-secret', 'content-type': 'application/json' },
+      body: JSON.stringify({ memeCycleId })
     }));
 
     expect(response.status).toBe(400);

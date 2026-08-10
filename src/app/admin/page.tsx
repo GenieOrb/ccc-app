@@ -656,23 +656,37 @@ export default function AdminDashboardPage() {
   const [displayName, setDisplayName] = useState('');
   const [modelKey, setModelKey] = useState('deepseek-v4-flash');
   const [models, setModels] = useState<Array<{key:string;displayName:string;inputPricePerMillion:number;outputPricePerMillion:number;configured:boolean;enabled:boolean}>>([]);
-  const [imageModels, setImageModels] = useState<Array<{key:string;displayName:string;costPerImage:number;configured:boolean;enabled:boolean}>>([]);
+  type ImageModel = { key: string; displayName: string; costPerImage: number; configured: boolean; enabled: boolean };
+  type ImageModelCatalog =
+    | { status: 'loading' }
+    | { status: 'ready'; models: ImageModel[] }
+    | { status: 'error'; message: string };
+  const [imageModelCatalog, setImageModelCatalog] = useState<ImageModelCatalog>({ status: 'loading' });
 
   useEffect(() => {
     fetch('/api/admin/models').then(r => r.ok ? r.json() : null).then(data => { if (data?.models) setModels(data.models); }).catch(() => {});
-    fetch('/api/admin/image-models').then(r => r.ok ? r.json() : null).then(data => { 
-      if (data?.models) {
-        setImageModels(data.models);
-        const available = data.models.filter((m: { key: string; enabled: boolean; configured: boolean; }) => m.enabled && m.configured);
-        setMemeModelKey(prev => {
-          if (prev && available.some((m: { key: string; }) => m.key === prev)) return prev;
+    let disposed = false;
+    void (async () => {
+      try {
+        const response = await fetch('/api/admin/image-models');
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (!Array.isArray(data?.models)) throw new Error('payload inválido');
+        const imageModels = data.models as ImageModel[];
+        const available = imageModels.filter((model) => model.enabled && model.configured);
+        if (disposed) return;
+        setImageModelCatalog({ status: 'ready', models: imageModels });
+        setMemeModelKey((previous) => {
+          if (previous && available.some((model) => model.key === previous)) return previous;
           const defaultKey = 'gemini-3.1-flash-image';
-          if (available.some((m: { key: string; }) => m.key === defaultKey)) return defaultKey;
-          if (available.length > 0) return available[0].key;
-          return '';
+          if (available.some((model) => model.key === defaultKey)) return defaultKey;
+          return available[0]?.key || '';
         });
+      } catch {
+        if (!disposed) setImageModelCatalog({ status: 'error', message: 'No se pudo cargar el catálogo de modelos de imagen.' });
       }
-    }).catch(() => {});
+    })();
+    return () => { disposed = true; };
   }, []);
 
   const [urlsInput, setUrlsInput] = useState('');
@@ -684,6 +698,10 @@ export default function AdminDashboardPage() {
   const [includeMemes, setIncludeMemes] = useState(true);
   const [memePercentage, setMemePercentage] = useState('25');
   const [memeModelKey, setMemeModelKey] = useState('');
+  const imageModels = imageModelCatalog.status === 'ready' ? imageModelCatalog.models : [];
+  const availableImageModels = imageModels.filter((model) => model.enabled && model.configured);
+  const hasSelectedImageModel = availableImageModels.some((model) => model.key === memeModelKey);
+  const memePreconditionMissing = includeMemes && (imageModelCatalog.status !== 'ready' || !hasSelectedImageModel);
 
 
   const [draftId, setDraftId] = useState<string | null>(null);
@@ -918,6 +936,7 @@ export default function AdminDashboardPage() {
 
     if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
     if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
+    if (imageModelCatalog.status !== 'ready' || !hasSelectedImageModel) return;
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -961,6 +980,15 @@ export default function AdminDashboardPage() {
       }
 
       const previewData = await previewResponse.json();
+      if (
+        previewData.retryable === true &&
+        typeof previewData.draftId === 'string' &&
+        previewData.draftId.trim() &&
+        typeof previewData.cycleId === 'string' &&
+        previewData.cycleId.trim()
+      ) {
+        setDraftId(previewData.draftId);
+      }
       if (!previewResponse.ok) throw new Error(previewData.error || `Error HTTP ${previewResponse.status}.`);
 
       if (!previewData.draftId || !previewData.cycleId) {
@@ -1043,6 +1071,11 @@ export default function AdminDashboardPage() {
         throw new Error('La preview de memes superó el tiempo de espera máximo (5 minutos).');
       }
       
+      if (!finalMemes || finalMemes.length !== 3) {
+        const receivedCount = Array.isArray(finalMemes) ? finalMemes.length : 0;
+        throw new Error(`Preview incompleta: esperados=3, recibidos=${receivedCount}. La respuesta terminal no se renderizará parcialmente.`);
+      }
+
       if (finalMemes && finalMemes.length === 0) {
         throw new Error('La generación finalizó pero no produjo imágenes válidas.');
       }
@@ -1073,6 +1106,7 @@ export default function AdminDashboardPage() {
   async function handleCreateCampaign(creationMode: 'active' | 'inactive') {
     if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
     if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
+    if (memePreconditionMissing) return;
     const parsedDuration = Number(postActiveLifetimeHours);
     if (campaignTypeToCreate === 'perpetual' && (!Number.isInteger(parsedDuration) || parsedDuration < 1 || parsedDuration > 720)) return;
 
@@ -1087,10 +1121,12 @@ export default function AdminDashboardPage() {
         modelKey,
         creationMode,
         includeMemes,
-        memePercentage: Number(memePercentage),
-        memeModelKey,
-        draftId
       };
+      if (includeMemes) {
+        payload.memePercentage = Number(memePercentage);
+        payload.memeModelKey = memeModelKey;
+        payload.draftId = draftId;
+      }
 
       const trimmedMax = maxCommentsTotalInput.trim();
       if (trimmedMax !== '') {
@@ -1344,14 +1380,22 @@ export default function AdminDashboardPage() {
                     <input type="number" min="0" max="100" className="form-textarea" style={{ minHeight: 'auto', padding: '8px' }} value={memePercentage} onChange={(e) => setMemePercentage(e.target.value)} disabled={creating} />
                   </div>
                   <div>
-                    <label className="form-label">Modelo Generador de Imágenes</label>
-                    <select className="form-textarea" style={{ minHeight: 'auto', padding: '8px' }} value={memeModelKey} onChange={(e) => setMemeModelKey(e.target.value)} disabled={creating}>
-                      {imageModels.map(model => (
-                        <option key={model.key} value={model.key} disabled={!model.enabled || !model.configured}>
-                          {model.displayName} — Base Cost ${model.costPerImage} {!model.configured ? '(No config)' : ''}
+                    <label htmlFor="meme-image-model" className="form-label">Modelo Generador de Imágenes</label>
+                    <select id="meme-image-model" className="form-textarea" style={{ minHeight: 'auto', padding: '8px' }} value={memeModelKey} onChange={(e) => setMemeModelKey(e.target.value)} disabled={creating || imageModelCatalog.status !== 'ready' || availableImageModels.length === 0}>
+                      {imageModelCatalog.status === 'loading' ? (
+                        <option value="">Cargando modelos de imagen…</option>
+                      ) : imageModelCatalog.status === 'error' ? (
+                        <option value="">No se pudo cargar el catálogo de imágenes</option>
+                      ) : availableImageModels.length === 0 ? (
+                        <option value="">No hay modelos de imagen configurados</option>
+                      ) : availableImageModels.map(model => (
+                        <option key={model.key} value={model.key}>
+                          {model.displayName} — Base Cost ${model.costPerImage}
                         </option>
                       ))}
                     </select>
+                    {imageModelCatalog.status === 'loading' && <p role="status" style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: 4 }}>Cargando catálogo de modelos de imagen…</p>}
+                    {imageModelCatalog.status === 'error' && <p role="alert" style={{ fontSize: '0.8rem', color: 'var(--color-danger)', marginTop: 4 }}>{imageModelCatalog.message}</p>}
 
                   </div>
                   
@@ -1458,7 +1502,7 @@ export default function AdminDashboardPage() {
               <button
                 type="submit"
                 className="btn-admin btn-primary"
-                disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
+                disabled={creating || generatingPreview || memePreconditionMissing || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
               >
                 {creating ? 'Creando campaña...' : 'Crear Campaña'}
               </button>
@@ -1466,7 +1510,7 @@ export default function AdminDashboardPage() {
                 type="button"
                 onClick={() => handleCreateCampaign('inactive')}
                 className="btn-admin btn-secondary"
-                disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
+                disabled={creating || generatingPreview || memePreconditionMissing || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
               >
                 {creating ? 'Guardando...' : 'Guardar'}
               </button>
@@ -1482,7 +1526,7 @@ export default function AdminDashboardPage() {
                 <button
                   type="button"
                   className="btn-admin btn-secondary"
-                  disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
+                  disabled={creating || generatingPreview || !hasSelectedImageModel || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
                   onClick={generateMemePreview}
                 >
                   {generatingPreview ? 'Generando preview...' : 'Generar 3 memes'}

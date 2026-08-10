@@ -53,7 +53,7 @@ export type PostRelationship = 'direct_reaction' | 'contradiction_visual' | 'met
 export type SceneComplexity = 'ultra_simple' | 'simple';
 
 export interface MemeSlotPlan {
-  plannerVersion: 2;
+  plannerVersion: 3;
   seed: string;
   campaignId?: string;
   draftId?: string;
@@ -71,7 +71,10 @@ export interface MemeSlotPlan {
   secondaryAssetId?: string;
   brandText?: string;
   deliveryOrder: number;
+  templateId: string;
+  templateVersion: 1;
 }
+import { ACTIVE_MEME_TEMPLATES } from './templates';
 
 export interface MemePlanAsset {
   id: string;
@@ -146,7 +149,8 @@ export function generateDeterministicMemeSlotPlans(
   campaignPostIds: string[],
   totalSlots: number,
   availableAssets: MemePlanAsset[],
-  brandVariants: MemeBrandVariant[] = []
+  brandVariants: MemeBrandVariant[] = [],
+  templateIds?: string[]
 ): MemeSlotPlan[] {
   const seedString = `${campaignId || 'none'}-${draftId || 'none'}-${campaignPostIds.join('-')}-${totalSlots}`;
   const prng = new DeterministicPRNG(seedString);
@@ -171,12 +175,15 @@ export function generateDeterministicMemeSlotPlans(
     : Array(totalSlots).fill(undefined);
 
   const plans: MemeSlotPlan[] = [];
+  const allowedTemplateIds = (templateIds?.length ? templateIds : ACTIVE_MEME_TEMPLATES.map((template) => template.id));
+  const templatePrng = new DeterministicPRNG(`${seedString}::template-selection:v1`);
+  const templateBag = deterministicShuffle(allowedTemplateIds, templatePrng);
   for (let i = 0; i < totalSlots; i++) {
     const textQuantity = textBag[i];
     const visualStructure = pickCompatibleStructure(textQuantity, prng);
     
     plans.push({
-      plannerVersion: 2,
+      plannerVersion: 3,
       seed: seedString,
       campaignId: campaignId || undefined,
       draftId: draftId || undefined,
@@ -188,7 +195,9 @@ export function generateDeterministicMemeSlotPlans(
       postRelationship: relationBag[i],
       sceneComplexity: complexityBag[i],
       requiresAsset: false,
-      deliveryOrder: i
+      deliveryOrder: i,
+      templateId: templateBag[i % templateBag.length],
+      templateVersion: 1
     });
   }
 

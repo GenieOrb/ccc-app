@@ -24,6 +24,10 @@ vi.mock('./x-accounts', () => ({ normalizeXAccounts: vi.fn() }));
 vi.mock('./openai', () => ({ checkCampaignSafety, generateSingleComment: vi.fn() }));
 vi.mock('./crypto', () => ({ generateSecureSlug }));
 vi.mock('./planner', () => ({ generateDeterministicSlotPlans }));
+vi.mock('./memes/planner', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./memes/planner')>();
+  return { ...actual, generateDeterministicMemeSlotPlans: vi.fn(actual.generateDeterministicMemeSlotPlans) };
+});
 vi.mock('./perpetual-monitor', () => ({ processPerpetualCampaigns: vi.fn() }));
 vi.mock('./ai/models', () => ({
   DEFAULT_MODEL_KEY: 'test-model',
@@ -31,7 +35,11 @@ vi.mock('./ai/models', () => ({
   isProviderConfigured: () => true,
 }));
 
+import { generateDeterministicMemeSlotPlans } from './memes/planner';
+import { getMemeTemplatesForProvider } from './memes/templates';
 import { createCampaign, toggleCampaignStatus, triggerReplenishmentIfNeeded } from './services';
+
+const generateMemePlans = vi.mocked(generateDeterministicMemeSlotPlans);
 
 const post = (postId: string) => ({
   postId,
@@ -83,6 +91,10 @@ describe('manual campaign generation inventory', () => {
       ['campaign-1', 'post-1'], ['campaign-1', 'post-2'],
     ]);
     expect(queries.filter(({ sql }) => sql.includes('INSERT INTO generation_jobs'))).toHaveLength(60);
+    expect(queries.filter(({ sql }) => sql.includes('INSERT INTO meme_generation_jobs'))).toHaveLength(10);
+    expect(generateMemePlans).toHaveBeenCalledTimes(1);
+    expect(generateMemePlans.mock.calls[0][3]).toBe(10);
+    expect(generateMemePlans.mock.calls[0][6]).toEqual(getMemeTemplatesForProvider('google').map((template) => template.id));
   });
 
   it('replenishes only the depleted manual post with ten jobs', async () => {

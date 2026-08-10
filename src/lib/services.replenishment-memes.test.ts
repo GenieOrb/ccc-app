@@ -6,13 +6,21 @@ const { queryDb, withTransaction } = vi.hoisted(() => ({
 }));
 
 vi.mock('./db', () => ({ queryDb, withTransaction }));
+vi.mock('./memes/planner', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./memes/planner')>();
+  return { ...actual, generateDeterministicMemeSlotPlans: vi.fn(actual.generateDeterministicMemeSlotPlans) };
+});
 vi.mock('./ai/models', () => ({
   DEFAULT_MODEL_KEY: 'test-model',
   getAiModel: () => ({ key: 'test-model', enabled: true, provider: 'openai', apiModel: 'test-model' }),
   isProviderConfigured: () => true,
 }));
 
+import { generateDeterministicMemeSlotPlans } from './memes/planner';
+import { getMemeTemplatesForProvider } from './memes/templates';
 import { triggerReplenishmentIfNeeded } from './services';
+
+const generateMemePlans = vi.mocked(generateDeterministicMemeSlotPlans);
 
 type CampaignType = 'manual' | 'perpetual';
 type RecordedQuery = { sql: string; params?: unknown[] };
@@ -85,6 +93,9 @@ describe('triggerReplenishmentIfNeeded meme job contract', () => {
 
       const memeJobInserts = queries.filter(({ sql }) => sql.includes('INSERT INTO meme_generation_jobs'));
       expect(memeJobInserts).toHaveLength(1);
+      expect(generateMemePlans).toHaveBeenCalledTimes(1);
+      expect(generateMemePlans.mock.calls[0][3]).toBe(1);
+      expect(generateMemePlans.mock.calls[0][6]).toEqual(getMemeTemplatesForProvider('google').map((template) => template.id));
       const memeJob = memeJobInserts[0];
       expect(memeJob.sql).toContain('asset_snapshot');
 

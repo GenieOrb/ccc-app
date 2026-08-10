@@ -8,6 +8,7 @@ import { checkCampaignSafety } from './openai';
 import { generateSecureSlug } from './crypto';
 import { generateDeterministicSlotPlans } from './planner';
 import { parseBrandVariantsSafe } from './brand-variants';
+import { getMemeTemplatesForProvider } from './memes/templates';
 
 function createMemeAssetSnapshot(
   plan: { assetId?: string; secondaryAssetId?: string },
@@ -472,12 +473,12 @@ export async function createCampaign(params: {
           sha256: a.sha256_hash, width: a.width, height: a.height
         }));
 
-        const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [campaignPostIds[0]], remainingToGenerate, availableAssets, params.brandVariants || []);
+        const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [campaignPostIds[0]], remainingToGenerate, availableAssets, params.brandVariants || [], getMemeTemplatesForProvider(memeModel.provider).map((template) => template.id));
         const mCycleRes = await client.query<{ id: string }>(
           `INSERT INTO meme_generation_cycles (
               campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, provider, api_model, planner_version, pricing_snapshot
            ) VALUES (
-              $1, $2, 'initial', $3, 'pending', $4, $5, $6, 1, $7::jsonb
+              $1, $2, 'initial', $3, 'pending', $4, $5, $6, 3, $7::jsonb
            ) RETURNING id`,
           [campaignId, campaignPostIds[0], remainingToGenerate, memeModel.key, memeModel.provider, memeModel.apiModel, JSON.stringify(memeModel)]
         );
@@ -841,7 +842,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
                 instruction: asset.instruction, storageKey: asset.storage_key, mimeType: asset.mime_type,
                 sha256: asset.sha256_hash, width: asset.width, height: asset.height,
               }));
-              const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [postId], mRepSize, availableMemeAssets, parseBrandVariantsSafe(campaignInfo.brand_variants));
+              const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [postId], mRepSize, availableMemeAssets, parseBrandVariantsSafe(campaignInfo.brand_variants), getMemeTemplatesForProvider(memeModel.provider).map((template) => template.id));
               if (memePlans.length > 0) {
                 let mCycleId: string;
                 try {
@@ -849,7 +850,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
                     `INSERT INTO meme_generation_cycles (
                         campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, provider, api_model, planner_version, pricing_snapshot
                      ) VALUES (
-                        $1, $2, 'replenishment', $3, 'pending', $4, $5, $6, 1, $7::jsonb
+                        $1, $2, 'replenishment', $3, 'pending', $4, $5, $6, 3, $7::jsonb
                      ) RETURNING id`,
                      [campaignId, postId, mRepSize, memeModel.key, memeModel.provider, memeModel.apiModel, JSON.stringify(memeModel)]
                   );
@@ -1021,7 +1022,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
                 instruction: asset.instruction, storageKey: asset.storage_key, mimeType: asset.mime_type,
                 sha256: asset.sha256_hash, width: asset.width, height: asset.height,
               }));
-              const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [postId], mRepSize, availableMemeAssets, parseBrandVariantsSafe(campaignInfo.brand_variants));
+              const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [postId], mRepSize, availableMemeAssets, parseBrandVariantsSafe(campaignInfo.brand_variants), getMemeTemplatesForProvider(memeModel.provider).map((template) => template.id));
               if (memePlans.length > 0) {
                 let mCycleId: string;
                 try {
@@ -1029,7 +1030,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
                     `INSERT INTO meme_generation_cycles (
                         campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, provider, api_model, planner_version, pricing_snapshot
                      ) VALUES (
-                        $1, $2, 'replenishment', $3, 'pending', $4, $5, $6, 1, $7::jsonb
+                        $1, $2, 'replenishment', $3, 'pending', $4, $5, $6, 3, $7::jsonb
                      ) RETURNING id`,
                      [campaignId, postId, mRepSize, memeModel.key, memeModel.provider, memeModel.apiModel, JSON.stringify(memeModel)]
                   );

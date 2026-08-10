@@ -30,6 +30,7 @@ describe('administration campaign cards', () => {
   beforeEach(() => {
     fetchMock.mockImplementation((input: string) => {
       if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
       if (input.includes('/preview')) return Promise.resolve(json({ previews: [] }));
       if (input.includes('/toggle')) return Promise.resolve(json({ success: true, isActive: false }));
       if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
@@ -41,6 +42,82 @@ describe('administration campaign cards', () => {
   it('enables the meme system by default', async () => {
     render(<AdminDashboardPage />);
     expect((await screen.findByLabelText(/habilitar sistema de memes/i) as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('blocks meme-dependent actions with no configured image model while leaving comment preview available', async () => {
+    fetchMock.mockImplementation((input: string) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [] }));
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+    render(<AdminDashboardPage />);
+    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
+    const imageSelector = screen.getByLabelText(/modelo generador de im[aá]genes/i) as HTMLSelectElement;
+    expect(imageSelector.disabled).toBe(true);
+    expect(imageSelector.value).toBe('');
+    expect((screen.getByRole('button', { name: /crear campa[añ]a/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: /^guardar$/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: /generar 3 memes/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: /generar preview de comentarios/i }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url) === '/api/admin/campaigns/preview/memes' && (init as RequestInit | undefined)?.method === 'POST')).toBe(false);
+  });
+
+  it('keeps all meme actions blocked while the image-model catalog is loading', async () => {
+    let resolveCatalog: ((value: ReturnType<typeof json>) => void) | undefined;
+    fetchMock.mockImplementation((input: string) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input.includes('/api/admin/image-models')) return new Promise((resolve) => { resolveCatalog = resolve; });
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+    render(<AdminDashboardPage />);
+    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
+    expect(screen.getByRole('status').textContent).toMatch(/cargando catálogo/i);
+    expect((screen.getByRole('button', { name: /crear campaña/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: /generar 3 memes/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: /generar preview de comentarios/i }) as HTMLButtonElement).disabled).toBe(false);
+    resolveCatalog?.(json({ models: [] }));
+  });
+
+  it('reports a catalog error, blocks meme POSTs, and allows a campaign without memes', async () => {
+    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ error: 'unavailable' }, false));
+      if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true }));
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+    render(<AdminDashboardPage />);
+    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
+    expect((await screen.findByRole('alert')).textContent).toMatch(/no se pudo cargar/i);
+    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
+    expect(fetchMock.mock.calls.some(([url, init]) => String(url) === '/api/admin/campaigns/preview/memes' && (init as RequestInit | undefined)?.method === 'POST')).toBe(false);
+    fireEvent.click(screen.getByLabelText(/habilitar sistema de memes/i));
+    fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([url, init]) => String(url) === '/api/admin/campaigns' && (init as RequestInit | undefined)?.method === 'POST');
+      expect(request).toBeTruthy();
+      const payload = JSON.parse((request?.[1] as RequestInit).body as string);
+      expect(payload).toMatchObject({ includeMemes: false });
+      expect(payload).not.toHaveProperty('memeModelKey');
+      expect(payload).not.toHaveProperty('memePercentage');
+    });
+  });
+
+  it('selects the first configured image model and allows meme actions', async () => {
+    fetchMock.mockImplementation((input: string) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+    render(<AdminDashboardPage />);
+    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
+    await waitFor(() => expect((screen.getByLabelText(/modelo generador de im[aá]genes/i) as HTMLSelectElement).value).toBe('image-ready'));
+    expect((screen.getByRole('button', { name: /crear campa[añ]a/i }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('button', { name: /generar 3 memes/i }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it('starts collapsed, exposes an accessible arrow, and only fetches preview after expansion', async () => {
@@ -154,6 +231,7 @@ describe('administration campaign cards', () => {
   it('submits the default manual campaign with only its X post URLs', async () => {
     fetchMock.mockImplementation((input: string, init?: RequestInit) => {
       if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
       if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true }));
       if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
       return Promise.resolve(json({}));
@@ -287,6 +365,7 @@ describe('administration campaign cards', () => {
   it('includes existing brand variants in the meme preview request', async () => {
     fetchMock.mockImplementation((input: string, init?: RequestInit) => {
       if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
       if (input === '/api/admin/campaigns/preview/memes' && init?.method === 'POST') return Promise.resolve(json({ error: 'stop after payload' }, false));
       if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
       return Promise.resolve(json({}));
@@ -304,6 +383,72 @@ describe('administration campaign cards', () => {
     });
   });
 
+  it('reuses the draftId returned by a retryable meme preview error', async () => {
+    const retryableErrorResponse = () => ({
+      ...json({
+        error: 'La generación no terminó en esta invocación.',
+        retryable: true,
+        draftId: 'draft-retry-1',
+        cycleId: 'cycle-retry-1',
+      }, false),
+      status: 502,
+    });
+
+    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
+      if (input === '/api/admin/campaigns/preview/memes' && init?.method === 'POST') {
+        return Promise.resolve(retryableErrorResponse());
+      }
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+
+    render(<AdminDashboardPage />);
+    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
+      target: { value: 'https://x.com/genieorb/status/123' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
+    expect(await screen.findByText('La generación no terminó en esta invocación.')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
+
+    await waitFor(() => {
+      const previewCalls = fetchMock.mock.calls.filter(([url, callInit]) =>
+        String(url) === '/api/admin/campaigns/preview/memes' && (callInit as RequestInit | undefined)?.method === 'POST',
+      );
+      expect(previewCalls).toHaveLength(2);
+      expect(JSON.parse((previewCalls[1][1] as RequestInit).body as string)).toMatchObject({
+        draftId: 'draft-retry-1',
+      });
+    });
+  });
+
+  it('rechaza terminal parcial de dos memes con diagnostico y no lo renderiza', async () => {
+    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
+      if (input === '/api/admin/campaigns/preview/memes' && init?.method === 'POST') return Promise.resolve(json({ success: true, draftId: 'draft-partial', cycleId: 'cycle-partial' }));
+      if (input.includes('/api/admin/meme-drafts/draft-partial/status')) return Promise.resolve(json({
+        terminal: true, targetCount: 3, completedCount: 2, failedCount: 0, cancelledCount: 0, actualMemesCount: 2,
+        memes: [
+          { id: 'meme-1', url: 'local://one', plan: { slotIndex: 0 } },
+          { id: 'meme-2', url: 'local://two', plan: { slotIndex: 1 } },
+        ],
+      }));
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+    render(<AdminDashboardPage />);
+    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
+    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
+
+    expect(await screen.findByText(/preview incompleta.*esperados=3.*recibidos=2/i)).toBeTruthy();
+    expect(screen.queryByRole('region', { name: /preview de memes generados/i })).toBeNull();
+    expect(screen.queryByAltText('Meme 1')).toBeNull();
+  });
+
   describe('maxCommentsTotal optional field', () => {
     it('is initially empty and not required', async () => {
       render(<AdminDashboardPage />);
@@ -315,6 +460,7 @@ describe('administration campaign cards', () => {
     it('submits without maxCommentsTotal when empty', async () => {
       fetchMock.mockImplementation((input: string, init?: RequestInit) => {
         if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+        if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
         if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true }));
         if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
         return Promise.resolve(json({}));
@@ -337,6 +483,7 @@ describe('administration campaign cards', () => {
     it('submits with maxCommentsTotal when provided', async () => {
       fetchMock.mockImplementation((input: string, init?: RequestInit) => {
         if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+        if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
         if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true }));
         if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
         return Promise.resolve(json({}));
@@ -366,6 +513,7 @@ describe('administration campaign cards', () => {
     it('shows error and does not submit with invalid maxCommentsTotal', async () => {
       fetchMock.mockImplementation((input: string) => {
         if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+        if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
         if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
         return Promise.resolve(json({}));
       });

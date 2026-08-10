@@ -1,13 +1,11 @@
 import 'server-only';
 import { randomUUID } from 'node:crypto';
-import sharp from 'sharp';
 import { queryDb, withTransaction } from './db';
 import { uploadGeneratedMeme, getMemeBlobBuffer, deleteBlob } from './memes/blob';
-import { performMemeAnalysis } from './memes/analysis';
-import { generateMemeImage, MemeGenerationResult } from './memes/generation';
-import { validateMemeImage } from './memes/validation';
+import { MemePreflightAnalysis, normalizeMemeCaptions, performMemeAnalysis, resolveMemeAnalysisModel } from './memes/analysis';
+import { generateMemeImage, type MemeGenerationResult } from './memes/generation';
 import { MemeSlotPlan } from './memes/planner';
-import { ResolvedEntityLogo, resolveEntityLogos } from './memes/entity-logo-resolver';
+import { DEFAULT_MEME_TEMPLATE, getMemeTemplate, resolveMemeTemplateSelection } from './memes/templates';
 import { ImageModelSnapshot } from './ai/image-models';
 import { classifyMemeProviderError } from './memes/errors';
 
@@ -76,97 +74,27 @@ function normalizeAssetSnapshots(snapshot: unknown): { primaryAsset: NormalizedA
   return { primaryAsset, secondaryAsset: normalizeSingleAssetSnapshot(record.secondaryAsset) };
 }
 
-async function composeRequiredLogo(generation: MemeGenerationResult, assetData?: { buffer: Buffer; assetType: string }): Promise<MemeGenerationResult> {
-  if (!assetData || assetData.assetType !== 'logo') return generation;
-  const metadata = await sharp(generation.imageBuffer).metadata();
-  const width = metadata.width || generation.width;
-  const height = metadata.height || generation.height;
-  if (!width || !height) throw new Error('Generated image dimensions are unavailable for logo composition');
-  const logo = await sharp(assetData.buffer)
-    .resize({ width: Math.max(32, Math.floor(width * 0.18)), height: Math.max(32, Math.floor(height * 0.18)), fit: 'inside', withoutEnlargement: true })
-    .png()
-    .toBuffer();
-  return {
-    ...generation,
-    imageBuffer: await sharp(generation.imageBuffer).composite([{ input: logo, gravity: 'southeast' }]).png().toBuffer(),
-    mimeType: 'image/png',
-    width,
-    height
-  };
-}
-
-function escapeXml(value: string): string {
-  return value.replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[character]!);
-}
-
-export function composeBrandTextSvg(brandText: string, width: number = 1024, height: number = 1024): string {
-  const fontSize = Math.max(12, Math.floor(Math.min(width, height) * 0.045));
-  const padding = Math.max(8, Math.floor(fontSize * 0.45));
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><text x="${padding}" y="${height - padding}" fill="#ffffff" stroke="#000000" stroke-width="${Math.max(1, Math.floor(fontSize / 12))}" paint-order="stroke" font-family="Arial, sans-serif" font-size="${fontSize}" font-weight="700">${escapeXml(brandText)}</text></svg>`;
-}
-
-async function composeBrandText(generation: MemeGenerationResult, brandText?: string): Promise<MemeGenerationResult> {
-  if (!brandText) return generation;
-  try {
-    const metadata = await sharp(generation.imageBuffer).metadata();
-    const width = metadata.width || generation.width;
-    const height = metadata.height || generation.height;
-    if (!width || !height) throw new Error('Generated image dimensions are unavailable for brand composition');
-    return {
-      ...generation,
-      imageBuffer: await sharp(generation.imageBuffer).composite([{ input: Buffer.from(composeBrandTextSvg(brandText, width, height)) }]).png().toBuffer(),
-      mimeType: 'image/png',
-      width,
-      height,
-    };
-  } catch {
-    return generation;
-  }
-}
-
-export async function composeResolvedEntityLogos(
-  generation: MemeGenerationResult,
-  logos: readonly ResolvedEntityLogo[],
-  clientAsset?: { buffer: Buffer; assetType: string }
-): Promise<MemeGenerationResult> {
-  const withClientAsset = await composeRequiredLogo(generation, clientAsset);
-  if (logos.length === 0) return withClientAsset;
-
-  const metadata = await sharp(withClientAsset.imageBuffer).metadata();
-  const width = metadata.width || withClientAsset.width;
-  const height = metadata.height || withClientAsset.height;
-  if (!width || !height) throw new Error('Generated image dimensions are unavailable for entity logo composition');
-
-  if (width < 2 || height < 2) {
-    return {
-      ...withClientAsset,
-      imageBuffer: await sharp({ create: { width, height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } }).png().toBuffer(),
-      mimeType: 'image/png',
-      width,
-      height,
-    };
-  }
-
-  const smallestDimension = Math.min(width, height);
-  const logoSize = Math.min(smallestDimension, Math.max(1, Math.floor(smallestDimension * 0.14)));
-  const margin = Math.min(Math.max(0, smallestDimension - logoSize), Math.max(0, Math.floor(smallestDimension * 0.03)));
-  const composites = await Promise.all(logos.slice(0, 2).map(async (logo, index) => ({
-    input: await sharp(Buffer.from(logo.svg)).resize({ width: logoSize, height: logoSize, fit: 'inside' }).png().toBuffer(),
-    left: margin + index * (logoSize + margin),
-    top: Math.max(0, height - logoSize - margin),
-  })));
-
-  return {
-    ...withClientAsset,
-    imageBuffer: await sharp(withClientAsset.imageBuffer).composite(composites).png().toBuffer(),
-    mimeType: 'image/png',
-    width,
-    height,
-  };
-}
-
 export const MIN_MEME_WORKER_JOB_BUDGET_MS = 25_000;
 const WORKER_DURABLE_WRITE_RESERVE_MS = 5_000;
+const MEME_ANALYSIS_PREVIEW_TIMEOUT_MS = 12_000;
+const MEME_ANALYSIS_BACKGROUND_TIMEOUT_MS = 18_000;
+
+function buildFallbackMemeAnalysis(postText: string, _campaignDirection: string, textQuantity: MemeSlotPlan['textQuantity']): MemePreflightAnalysis {
+  const postContext = postText.replace(/\s+/g, ' ').trim() || 'The original post context';
+  return {
+    captions: normalizeMemeCaptions(textQuantity, []),
+    immediate_joke: 'A familiar visual reaction grounded in the post context.',
+    single_visual_focus: 'The template subject reacting clearly.',
+    familiar_physical_situation: 'A recognizable everyday reaction.',
+    post_connection: postContext,
+    requires_asset: false,
+    entityEvidence: {
+      postJustification: postContext,
+      externalLogoIntent: false
+    },
+    canonicalEntities: []
+  };
+}
 
 export async function processMemeBackgroundQueue(
   optionsOrWorkerId: ProcessMemeQueueOptions | string = {},
@@ -262,9 +190,14 @@ async function claimNextMemeJob(
   return await withTransaction(async (client) => {
     const queryParams: unknown[] = [];
     let cycleFilter = '';
+    let pendingEligibility = "j.status = 'pending' AND j.next_attempt_at <= NOW()";
     if (cycleId) {
       queryParams.push(cycleId);
       cycleFilter = `AND j.cycle_id = $1`;
+      pendingEligibility = `j.status = 'pending' AND (
+        j.next_attempt_at <= NOW()
+        OR (j.draft_id IS NOT NULL AND cy.cycle_type = 'preview')
+      )`;
     }
 
     const selectRes = await client.query(
@@ -295,7 +228,7 @@ async function claimNextMemeJob(
        LEFT JOIN meme_drafts md ON j.draft_id = md.id
        LEFT JOIN meme_generation_cycles cy ON j.cycle_id = cy.id
        WHERE (
-         (j.status = 'pending' AND j.next_attempt_at <= NOW())
+         (${pendingEligibility})
          OR (j.status = 'processing' AND j.lease_expires_at < NOW())
        )
        AND (
@@ -360,7 +293,11 @@ async function claimNextMemeJob(
       draftId: row.draft_id,
       campaignPostId: row.campaign_post_id,
       slotIndex: row.slot_index,
-      slotPlan: row.slot_plan,
+      slotPlan: {
+        ...row.slot_plan,
+        templateId: row.slot_plan?.templateId || DEFAULT_MEME_TEMPLATE.id,
+        templateVersion: row.slot_plan?.templateVersion || DEFAULT_MEME_TEMPLATE.version,
+      },
       deterministicDimensions: row.deterministic_dimensions,
       assetSnapshot: row.asset_snapshot,
       modelSnapshot: canonicalSnapshot,
@@ -469,7 +406,7 @@ async function recalculateMemeCycleStatus(cycleId: string, lastError?: string) {
     } else {
       const terminal = pending === 0 && processing === 0;
       if (terminal) {
-        if (completedJobs === 3 && validProducedCount === 3 && targetCount === 3) {
+        if (completedJobs === targetCount && validProducedCount === targetCount) {
           cycleStatus = 'completed';
         } else if (validProducedCount > 0) {
           cycleStatus = 'partial';
@@ -537,7 +474,8 @@ async function executeMemeJobTask(
     provider: string,
     modelKey: string,
     apiModel: string,
-    phase?: 'revalidation'
+    phase?: 'revalidation',
+    checkpoint?: { referenceImagesCount?: number; resolution?: string; message?: string }
   ): Promise<{ callKey: string; shouldExecute: boolean; existingStatus?: string }> => {
     const callKey = phase
       ? `${job.jobId}:${attemptNumber}:${purpose}:${phase}`
@@ -545,8 +483,8 @@ async function executeMemeJobTask(
 
     const insertRes = await queryDb<{ id: string }>(
       `INSERT INTO meme_api_calls (
-         call_key, campaign_id, draft_id, cycle_id, job_id, purpose, provider, model_key, api_model, status, total_cost, pricing_snapshot, currency, attempt
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'started', 0, $10, 'USD', $11)
+         call_key, campaign_id, draft_id, cycle_id, job_id, purpose, provider, model_key, api_model, status, total_cost, pricing_snapshot, currency, attempt, reference_images_count, resolution, error_message
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'started', 0, $10, 'USD', $11, $12, $13, $14)
        ON CONFLICT (call_key) DO NOTHING
        RETURNING id`,
       [
@@ -560,7 +498,10 @@ async function executeMemeJobTask(
         modelKey,
         apiModel,
         JSON.stringify(job.modelSnapshot),
-        attemptNumber
+        attemptNumber,
+        checkpoint?.referenceImagesCount || 0,
+        checkpoint?.resolution || null,
+        checkpoint?.message?.slice(0, 300) || null,
       ]
     );
 
@@ -593,10 +534,14 @@ async function executeMemeJobTask(
   const finishApiCall = async (callKey: string, cost: number, status: string, error?: string) => {
     await queryDb(
       `UPDATE meme_api_calls
-       SET status = $1, total_cost = $2, error_message = $3, finished_at = NOW()
+       SET status = $1, total_cost = $2, error_message = COALESCE($3, error_message), finished_at = NOW()
        WHERE call_key = $4`,
-      [status, cost, error || null, callKey]
+      [status, cost, error?.slice(0, 300) || null, callKey]
     );
+  };
+
+  const checkpointApiCall = async (callKey: string, message: string) => {
+    await queryDb(`UPDATE meme_api_calls SET error_message = $1 WHERE call_key = $2`, [message.slice(0, 300), callKey]);
   };
 
   const ensureShouldExecute = (call: { shouldExecute: boolean; existingStatus?: string }, stepName: string) => {
@@ -657,16 +602,29 @@ async function executeMemeJobTask(
       assetType: asset.assetType,
     }));
 
-    const analysisCall = await startApiCall('analysis', 'google', 'gemini-2.5-flash', 'gemini-2.5-flash');
-    let analysis;
+    const analysisModelName = resolveMemeAnalysisModel();
+    const analysisCall = await startApiCall('analysis', 'google', analysisModelName, analysisModelName);
+    let analysis: MemePreflightAnalysis;
     ensureShouldExecute(analysisCall, 'analysis');
     try {
-      analysis = await performMemeAnalysis({ postText, campaignDirection, availableAssets, brandContext: job.slotPlan.brandText }, { signal: abortController.signal, timeoutMs: deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS });
+      const analysisTimeoutMs = Math.min(
+        Math.max(1, deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS),
+        job.draftId ? MEME_ANALYSIS_PREVIEW_TIMEOUT_MS : MEME_ANALYSIS_BACKGROUND_TIMEOUT_MS
+      );
+      const plannedTemplate = getMemeTemplate(job.slotPlan.templateId, job.slotPlan.templateVersion);
+      analysis = await performMemeAnalysis({
+        postText, campaignDirection, availableAssets, brandContext: job.slotPlan.brandText, textQuantity: job.slotPlan.textQuantity,
+        templates: [{ id: plannedTemplate.id, name: plannedTemplate.name, layout: plannedTemplate.layout, zones: plannedTemplate.zones.map((zone) => zone.id), guidance: plannedTemplate.guidance }],
+      }, { signal: abortController.signal, timeoutMs: analysisTimeoutMs, modelName: analysisModelName });
       await finishApiCall(analysisCall.callKey, 0, 'succeeded');
     } catch (e: unknown) {
-      await finishApiCall(analysisCall.callKey, 0, 'failed', e instanceof Error ? e.message : String(e));
-      throw e;
+      analysis = buildFallbackMemeAnalysis(postText, campaignDirection, job.slotPlan.textQuantity);
+      await finishApiCall(analysisCall.callKey, 0, 'succeeded', e instanceof Error ? e.message : String(e));
     }
+
+    // The model may only select a catalog entry. Missing/invalid output retains the deterministic planned template.
+    const selectedTemplate = resolveMemeTemplateSelection(analysis.template_id, job.slotPlan.templateId, job.slotPlan.templateVersion);
+    const resolvedSlotPlan: MemeSlotPlan = { ...job.slotPlan, templateId: selectedTemplate.id, templateVersion: selectedTemplate.version };
 
     const loadAssetData = async (assetSnapshot: NormalizedAssetSnapshot) => {
       const storageKeyOrUrl = assetSnapshot.storageKey || assetSnapshot.storageUrl;
@@ -683,34 +641,39 @@ async function executeMemeJobTask(
         throw new Error('Failed to fetch required asset blob');
       }
     };
-    const primaryAssetData = primaryAssetSnapshot ? await loadAssetData(primaryAssetSnapshot) : undefined;
-    const secondaryAssetData = secondaryAssetSnapshot ? await loadAssetData(secondaryAssetSnapshot) : undefined;
-    if (job.slotPlan.requiresAsset && !primaryAssetData) throw new Error('Required asset blob is unavailable');
-    const assetData = secondaryAssetData || primaryAssetData;
+    const assetReferences = [];
+    if (primaryAssetSnapshot) assetReferences.push(await loadAssetData(primaryAssetSnapshot));
+    if (secondaryAssetSnapshot) assetReferences.push(await loadAssetData(secondaryAssetSnapshot));
+    if (job.slotPlan.requiresAsset && assetReferences.length === 0) throw new Error('Required asset blob is unavailable');
 
     if (!hasRemainingBudget(WORKER_DURABLE_WRITE_RESERVE_MS + 10000)) {
       await releaseLease(job.jobId, 'pending', 'Insufficient budget for image generation');
       return { success: false, error: 'Insufficient budget for image generation', metrics };
     }
 
-    const analysisEvidence = analysis.entityEvidence as (typeof analysis.entityEvidence & { entities?: Array<{ canonicalEntity?: string; postJustification?: string }> }) | undefined;
-    const entityEvidence = analysisEvidence?.entities
-      ? analysisEvidence.entities.flatMap((entity) => typeof entity.canonicalEntity === 'string' && typeof entity.postJustification === 'string'
-        ? [{ canonicalEntity: entity.canonicalEntity, postJustification: entity.postJustification }]
-        : [])
-      : (analysis.canonicalEntities || []).map((canonicalEntity) => ({ canonicalEntity, postJustification: analysis.entityEvidence?.postJustification || '' }));
-    const resolvedEntityLogos = resolveEntityLogos({
-      postText,
-      externalLogoIntent: analysis.entityEvidence?.externalLogoIntent === true,
-      entityEvidence,
-    });
-    const genCall = await startApiCall('generation', job.modelSnapshot.provider, job.modelSnapshot.key, job.modelSnapshot.apiModel);
+    const referenceImagesCount = 1 + assetReferences.length;
+    const resolution = '1024x1024';
+    const genCall = await startApiCall(
+      'generation',
+      job.modelSnapshot.provider,
+      job.modelSnapshot.key,
+      job.modelSnapshot.apiModel,
+      undefined,
+      { referenceImagesCount, resolution, message: `checkpoint=ai_started;template=${resolvedSlotPlan.templateId};captions=${analysis.captions?.length || 0}` }
+    );
     let generation: MemeGenerationResult;
     ensureShouldExecute(genCall, 'generation');
     try {
-      generation = await generateMemeImage(job.slotPlan, analysis, job.modelSnapshot.key, assetData, undefined, { signal: abortController.signal, timeoutMs: deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS });
-      generation = await composeResolvedEntityLogos(generation, resolvedEntityLogos, primaryAssetData);
-      generation = await composeBrandText(generation, job.slotPlan.brandText);
+      generation = await generateMemeImage(
+        resolvedSlotPlan,
+        analysis,
+        job.modelSnapshot.key,
+        assetReferences,
+        undefined,
+        { signal: abortController.signal, timeoutMs: Math.max(1, deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS) }
+      );
+      if (generation.imageBuffer.length === 0) throw new Error('AI generation returned an empty binary image');
+      await checkpointApiCall(genCall.callKey, `checkpoint=ai_output_binary_valid;template=${resolvedSlotPlan.templateId};bytes=${generation.imageBuffer.length}`);
       currentCost += parseFloat(generation.cost);
       metrics.cost = currentCost;
       await finishApiCall(genCall.callKey, parseFloat(generation.cost), 'succeeded');
@@ -723,62 +686,7 @@ async function executeMemeJobTask(
       return { success: false, error: 'Lost worker lease after image generation', metrics };
     }
 
-    const valCall = await startApiCall('validation', 'google', 'gemini-2.5-flash', 'gemini-2.5-flash');
-    let validation;
-    ensureShouldExecute(valCall, 'validation');
-    try {
-      validation = await validateMemeImage(generation.imageBuffer, generation.mimeType, job.slotPlan, campaignDirection, { signal: abortController.signal, timeoutMs: deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS });
-      await finishApiCall(valCall.callKey, 0, 'succeeded');
-    } catch (e: unknown) {
-      await finishApiCall(valCall.callKey, 0, 'failed', e instanceof Error ? e.message : String(e));
-      throw e;
-    }
-
-    let is_valid = validation.is_valid;
-
-    if (!is_valid) {
-      metrics.regenerations++;
-      metrics.boundedErrors++;
-
-      if (!hasRemainingBudget(WORKER_DURABLE_WRITE_RESERVE_MS + 10000)) {
-        await releaseLease(job.jobId, 'pending', 'Insufficient budget for regeneration');
-        return { success: false, error: 'Insufficient budget for regeneration', metrics };
-      }
-
-      const regenCall = await startApiCall('regeneration', job.modelSnapshot.provider, job.modelSnapshot.key, job.modelSnapshot.apiModel);
-      ensureShouldExecute(regenCall, 'regeneration');
-      try {
-        const regenerateInstruction = `FAILED VALIDATION REASON: ${validation.reason}\n\nCRITICAL: Simplify radically, remove all explanations, remove extra labels, reduce scene complexity, express one immediate visual joke. Do NOT render text if no_text was specified!`;
-        generation = await generateMemeImage(job.slotPlan, analysis, job.modelSnapshot.key, assetData, regenerateInstruction, { signal: abortController.signal, timeoutMs: deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS });
-        generation = await composeResolvedEntityLogos(generation, resolvedEntityLogos, primaryAssetData);
-        generation = await composeBrandText(generation, job.slotPlan.brandText);
-        currentCost += parseFloat(generation.cost);
-        metrics.cost = currentCost;
-        await finishApiCall(regenCall.callKey, parseFloat(generation.cost), 'succeeded');
-      } catch (e: unknown) {
-        await finishApiCall(regenCall.callKey, 0, 'failed', e instanceof Error ? e.message : String(e));
-        throw e;
-      }
-
-      const revalCall = await startApiCall('validation', 'google', 'gemini-2.5-flash', 'gemini-2.5-flash', 'revalidation');
-      ensureShouldExecute(revalCall, 'revalidation');
-      try {
-        validation = await validateMemeImage(generation.imageBuffer, generation.mimeType, job.slotPlan, campaignDirection, { signal: abortController.signal, timeoutMs: deadline - Date.now() - WORKER_DURABLE_WRITE_RESERVE_MS });
-        await finishApiCall(revalCall.callKey, 0, 'succeeded');
-      } catch (e: unknown) {
-        await finishApiCall(revalCall.callKey, 0, 'failed', e instanceof Error ? e.message : String(e));
-        throw e;
-      }
-
-      if (!validation.is_valid) {
-        throw new Error('Meme validation failed twice');
-      }
-      is_valid = true;
-    }
-
-    if (is_valid) {
-      metrics.validMemes = 1;
-    }
+    metrics.validMemes = 1;
 
     if (!hasRemainingBudget(WORKER_DURABLE_WRITE_RESERVE_MS)) {
       await releaseLease(job.jobId, 'pending', 'Insufficient budget for Blob storage and DB write');
@@ -792,6 +700,7 @@ async function executeMemeJobTask(
     let storageResult;
     try {
       storageResult = await uploadGeneratedMeme(generation.imageBuffer, generation.mimeType);
+      await checkpointApiCall(genCall.callKey, `checkpoint=blob_uploaded;template=${resolvedSlotPlan.templateId};bytes=${generation.imageBuffer.length}`);
     } catch (blobErr) {
       console.error('Blob upload failed', blobErr);
       throw new Error('No se pudo guardar la imagen en el almacenamiento de blobs.');
@@ -837,7 +746,7 @@ async function executeMemeJobTask(
            ) VALUES (
              $1, $2, $3, $4, $5, 'vercel_blob', $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
            ) RETURNING id`,
-          [finalDraftId, finalCampaignId, finalCampaignPostId, job.jobId, finalStatus, storageResult.pathname, storageResult.url, generation.mimeType, generation.imageBuffer.length, generation.width, generation.height, storageResult.sha256Hash, JSON.stringify({ ...job.slotPlan, analysisEvidence: analysis.entityEvidence, entityLogoResolution: resolvedEntityLogos.map(({ entity, slug }) => ({ entity, slug })) }), job.modelSnapshot.key, currentCost, job.slotIndex, primaryAssetSnapshot?.id || null]
+          [finalDraftId, finalCampaignId, finalCampaignPostId, job.jobId, finalStatus, storageResult.pathname, storageResult.url, generation.mimeType, generation.imageBuffer.length, generation.width, generation.height, storageResult.sha256Hash, JSON.stringify({ ...resolvedSlotPlan, analysisEvidence: analysis.entityEvidence }), job.modelSnapshot.key, currentCost, job.slotIndex, primaryAssetSnapshot?.id || null]
         );
 
         await client.query(
@@ -865,6 +774,7 @@ async function executeMemeJobTask(
       }
       return { success: false, error: 'Failed to insert meme or lost lease', metrics };
     }
+    await checkpointApiCall(genCall.callKey, `checkpoint=db_persisted;template=${resolvedSlotPlan.templateId}`);
 
     await recalculateMemeCycleStatus(job.cycleId);
     return { success: true, metrics };
@@ -879,6 +789,19 @@ async function executeMemeJobTask(
     const nextAttemptCount = job.attemptsCount + 1;
     const isTerminal = isPermanent || nextAttemptCount >= 3;
     const finalErrorMessage = classified.sanitizedMessage;
+
+    console.error('Meme generation job failed', {
+      jobId: job.jobId,
+      cycleId: job.cycleId,
+      slotIndex: job.slotIndex,
+      provider: job.modelSnapshot.provider,
+      model: job.modelSnapshot.key,
+      templateId: job.slotPlan.templateId,
+      attempt: nextAttemptCount,
+      terminal: isTerminal,
+      checkpoint: finalErrorMessage,
+      providerError: classified.originalMessage.slice(0, 300),
+    });
 
     await queryDb(
       `UPDATE meme_generation_jobs

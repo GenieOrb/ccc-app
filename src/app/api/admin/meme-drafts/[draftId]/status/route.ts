@@ -70,11 +70,13 @@ export async function GET(req: Request, props: { params: Promise<{ draftId: stri
       latest_call_status: string | null;
       latest_call_purpose: string | null;
       latest_call_updated: Date | string | null;
+      latest_call_checkpoint: string | null;
     }>(
       `SELECT j.id, j.status, j.slot_index, j.error_message, j.attempts_count, j.next_attempt_at, j.lease_expires_at, j.updated_at,
               (SELECT c.status FROM meme_api_calls c WHERE c.job_id = j.id ORDER BY c.created_at DESC LIMIT 1) as latest_call_status,
               (SELECT c.purpose FROM meme_api_calls c WHERE c.job_id = j.id ORDER BY c.created_at DESC LIMIT 1) as latest_call_purpose,
-              (SELECT c.finished_at FROM meme_api_calls c WHERE c.job_id = j.id ORDER BY c.created_at DESC LIMIT 1) as latest_call_updated
+              (SELECT c.finished_at FROM meme_api_calls c WHERE c.job_id = j.id ORDER BY c.created_at DESC LIMIT 1) as latest_call_updated,
+              (SELECT c.error_message FROM meme_api_calls c WHERE c.job_id = j.id ORDER BY c.created_at DESC LIMIT 1) as latest_call_checkpoint
        FROM meme_generation_jobs j
        WHERE j.cycle_id = $1 AND j.draft_id = $2
        ORDER BY j.slot_index ASC`,
@@ -120,6 +122,7 @@ export async function GET(req: Request, props: { params: Promise<{ draftId: stri
         updatedAt: j.updated_at,
         currentPhase,
         latestCallStatus: j.latest_call_status,
+        latestCheckpoint: j.latest_call_checkpoint || null,
         errorMessage: j.error_message || null
       };
     });
