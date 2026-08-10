@@ -55,21 +55,6 @@ async function handleProcess(req: Request) {
 
       phase = 'response_serialization';
       const memeWorker = generationResult.workerMemes;
-      if (memeWorker.failed > 0) {
-        return NextResponse.json(
-          {
-            success: false,
-            mode,
-            error: 'Directed preview generation failed',
-            workerMemes: {
-              processed: memeWorker.processed,
-              completed: memeWorker.completed,
-              failed: memeWorker.failed,
-            },
-          },
-          { status: 502, headers: { 'Cache-Control': 'no-store' } }
-        );
-      }
       return NextResponse.json(
         {
           success: true,

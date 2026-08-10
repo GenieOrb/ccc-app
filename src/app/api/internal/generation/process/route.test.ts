@@ -66,14 +66,17 @@ describe('internal generation cron route', () => {
     expect(reconcileCampaignReplenishment).not.toHaveBeenCalled();
   });
 
-  it('reports a directed preview failure when the meme worker failed jobs', async () => {
+  it('reports directed preview worker failures as a successful execution outcome', async () => {
     runGenerationProcessing.mockResolvedValue({ worker: { processed: 0, completed: 0, failed: 0 }, workerMemes: { processed: 3, completed: 0, failed: 3 } });
     const response = await POST(new Request('http://localhost/api/internal/generation/process', {
       method: 'POST', headers: { authorization: 'Bearer cron-only-secret', 'content-type': 'application/json' },
       body: JSON.stringify({ memeCycleId: '11111111-1111-4111-8111-111111111111' })
     }));
-    expect(response.ok).toBe(false);
-    expect((await response.json()).success).toBe(false);
+    expect(response.status).toBe(200);
+    expect(response.ok).toBe(true);
+    const payload = await response.json();
+    expect(payload.success).toBe(true);
+    expect(payload.workerMemes).toMatchObject({ processed: 3, completed: 0, failed: 3 });
   });
 
   it('treats a directed 0/0/0 result as a successful no-op', async () => {
