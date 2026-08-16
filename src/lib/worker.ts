@@ -152,6 +152,7 @@ async function claimNextJob(workerId: string): Promise<ClaimedJob | null> {
          c.is_active = true
          OR (c.campaign_type = 'manual' AND cy.cycle_type = 'initial')
        )
+       AND c.cancelled_at IS NULL
        AND p.retired_at IS NULL
        AND cy.status IN ('pending', 'processing')
        ORDER BY
@@ -392,6 +393,7 @@ async function executeJobTask(
              c.is_active = true
              OR (c.campaign_type = 'manual' AND cy.cycle_type = 'initial')
            )
+           AND c.cancelled_at IS NULL
            AND p.retired_at IS NULL
            AND (p.expires_at IS NULL OR p.expires_at > NOW())
          FOR SHARE`,
@@ -444,10 +446,15 @@ async function executeJobTask(
              error_message = NULL,
              updated_at = NOW()
          WHERE id = $2 AND status = 'processing' AND lease_owner = $3 AND lease_expires_at > NOW()
+           AND EXISTS (SELECT 1 FROM campaigns c WHERE c.id = generation_jobs.campaign_id AND c.cancelled_at IS NULL)
          RETURNING id`,
         [suggestionId, job.jobId, workerId]
       );
-      if (completedRes.rows.length === 0) return;
+      if (completedRes.rows.length === 0) {
+        // The insert and completion transition are one atomic outcome.  A
+        // cancelled campaign or lost lease must roll the suggestion back.
+        throw new Error('Suggestion completion lost lease or campaign eligibility');
+      }
 
       await client.query(
         `INSERT INTO generation_usage_metrics (campaign_id,campaign_post_id,cycle_id,job_id,requested_provider,requested_model_key,final_provider,final_model_key,input_tokens,cached_input_tokens,output_tokens,comments_requested,comments_received,comments_valid,comments_rejected,regenerations,attempts,fallback_used,input_price_per_million,cached_input_price_per_million,output_price_per_million,currency,estimated_cost)
@@ -505,6 +512,7 @@ async function executeJobTask(
                lease_expires_at = NULL,
                updated_at = NOW()
            WHERE id = $3 AND status = 'processing' AND lease_owner = $4 AND lease_expires_at > NOW()
+             AND EXISTS (SELECT 1 FROM campaigns c WHERE c.id = generation_jobs.campaign_id AND c.cancelled_at IS NULL)
            RETURNING id`,
           [newAttemptCount, errorMsg, job.jobId, workerId]
         );
@@ -549,6 +557,7 @@ async function executeJobTask(
                lease_expires_at = NULL,
                updated_at = NOW()
            WHERE id = $3 AND status = 'processing' AND lease_owner = $4 AND lease_expires_at > NOW()
+             AND EXISTS (SELECT 1 FROM campaigns c WHERE c.id = generation_jobs.campaign_id AND c.cancelled_at IS NULL)
            RETURNING id`,
           [newAttemptCount, isDeferred ? 'Deferred due to recent started call' : errorMsg, job.jobId, workerId]
         );

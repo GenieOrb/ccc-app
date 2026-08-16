@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { validateSameOrigin, getOrCreateVisitorIdentity, withTransaction } = vi.hoisted(() => ({
-  validateSameOrigin: vi.fn(), getOrCreateVisitorIdentity: vi.fn(), withTransaction: vi.fn(),
+const { validateSameOrigin, getOrCreateVisitorIdentity, withTransaction, triggerReplenishmentIfNeeded } = vi.hoisted(() => ({
+  validateSameOrigin: vi.fn(), getOrCreateVisitorIdentity: vi.fn(), withTransaction: vi.fn(), triggerReplenishmentIfNeeded: vi.fn(),
 }));
 vi.mock('@/lib/auth', () => ({ validateSameOrigin }));
 vi.mock('@/lib/visitor', () => ({ getOrCreateVisitorIdentity }));
 vi.mock('@/lib/db', () => ({ withTransaction }));
+vi.mock('@/lib/services', () => ({ triggerReplenishmentIfNeeded }));
 import { POST } from './route';
 
 const assignmentId = '00000000-0000-4000-8000-000000000001';
@@ -44,6 +45,18 @@ describe('public assignment completion route', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ status: 'success', canonicalUrl: 'https://x.com/user/status/1' });
     expect(withTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('awaits the replenishment nudge after a successful completion', async () => {
+    withTransaction.mockResolvedValue({ status: 'success', canonicalUrl: 'https://x.com/user/status/1', campaignId: 'campaign-1' });
+    let release!: () => void;
+    triggerReplenishmentIfNeeded.mockReturnValue(new Promise<void>((resolve) => { release = resolve; }));
+    let settled = false;
+    const pending = POST(request(), params).then(() => { settled = true; });
+    await vi.waitFor(() => expect(triggerReplenishmentIfNeeded).toHaveBeenCalledWith('campaign-1'));
+    expect(settled).toBe(false);
+    release();
+    await pending;
   });
 
   it('sanitizes transaction failures', async () => {

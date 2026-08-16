@@ -15,17 +15,22 @@ export async function GET(
     const visitor = await getOrCreateVisitorIdentity();
 
     // 1. Validate that the visitor owns this assignment and it belongs to the campaign
-    const res = await queryDb<{ storage_key: string; storage_url: string; mime_type: string }>(`
-      SELECT m.storage_key, m.storage_url, m.mime_type
+    const res = await queryDb<{ storage_key: string; storage_url: string; mime_type: string; cancelled_at: Date | null }>(`
+      SELECT COALESCE(cm.storage_key, m.storage_key) AS storage_key,
+             COALESCE(cm.storage_url, m.storage_url) AS storage_url,
+             COALESCE(cm.mime_type, m.mime_type) AS mime_type,
+             c.cancelled_at
       FROM assignments a
       JOIN campaigns c ON a.campaign_id = c.id
       JOIN visitors v ON a.visitor_id = v.id
-      JOIN memes m ON a.meme_id = m.id
+      LEFT JOIN memes m ON a.meme_id = m.id
+      LEFT JOIN campaign_memes cm ON a.campaign_meme_id = cm.id AND cm.campaign_id = a.campaign_id
       WHERE a.id = $1 AND c.slug = $2 AND v.visitor_hash = $3
+      AND (m.id IS NOT NULL OR cm.id IS NOT NULL)
       LIMIT 1
     `, [assignmentId, slug, visitor.visitorHash]);
 
-    if (res.length === 0) {
+    if (res.length === 0 || res[0].cancelled_at != null) {
       return new NextResponse('Not found or unauthorized', { status: 404 });
     }
 

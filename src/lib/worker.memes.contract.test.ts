@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-const { queryDb, withTransaction, performMemeAnalysis, normalizeMemeCaptions, resolveMemeAnalysisModel, generateMemeImage, validateMemeImage, uploadGeneratedMeme, getMemeBlobBuffer } = vi.hoisted(() => ({
+const { queryDb, withTransaction, performMemeAnalysis, normalizeMemeCaptions, resolveMemeAnalysisModel, generateMemeImage, validateMemeImage, uploadGeneratedMeme, getMemeBlobBuffer, deleteBlob } = vi.hoisted(() => ({
   queryDb: vi.fn(),
   withTransaction: vi.fn(),
   performMemeAnalysis: vi.fn(),
@@ -10,24 +10,297 @@ const { queryDb, withTransaction, performMemeAnalysis, normalizeMemeCaptions, re
   validateMemeImage: vi.fn(),
   uploadGeneratedMeme: vi.fn(),
   getMemeBlobBuffer: vi.fn(),
+  deleteBlob: vi.fn(),
 }));
 
 vi.mock('./db', () => ({ queryDb, withTransaction }));
 vi.mock('./memes/analysis', () => ({ performMemeAnalysis, normalizeMemeCaptions, resolveMemeAnalysisModel }));
 vi.mock('./memes/generation', () => ({ generateMemeImage }));
 vi.mock('./memes/validation', () => ({ validateMemeImage }));
-vi.mock('./memes/blob', () => ({ uploadGeneratedMeme, getMemeBlobBuffer, deleteBlob: vi.fn() }));
+vi.mock('./memes/blob', () => ({ uploadGeneratedMeme, getMemeBlobBuffer, deleteBlob }));
 
 import { processMemeBackgroundQueue } from './worker.memes';
 
 describe('meme validation API-call contract', () => {
+  async function runPostUploadFenceScenario({
+    draftId,
+    leaseMatches,
+    eligibilityMatches,
+    cancellationMatches,
+  }: {
+    draftId: string | null;
+    leaseMatches: boolean;
+    eligibilityMatches: boolean;
+    cancellationMatches: boolean;
+  }) {
+    let claimed = false;
+    const transactionQueries: Array<{ sql: string; params: unknown[] | undefined }> = [];
+
+    queryDb.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('SELECT id FROM memes')) return [];
+      if (sql.includes('INSERT INTO meme_api_calls')) return [{ id: 'api-call' }];
+      if (sql.includes('SELECT id FROM meme_generation_jobs') && sql.includes('lease_owner')) return [{ id: params?.[0] }];
+      return [];
+    });
+    withTransaction.mockImplementation(async (operation: (client: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> }) => Promise<unknown>) => operation({
+      query: async (sql: string, params?: unknown[]) => {
+        transactionQueries.push({ sql, params });
+        if (sql.includes('UPDATE meme_generation_jobs j')) return { rows: [] };
+        if (sql.includes('FROM meme_generation_jobs j')) {
+          if (claimed) return { rows: [] };
+          claimed = true;
+          return { rows: [{
+            job_id: 'job-fenced', cycle_id: 'cycle-fenced', campaign_id: draftId ? null : 'campaign-fenced', draft_id: draftId,
+            campaign_post_id: draftId ? null : 'post-fenced', slot_index: 0, slot_plan: { textQuantity: 'no_text' },
+            deterministic_dimensions: {}, asset_snapshot: null,
+            model_snapshot: { key: 'image-model', provider: 'google', apiModel: 'image-model' }, attempts_count: 0,
+            post_text: 'Post', author_name: 'Author', author_username: 'author', accessible_context: {}, direction: 'Direction',
+            cycle_model_key: 'image-model', cycle_provider: 'google', cycle_api_model: 'image-model',
+          }] };
+        }
+        if (sql.includes('SELECT id FROM meme_generation_jobs') && sql.includes('FOR UPDATE')) {
+          return { rows: leaseMatches ? [{ id: 'job-fenced' }] : [] };
+        }
+        if (sql.includes('SELECT id FROM meme_drafts') || sql.includes('FROM campaign_posts p')) {
+          return { rows: eligibilityMatches ? [{ id: draftId || 'post-fenced' }] : [] };
+        }
+        if (sql.includes("SET status = 'cancelled'")) {
+          return { rows: cancellationMatches ? [{ id: 'job-fenced' }] : [] };
+        }
+        if (sql.includes('SELECT target_count, status FROM meme_generation_cycles')) {
+          return { rows: [{ target_count: 1, status: 'processing' }] };
+        }
+        if (sql.includes('SELECT id, status, slot_index FROM meme_generation_jobs')) {
+          return { rows: [{ id: 'job-fenced', status: 'cancelled', slot_index: 0 }] };
+        }
+        if (sql.includes('SELECT m.job_id FROM memes')) return { rows: [] };
+        return { rows: [{ id: 'ok' }] };
+      },
+    }));
+    performMemeAnalysis.mockResolvedValue({ immediate_joke: 'joke', single_visual_focus: 'focus', familiar_physical_situation: 'situation', requires_asset: false });
+    generateMemeImage.mockResolvedValue({ imageBuffer: Buffer.from('image'), mimeType: 'image/png', cost: '0', width: 1, height: 1 });
+    uploadGeneratedMeme.mockResolvedValue({ url: 'local://fenced-meme', pathname: 'fenced-meme', contentType: 'image/png', sizeBytes: 5, sha256Hash: 'hash' });
+
+    const result = await processMemeBackgroundQueue({ workerId: 'worker-fenced', budgetMs: 60_000, maxJobs: 1 });
+    return { result, transactionQueries };
+  }
+
+  it.each([
+    { label: 'draft', draftId: 'draft-fenced', lockSql: "SELECT id FROM meme_drafts WHERE id = $1 AND status = 'active' AND expires_at > NOW()", error: 'Draft expired' },
+    { label: 'campaign post', draftId: null, lockSql: 'FROM campaign_posts p', error: 'Post retired' },
+  ])('fences $label cancellation, clears its own lease, cleans its blob, and recalculates after the confirmed transition', async ({ draftId, lockSql, error }) => {
+    const { result, transactionQueries } = await runPostUploadFenceScenario({
+      draftId,
+      leaseMatches: true,
+      eligibilityMatches: false,
+      cancellationMatches: true,
+    });
+
+    expect(result).toMatchObject({ processed: 1, completed: 0, failed: 1 });
+    expect(transactionQueries.some(({ sql }) => sql.includes(lockSql))).toBe(true);
+    const cancellation = transactionQueries.find(({ sql }) => sql.includes("SET status = 'cancelled'") && sql.includes('WHERE id = $1'));
+    expect(cancellation?.sql).toContain('lease_owner = NULL');
+    expect(cancellation?.sql).toContain('lease_expires_at = NULL');
+    expect(cancellation?.sql).toContain("status = 'processing' AND lease_owner = $2 AND lease_expires_at > NOW()");
+    expect(cancellation?.sql).toContain('RETURNING id');
+    expect(cancellation?.params).toEqual(['job-fenced', 'worker-fenced', error]);
+    expect(deleteBlob).toHaveBeenCalledWith('local://fenced-meme');
+    expect(transactionQueries.some(({ sql }) => sql.includes('SELECT target_count, status FROM meme_generation_cycles'))).toBe(true);
+    expect(transactionQueries.some(({ sql }) => sql.includes('UPDATE meme_generation_cycles') && sql.includes('valid_produced_count'))).toBe(true);
+  });
+
+  it('treats a missing post-upload lease as lease_lost, cleans the blob, and leaves the foreign job and cycle untouched', async () => {
+    const { result, transactionQueries } = await runPostUploadFenceScenario({
+      draftId: 'draft-fenced',
+      leaseMatches: false,
+      eligibilityMatches: false,
+      cancellationMatches: false,
+    });
+
+    expect(result).toMatchObject({ processed: 1, completed: 0, failed: 1 });
+    expect(deleteBlob).toHaveBeenCalledWith('local://fenced-meme');
+    expect(transactionQueries.some(({ sql }) => sql.includes("SET status = 'cancelled'") && sql.includes('WHERE id = $1'))).toBe(false);
+    expect(transactionQueries.some(({ sql }) => sql.includes("SET status = 'completed'"))).toBe(false);
+    expect(transactionQueries.some(({ sql }) => sql.includes('SELECT target_count, status FROM meme_generation_cycles'))).toBe(false);
+  });
+
+  it('treats an unmatched fenced cancellation as lease_lost, cleans the blob, and does not recalculate a foreign cycle', async () => {
+    const { result, transactionQueries } = await runPostUploadFenceScenario({
+      draftId: null,
+      leaseMatches: true,
+      eligibilityMatches: false,
+      cancellationMatches: false,
+    });
+
+    expect(result).toMatchObject({ processed: 1, completed: 0, failed: 1 });
+    expect(deleteBlob).toHaveBeenCalledWith('local://fenced-meme');
+    const cancellation = transactionQueries.find(({ sql }) => sql.includes("SET status = 'cancelled'") && sql.includes('WHERE id = $1'));
+    expect(cancellation?.sql).toContain("status = 'processing' AND lease_owner = $2 AND lease_expires_at > NOW()");
+    expect(cancellation?.sql).toContain('RETURNING id');
+    expect(transactionQueries.some(({ sql }) => sql.includes('SELECT target_count, status FROM meme_generation_cycles'))).toBe(false);
+  });
+
+  it('never claims a campaign meme job once its campaign is cancelled, even if a legacy draft remains active', async () => {
+    const queries: string[] = [];
+    withTransaction.mockImplementation(async (operation: (client: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> }) => Promise<unknown>) => operation({
+      query: async (sql: string) => {
+        queries.push(sql);
+        return { rows: [] };
+      },
+    }));
+
+    await expect(processMemeBackgroundQueue({ workerId: 'worker-cancelled', budgetMs: 60_000, maxJobs: 1 })).resolves.toMatchObject({ processed: 0 });
+
+    const claimQuery = queries.find((sql) => sql.includes('FROM meme_generation_jobs j'))!.replace(/\s+/g, ' ');
+    expect(claimQuery).toContain('c.cancelled_at IS NULL');
+  });
+
+  it('cancels only expired or inactive draft jobs before claiming, then recalculates each affected directed cycle once', async () => {
+    const transactionQueries: Array<{ sql: string; params: unknown[] | undefined }> = [];
+    const recalculatedCycles: string[] = [];
+
+    withTransaction.mockImplementation(async (operation: (client: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> }) => Promise<unknown>) => operation({
+      query: async (sql: string, params?: unknown[]) => {
+        transactionQueries.push({ sql, params });
+        if (sql.includes("UPDATE meme_generation_jobs j\n       SET status = 'cancelled'")) {
+          return { rows: [{ cycle_id: 'preview-cycle' }, { cycle_id: 'preview-cycle' }] };
+        }
+        if (sql.includes('SELECT target_count, status FROM meme_generation_cycles')) {
+          recalculatedCycles.push(params?.[0] as string);
+          return { rows: [{ target_count: 1, status: 'processing' }] };
+        }
+        if (sql.includes('SELECT id, status, slot_index FROM meme_generation_jobs')) return { rows: [{ id: 'cancelled-job', status: 'cancelled', slot_index: 0 }] };
+        if (sql.includes('SELECT m.job_id FROM memes')) return { rows: [] };
+        if (sql.includes('FROM meme_generation_jobs j')) return { rows: [] };
+        return { rows: [{ id: 'ok' }] };
+      },
+    }));
+
+    await expect(processMemeBackgroundQueue({ workerId: 'worker-expiry', budgetMs: 60_000, cycleId: 'preview-cycle', maxJobs: 1 })).resolves.toMatchObject({ processed: 0 });
+
+    const cleanup = transactionQueries.find(({ sql }) => sql.includes("UPDATE meme_generation_jobs j\n       SET status = 'cancelled'"));
+    expect(cleanup?.sql).toContain("j.draft_id IS NOT NULL");
+    expect(cleanup?.sql).toContain("md.status <> 'active' OR md.expires_at <= NOW()");
+    expect(cleanup?.sql).toContain("j.status = 'pending' OR (j.status = 'processing' AND j.lease_expires_at < NOW())");
+    expect(cleanup?.sql).toContain('lease_owner = NULL');
+    expect(cleanup?.sql).toContain('lease_expires_at = NULL');
+    expect(cleanup?.sql).toContain('RETURNING j.cycle_id');
+    expect(cleanup?.params).toEqual(['preview-cycle']);
+    expect(recalculatedCycles).toEqual(['preview-cycle']);
+  });
+
+  it('does not let the meme error handler overwrite a cancelled job or another worker lease', async () => {
+    const errorUpdates: Array<{ sql: string; params: unknown[] | undefined }> = [];
+    let claimed = false;
+    queryDb.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (sql.includes("SET status = CASE WHEN $1::boolean THEN 'failed' ELSE 'pending' END")) errorUpdates.push({ sql, params });
+      return [];
+    });
+    withTransaction.mockImplementation(async (operation: (client: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> }) => Promise<unknown>) => operation({
+      query: async (sql: string) => {
+        if (sql.includes('FROM meme_generation_jobs j')) {
+          if (claimed) return { rows: [] };
+          claimed = true;
+          return { rows: [{
+            job_id: 'job-foreign-lease', cycle_id: 'cycle-1', campaign_id: 'campaign-1', draft_id: null,
+            campaign_post_id: 'post-1', slot_index: 0, slot_plan: { textQuantity: 'no_text' }, deterministic_dimensions: {}, asset_snapshot: null,
+            model_snapshot: { key: '', provider: '', apiModel: '' }, attempts_count: 0,
+            post_text: 'Post', author_name: 'Author', author_username: 'author', accessible_context: {}, direction: 'Direction',
+            cycle_model_key: '', cycle_provider: '', cycle_api_model: '',
+          }] };
+        }
+        return { rows: [] };
+      },
+    }));
+
+    await processMemeBackgroundQueue({ workerId: 'worker-current', budgetMs: 60_000, maxJobs: 1 });
+
+    expect(errorUpdates).toHaveLength(1);
+    expect(errorUpdates[0].sql).toContain("status = 'processing' AND lease_owner = $6 AND lease_expires_at > NOW()");
+    expect(errorUpdates[0].sql).toContain('c.cancelled_at IS NULL');
+    expect(errorUpdates[0].params?.[5]).toBe('worker-current');
+  });
+
+  it('rolls back and cleans the blob when the fenced meme completion update loses the job after insert', async () => {
+    let claimed = false;
+    const writes: string[] = [];
+    queryDb.mockImplementation(async (sql: string) => {
+      if (sql.includes('SELECT id FROM memes')) return [];
+      if (sql.includes('INSERT INTO meme_api_calls')) return [{ id: 'api-call' }];
+      if (sql.includes('SELECT id FROM meme_generation_jobs') && sql.includes('lease_owner')) return [{ id: 'job-1' }];
+      return [];
+    });
+    withTransaction.mockImplementation(async (operation: (client: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> }) => Promise<unknown>) => operation({
+      query: async (sql: string) => {
+        writes.push(sql);
+        if (sql.includes('FROM meme_generation_jobs j')) {
+          if (claimed) return { rows: [] };
+          claimed = true;
+          return { rows: [{
+            job_id: 'job-1', cycle_id: 'cycle-1', campaign_id: 'campaign-1', draft_id: 'draft-1', campaign_post_id: null,
+            slot_index: 0, slot_plan: { textQuantity: 'no_text' }, deterministic_dimensions: {}, asset_snapshot: null,
+            model_snapshot: { key: 'image-model', provider: 'google', apiModel: 'image-model' }, attempts_count: 0,
+            post_text: 'Post', author_name: 'Author', author_username: 'author', accessible_context: {}, direction: 'Direction',
+            cycle_model_key: 'image-model', cycle_provider: 'google', cycle_api_model: 'image-model',
+          }] };
+        }
+        if (sql.includes('SELECT id FROM meme_generation_jobs') && sql.includes('FOR UPDATE')) return { rows: [{ id: 'job-1' }] };
+        if (sql.includes('SELECT id FROM meme_drafts')) return { rows: [{ id: 'draft-1' }] };
+        if (sql.includes('INSERT INTO memes')) return { rows: [{ id: 'meme-1' }] };
+        if (sql.includes("UPDATE meme_generation_jobs\n           SET status = 'completed'")) return { rows: [] };
+        return { rows: [{ id: 'ok' }] };
+      },
+    }));
+    performMemeAnalysis.mockResolvedValue({ immediate_joke: 'joke', single_visual_focus: 'focus', familiar_physical_situation: 'situation', requires_asset: false });
+    generateMemeImage.mockResolvedValue({ imageBuffer: Buffer.from('image'), mimeType: 'image/png', cost: '0', width: 1, height: 1 });
+    uploadGeneratedMeme.mockResolvedValue({ url: 'local://meme', pathname: 'meme', contentType: 'image/png', sizeBytes: 5, sha256Hash: 'hash' });
+
+    await expect(processMemeBackgroundQueue({ workerId: 'worker-1', budgetMs: 60_000, maxJobs: 1 })).resolves.toMatchObject({ processed: 1, completed: 0, failed: 1 });
+    expect(writes.some((sql) => sql.includes('INSERT INTO memes'))).toBe(true);
+    expect(deleteBlob).toHaveBeenCalledWith('local://meme');
+  });
+
+  it('does not count an existing meme as complete when its fenced completion update loses the job', async () => {
+    let claimed = false;
+    const completionUpdates: string[] = [];
+    queryDb.mockImplementation(async (sql: string) => {
+      if (sql.includes('SELECT id FROM memes')) return [{ id: 'meme-1' }];
+      return [];
+    });
+    withTransaction.mockImplementation(async (operation: (client: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> }) => Promise<unknown>) => operation({
+      query: async (sql: string) => {
+        if (sql.includes('FROM meme_generation_jobs j')) {
+          if (claimed) return { rows: [] };
+          claimed = true;
+          return { rows: [{
+            job_id: 'job-existing', cycle_id: 'cycle-1', campaign_id: 'campaign-1', draft_id: 'draft-1', campaign_post_id: null,
+            slot_index: 0, slot_plan: { textQuantity: 'no_text' }, deterministic_dimensions: {}, asset_snapshot: null,
+            model_snapshot: { key: 'image-model', provider: 'google', apiModel: 'image-model' }, attempts_count: 0,
+            post_text: 'Post', author_name: 'Author', author_username: 'author', accessible_context: {}, direction: 'Direction',
+            cycle_model_key: 'image-model', cycle_provider: 'google', cycle_api_model: 'image-model',
+          }] };
+        }
+        if (sql.includes("UPDATE meme_generation_jobs\n           SET status = 'completed'")) {
+          completionUpdates.push(sql);
+          return { rows: [] };
+        }
+        return { rows: [{ id: 'ok' }] };
+      },
+    }));
+
+    await expect(processMemeBackgroundQueue({ workerId: 'worker-existing', budgetMs: 60_000, maxJobs: 1 })).resolves.toMatchObject({ processed: 1, completed: 0, failed: 1 });
+    expect(performMemeAnalysis).not.toHaveBeenCalled();
+    expect(completionUpdates).toHaveLength(1);
+    expect(completionUpdates[0]).toContain("EXISTS (SELECT 1 FROM meme_drafts md WHERE md.id = meme_generation_jobs.draft_id AND md.status = 'active' AND md.expires_at > NOW())");
+  });
+
   it('claims and completes all three directed preview slots despite future retry timestamps', async () => {
     type JobState = { id: string; slotIndex: number; status: 'pending' | 'processing' | 'completed'; leaseOwner: string | null; leaseValid: boolean; nextAttemptFuture: boolean };
     type ClaimQuery = { sql: string; where: string; params: unknown[] };
     const normalizeSql = (sql: string) => sql.replace(/\s+/g, ' ').trim();
     const extractWhere = (sql: string) => sql.match(/\bWHERE\b.*?\bORDER BY\b/)?.[0] ?? '';
-    const globalClaimWhereContract = /^WHERE\s+\(\s*\(j\.status = 'pending'\s+AND\s+j\.next_attempt_at <= NOW\(\)\)\s+OR\s+\(j\.status = 'processing'\s+AND\s+j\.lease_expires_at < NOW\(\)\)\s*\)\s+AND\s+\(\s*\(c\.is_active = true\)\s+OR\s+\(md\.status = 'active'\)\s*\)\s+ORDER BY$/;
-    const directedClaimWhereContract = /^WHERE\s+\(\s*\(j\.status = 'pending'\s+AND\s+\(\s*j\.next_attempt_at <= NOW\(\)\s+OR\s+\(j\.draft_id IS NOT NULL\s+AND\s+cy\.cycle_type = 'preview'\)\s*\)\)\s+OR\s+\(j\.status = 'processing'\s+AND\s+j\.lease_expires_at < NOW\(\)\)\s*\)\s+AND\s+\(\s*\(c\.is_active = true\)\s+OR\s+\(md\.status = 'active'\)\s*\)\s+AND\s+j\.cycle_id = \$1\s+ORDER BY$/;
+    const globalClaimWhereContract = /^WHERE\s+\(\s*\(j\.status = 'pending'\s+AND\s+j\.next_attempt_at <= NOW\(\)\)\s+OR\s+\(j\.status = 'processing'\s+AND\s+j\.lease_expires_at < NOW\(\)\)\s*\)\s+AND\s+\(\s*\(c\.is_active = true\)\s+OR\s+\(md\.status = 'active'\s+AND\s+md\.expires_at > NOW\(\)\)\s*\)\s+AND\s+\(j\.campaign_id IS NULL OR c\.cancelled_at IS NULL\)\s+ORDER BY$/;
+    const directedClaimWhereContract = /^WHERE\s+\(\s*\(j\.status = 'pending'\s+AND\s+\(\s*j\.next_attempt_at <= NOW\(\)\s+OR\s+\(j\.draft_id IS NOT NULL\s+AND\s+cy\.cycle_type = 'preview'\)\s*\)\)\s+OR\s+\(j\.status = 'processing'\s+AND\s+j\.lease_expires_at < NOW\(\)\)\s*\)\s+AND\s+\(\s*\(c\.is_active = true\)\s+OR\s+\(md\.status = 'active'\s+AND\s+md\.expires_at > NOW\(\)\)\s*\)\s+AND\s+\(j\.campaign_id IS NULL OR c\.cancelled_at IS NULL\)\s+AND\s+j\.cycle_id = \$1\s+ORDER BY$/;
     const jobs: JobState[] = [0, 1, 2].map((slotIndex) => ({ id: `job-${slotIndex + 1}`, slotIndex, status: 'pending', leaseOwner: null, leaseValid: false, nextAttemptFuture: true }));
     const memes: Array<{ job_id: string }> = [];
     const cycle = { id: 'preview-cycle', status: 'processing', validProducedCount: 0, completedJobsCount: 0, failedJobsCount: 0 };

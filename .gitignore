@@ -46,3 +46,6 @@ backups/
 *.dump
 .vercel
 .env*
+/.codex-remote-attachments/
+
+.env*

@@ -17,7 +17,6 @@ vi.mock('./ai/models', () => ({
 }));
 
 import { generateDeterministicMemeSlotPlans } from './memes/planner';
-import { getMemeTemplatesForProvider } from './memes/templates';
 import { triggerReplenishmentIfNeeded } from './services';
 
 const generateMemePlans = vi.mocked(generateDeterministicMemeSlotPlans);
@@ -31,7 +30,7 @@ describe('triggerReplenishmentIfNeeded meme job contract', () => {
   });
 
   it.each<CampaignType>(['manual', 'perpetual'])(
-    'persists brand and immutable primary/secondary asset snapshots for %s replenishment',
+    'does not create image-generation cycles or jobs for %s replenishment',
     async (campaignType) => {
       const assetRows = [
         {
@@ -91,47 +90,9 @@ describe('triggerReplenishmentIfNeeded meme job contract', () => {
 
       await triggerReplenishmentIfNeeded('campaign-1');
 
-      const memeJobInserts = queries.filter(({ sql }) => sql.includes('INSERT INTO meme_generation_jobs'));
-      expect(memeJobInserts).toHaveLength(1);
-      expect(generateMemePlans).toHaveBeenCalledTimes(1);
-      expect(generateMemePlans.mock.calls[0][3]).toBe(1);
-      expect(generateMemePlans.mock.calls[0][6]).toEqual(getMemeTemplatesForProvider('google').map((template) => template.id));
-      const memeJob = memeJobInserts[0];
-      expect(memeJob.sql).toContain('asset_snapshot');
-
-      assetRows[0].instruction = 'mutated after insert';
-      assetRows[1].storage_key = 'mutated/after-insert.png';
-
-      expect(JSON.parse(String(memeJob.params?.[4]))).toMatchObject({
-        assignedPostId: 'post-1',
-        assetId: 'asset-logo',
-        secondaryAssetId: 'asset-character',
-        brandText: 'GenieOrb\u2122',
-      });
-      expect(JSON.parse(String(memeJob.params?.[7]))).toEqual({
-        primaryAsset: {
-          id: 'asset-logo',
-          assetType: 'logo',
-          appearancePercentage: 100,
-          instruction: 'Keep the logo unchanged',
-          storageKey: 'campaigns/campaign-1/logo.png',
-          mimeType: 'image/png',
-          sha256: 'logo-sha256',
-          width: 512,
-          height: 512,
-        },
-        secondaryAsset: {
-          id: 'asset-character',
-          assetType: 'character',
-          appearancePercentage: 100,
-          instruction: 'Place the character beside the logo',
-          storageKey: 'campaigns/campaign-1/character.png',
-          mimeType: 'image/png',
-          sha256: 'character-sha256',
-          width: 768,
-          height: 1024,
-        },
-      });
+      expect(queries.some(({ sql }) => sql.includes('INSERT INTO meme_generation_cycles'))).toBe(false);
+      expect(queries.some(({ sql }) => sql.includes('INSERT INTO meme_generation_jobs'))).toBe(false);
+      expect(generateMemePlans).not.toHaveBeenCalled();
     },
   );
 });

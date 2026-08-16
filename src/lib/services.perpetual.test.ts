@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { queryDb, withTransaction, normalizeXAccounts, generateSecureSlug, generateDeterministicSlotPlans, processPerpetualCampaigns, reconcilePerpetualScheduler } = vi.hoisted(() => ({
-  queryDb: vi.fn(), withTransaction: vi.fn(), normalizeXAccounts: vi.fn(), generateSecureSlug: vi.fn(), generateDeterministicSlotPlans: vi.fn(), processPerpetualCampaigns: vi.fn(), reconcilePerpetualScheduler: vi.fn(),
+const { queryDb, withTransaction, normalizeXAccounts, generateSecureSlug, generateDeterministicSlotPlans, processPerpetualCampaigns, reconcilePerpetualScheduler, deleteBlobStrict } = vi.hoisted(() => ({
+  queryDb: vi.fn(), withTransaction: vi.fn(), normalizeXAccounts: vi.fn(), generateSecureSlug: vi.fn(), generateDeterministicSlotPlans: vi.fn(), processPerpetualCampaigns: vi.fn(), reconcilePerpetualScheduler: vi.fn(), deleteBlobStrict: vi.fn(),
 }));
 vi.mock('./db', () => ({ queryDb, withTransaction }));
 vi.mock('./x-api', () => ({ parseMultipleXUrls: vi.fn(), fetchXPosts: vi.fn(), resolveXUsername: vi.fn().mockResolvedValue('x-123') }));
@@ -11,6 +11,7 @@ vi.mock('./crypto', () => ({ generateSecureSlug }));
 vi.mock('./planner', () => ({ generateDeterministicSlotPlans }));
 vi.mock('./perpetual-monitor', () => ({ processPerpetualCampaigns }));
 vi.mock('./perpetual-scheduler', () => ({ reconcilePerpetualScheduler }));
+vi.mock('./memes/blob', () => ({ deleteBlobStrict }));
 vi.mock('./ai/models', () => ({ DEFAULT_MODEL_KEY: 'test-model', getAiModel: () => ({ key: 'test-model', enabled: true, provider: 'openai', apiModel: 'test-model' }), isProviderConfigured: () => true }));
 
 import { createPerpetualCampaign, retryFailedCampaignJobs, toggleCampaignStatus, triggerReplenishmentIfNeeded } from './services';
@@ -20,12 +21,30 @@ beforeEach(() => {
 });
 
 describe('toggleCampaignStatus perpetual activation recovery', () => {
+  it('pauses reversibly without inspecting campaign memes or deleting blobs', async () => {
+    const transactionSql: string[] = [];
+    withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
+      query: vi.fn(async (sql: string) => {
+        transactionSql.push(sql);
+        if (sql.includes('SELECT is_active, campaign_type, cancelled_at')) return { rows: [{ is_active: true, campaign_type: 'manual', cancelled_at: null }] };
+        if (sql.includes('UPDATE campaigns SET is_active')) return { rows: [] };
+        throw new Error(`Unexpected SQL in pause test: ${sql}`);
+      }),
+    }));
+
+    await expect(toggleCampaignStatus('campaign-1', false)).resolves.toBe(false);
+
+    expect(transactionSql.some((sql) => sql.includes('campaign_memes'))).toBe(false);
+    expect(deleteBlobStrict).not.toHaveBeenCalled();
+    expect(queryDb).not.toHaveBeenCalled();
+  });
+
   it('awaits a campaign-scoped monitor only after the activation transaction commits', async () => {
     let committed = false;
     withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => {
       const result = await operation({
         query: vi.fn(async (sql: string) => {
-          if (sql.includes('SELECT is_active, campaign_type')) return { rows: [{ is_active: false, campaign_type: 'perpetual' }] };
+          if (sql.includes('SELECT is_active, campaign_type, cancelled_at')) return { rows: [{ is_active: false, campaign_type: 'perpetual', cancelled_at: null }] };
           if (sql.includes('FROM campaign_accounts')) return { rows: [{ count: '1' }] };
           if (sql.includes('UPDATE campaign_accounts') || sql.includes('UPDATE campaigns SET is_active')) return { rows: [] };
           throw new Error(`Unexpected SQL in test: ${sql}`);
@@ -45,12 +64,12 @@ describe('toggleCampaignStatus perpetual activation recovery', () => {
 
   it('does not invoke the monitor for manual activation or deactivation', async () => {
     for (const campaign of [
-      { is_active: false, campaign_type: 'manual' as const },
-      { is_active: true, campaign_type: 'perpetual' as const },
+      { is_active: false, campaign_type: 'manual' as const, cancelled_at: null },
+      { is_active: true, campaign_type: 'perpetual' as const, cancelled_at: null },
     ]) {
       withTransaction.mockImplementationOnce(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
         query: vi.fn(async (sql: string) => {
-          if (sql.includes('SELECT is_active, campaign_type')) return { rows: [campaign] };
+          if (sql.includes('SELECT is_active, campaign_type, cancelled_at')) return { rows: [campaign] };
           if (sql.includes('COUNT(*) AS initial_cycle_count')) return { rows: [{ initial_cycle_count: '1', incomplete_cycle_count: '0', valid_produced_count: '1', target_count: '1' }] };
           if (sql.includes('SELECT COUNT(*) as count FROM generation_jobs j')) return { rows: [{ count: '1' }] };
           if (sql.includes('FROM suggestions')) return { rows: [{ avail_count: '1' }] };
@@ -68,7 +87,7 @@ describe('toggleCampaignStatus perpetual activation recovery', () => {
   it('does not report a false failure after a perpetual campaign commit when QStash is temporarily unavailable', async () => {
     withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
       query: vi.fn(async (sql: string) => {
-        if (sql.includes('SELECT is_active, campaign_type')) return { rows: [{ is_active: true, campaign_type: 'perpetual' }] };
+        if (sql.includes('SELECT is_active, campaign_type, cancelled_at')) return { rows: [{ is_active: true, campaign_type: 'perpetual', cancelled_at: null }] };
         if (sql.includes('UPDATE campaigns SET is_active')) return { rows: [] };
         throw new Error(`Unexpected SQL in test: ${sql}`);
       }),
@@ -81,6 +100,20 @@ describe('toggleCampaignStatus perpetual activation recovery', () => {
     expect(reconcilePerpetualScheduler).toHaveBeenCalledOnce();
     expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('scheduler reconciliation failed'), expect.objectContaining({ context: 'toggle:campaign-1' }));
     consoleError.mockRestore();
+  });
+
+  it('rejects reactivation of a persistently cancelled campaign before recovery work', async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes('SELECT is_active, campaign_type, cancelled_at')) {
+        return { rows: [{ is_active: false, campaign_type: 'perpetual', cancelled_at: new Date('2026-08-16T12:34:56.000Z') }] };
+      }
+      throw new Error(`Unexpected SQL for cancelled campaign: ${sql}`);
+    });
+    withTransaction.mockImplementationOnce(async (operation: (client: { query: typeof query }) => Promise<unknown>) => operation({ query }));
+
+    await expect(toggleCampaignStatus('campaign-1', true)).rejects.toThrow('No se puede reactivar una campaña cancelada.');
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(processPerpetualCampaigns).not.toHaveBeenCalled();
   });
 });
 
@@ -245,6 +278,22 @@ describe('triggerReplenishmentIfNeeded for perpetual campaigns', () => {
 
     await expect(retryFailedCampaignJobs('campaign-1')).resolves.toBeUndefined();
     expect(queryOrder[0]).toContain('FROM campaigns WHERE id = $1 FOR UPDATE');
+  });
+
+  it('does not reactivate failed work for a cancelled campaign', async () => {
+    const queries: string[] = [];
+    withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        if (sql.includes('FROM campaigns WHERE id = $1 FOR UPDATE')) {
+          return { rows: [{ id: 'campaign-1', cancelled_at: new Date('2026-08-16T12:34:56.000Z') }] };
+        }
+        throw new Error(`Retry must stop before: ${sql}`);
+      }),
+    }));
+
+    await expect(retryFailedCampaignJobs('campaign-1')).resolves.toBeUndefined();
+    expect(queries).toHaveLength(1);
   });
 });
 

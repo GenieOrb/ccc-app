@@ -57,9 +57,13 @@ export async function uploadGeneratedMeme(
   };
 }
 
+export async function deleteBlobStrict(pathname: string): Promise<void> {
+  await del(pathname, { token: process.env.BLOB_READ_WRITE_TOKEN });
+}
+
 export async function deleteBlob(pathname: string): Promise<void> {
   try {
-    await del(pathname, { token: process.env.BLOB_READ_WRITE_TOKEN });
+    await deleteBlobStrict(pathname);
   } catch (error) {
     console.error(`Failed to delete blob ${pathname}:`, error);
   }

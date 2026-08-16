@@ -1,20 +1,27 @@
 import 'server-only';
-import { Pool, PoolClient, neonConfig } from '@neondatabase/serverless';
+import { Pool as NeonPool, PoolClient, neonConfig } from '@neondatabase/serverless';
+import { Pool as NodePostgresPool } from 'pg';
 import ws from 'ws';
 import { getConfig } from './config';
 
 neonConfig.webSocketConstructor = ws;
 
-function createDbPool(): Pool {
+function createDbPool(): NeonPool {
   const config = getConfig();
   if (!config.databaseUrl) {
     throw new Error('DATABASE_URL is not defined in environment.');
   }
-  return new Pool({
+  const databaseUrl = new URL(config.databaseUrl);
+  // The Neon driver speaks WebSocket and cannot connect directly to local
+  // PostgreSQL. Keep the deployed driver while enabling isolated local tests.
+  const PoolImplementation = ['127.0.0.1', 'localhost', '::1'].includes(databaseUrl.hostname)
+    ? NodePostgresPool
+    : NeonPool;
+  return new PoolImplementation({
     connectionString: config.databaseUrl,
     max: 1,
     connectionTimeoutMillis: 10000,
-  });
+  }) as unknown as NeonPool;
 }
 
 export async function withTransaction<T>(

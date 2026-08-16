@@ -9,6 +9,22 @@ export const maxDuration = 60;
 
 const CAMPAIGNS_PAGE_SIZE = 10;
 
+function validateUploadedMemeConfiguration(body: Record<string, unknown>): NextResponse | null {
+  const { includeMemes, draftId, memeEveryComments } = body;
+  if (includeMemes === false && draftId !== undefined) {
+    return NextResponse.json({ error: 'No se puede usar un draft de memes si los memes están desactivados.' }, { status: 400, headers: { 'Cache-Control': 'no-store' } });
+  }
+  if (includeMemes === true) {
+    if (typeof draftId !== 'string' || !draftId.trim()) {
+      return NextResponse.json({ error: 'Debes proporcionar un draft activo con assets para incluir memes.' }, { status: 400, headers: { 'Cache-Control': 'no-store' } });
+    }
+    if (typeof memeEveryComments !== 'number' || !Number.isInteger(memeEveryComments) || memeEveryComments <= 0) {
+      return NextResponse.json({ error: 'La cadencia de memes debe ser un entero positivo.' }, { status: 400, headers: { 'Cache-Control': 'no-store' } });
+    }
+  }
+  return null;
+}
+
 export async function GET(req: Request) {
   const isAuth = await isAdminAuthenticated();
   if (!isAuth) {
@@ -86,7 +102,9 @@ export async function POST(req: Request) {
         );
       }
 
-      const { urlsInput, direction, displayName, modelKey, brandVariants, maxCommentsTotal, includeMemes, memePercentage, memeModelKey, draftId } = body;
+      const { urlsInput, direction, displayName, modelKey, brandVariants, maxCommentsTotal, includeMemes, memePercentage, memeModelKey, draftId, memeEveryComments } = body;
+      const memeConfigurationError = validateUploadedMemeConfiguration(body);
+      if (memeConfigurationError) return memeConfigurationError;
 
       if (maxCommentsTotal !== undefined) {
         if (!Number.isInteger(maxCommentsTotal) || maxCommentsTotal < 1 || maxCommentsTotal > 1000000) {
@@ -116,7 +134,7 @@ export async function POST(req: Request) {
       if (brandVariants !== undefined && !Array.isArray(brandVariants)) return NextResponse.json({ error: 'Variantes de marca no válidas.' }, { status: 400 });
       if (memePercentage !== undefined && (!Number.isInteger(memePercentage) || memePercentage < 0 || memePercentage > 100)) return NextResponse.json({ error: 'Porcentaje de memes no válido.' }, { status: 400 });
 
-      const created = await createCampaign({ urlsInput, direction, displayName, modelKey, brandVariants, maxCommentsTotal, isInactive, includeMemes, memePercentage, memeModelKey, draftId });
+      const created = await createCampaign({ urlsInput, direction, displayName, modelKey, brandVariants, maxCommentsTotal, isInactive, includeMemes, memePercentage, memeModelKey, draftId, memeEveryComments });
 
       return NextResponse.json(
         { success: true, campaign: { ...created, campaignType: 'manual' } },
@@ -130,7 +148,9 @@ export async function POST(req: Request) {
         );
       }
 
-      const { accountsInput, direction, postActiveLifetimeHours, displayName, modelKey, brandVariants, maxCommentsTotal, includeMemes, memePercentage, memeModelKey } = body;
+      const { accountsInput, direction, postActiveLifetimeHours, displayName, modelKey, brandVariants, maxCommentsTotal, includeMemes, memePercentage, memeModelKey, draftId, memeEveryComments } = body;
+      const memeConfigurationError = validateUploadedMemeConfiguration(body);
+      if (memeConfigurationError) return memeConfigurationError;
 
       if (maxCommentsTotal !== undefined) {
         if (!Number.isInteger(maxCommentsTotal) || maxCommentsTotal < 1 || maxCommentsTotal > 1000000) {
@@ -167,7 +187,7 @@ export async function POST(req: Request) {
       if (brandVariants !== undefined && !Array.isArray(brandVariants)) return NextResponse.json({ error: 'Variantes de marca no válidas.' }, { status: 400 });
       if (memePercentage !== undefined && (!Number.isInteger(memePercentage) || memePercentage < 0 || memePercentage > 100)) return NextResponse.json({ error: 'Porcentaje de memes no válido.' }, { status: 400 });
 
-      const created = await createPerpetualCampaign({ accountsInput, direction, postActiveLifetimeHours, displayName, modelKey, brandVariants, maxCommentsTotal, isInactive, includeMemes, memePercentage, memeModelKey });
+      const created = await createPerpetualCampaign({ accountsInput, direction, postActiveLifetimeHours, displayName, modelKey, brandVariants, maxCommentsTotal, isInactive, includeMemes, memePercentage, memeModelKey, draftId, memeEveryComments });
 
       return NextResponse.json(
         { success: true, campaign: { id: created.id, slug: created.slug, campaignType: 'perpetual' }, initialSync: created.initialSync || { pending: true } },

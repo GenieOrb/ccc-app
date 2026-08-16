@@ -49,4 +49,16 @@ describe('campaign toggle route', () => {
     expect(response.status).toBe(403);
     expect(toggleCampaignStatus).not.toHaveBeenCalled();
   });
+
+  it('surfaces the service rejection when reactivation targets a cancelled campaign', async () => {
+    toggleCampaignStatus.mockRejectedValueOnce(new Error('No se puede reactivar una campaña cancelada.'));
+    const response = await POST(new Request('http://localhost/api/admin/campaigns/campaign-1/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ isActive: true }),
+    }), context);
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: 'No se puede reactivar una campaña cancelada.' });
+  });
 });

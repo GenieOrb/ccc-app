@@ -36,7 +36,6 @@ vi.mock('./ai/models', () => ({
 }));
 
 import { generateDeterministicMemeSlotPlans } from './memes/planner';
-import { getMemeTemplatesForProvider } from './memes/templates';
 import { createCampaign, toggleCampaignStatus, triggerReplenishmentIfNeeded } from './services';
 
 const generateMemePlans = vi.mocked(generateDeterministicMemeSlotPlans);
@@ -81,7 +80,7 @@ describe('manual campaign generation inventory', () => {
       }),
     }));
 
-    await createCampaign({ urlsInput: 'two posts', memeModelKey: 'gemini-3.1-flash-image' });
+    await createCampaign({ urlsInput: 'two posts', includeMemes: false, memeModelKey: 'gemini-3.1-flash-image' });
 
     const campaignInsert = queries.find(({ sql }) => sql.includes('INSERT INTO campaigns'))!;
     expect(campaignInsert.params?.[8]).toBe(true); // is_active
@@ -91,10 +90,42 @@ describe('manual campaign generation inventory', () => {
       ['campaign-1', 'post-1'], ['campaign-1', 'post-2'],
     ]);
     expect(queries.filter(({ sql }) => sql.includes('INSERT INTO generation_jobs'))).toHaveLength(60);
-    expect(queries.filter(({ sql }) => sql.includes('INSERT INTO meme_generation_jobs'))).toHaveLength(10);
-    expect(generateMemePlans).toHaveBeenCalledTimes(1);
-    expect(generateMemePlans.mock.calls[0][3]).toBe(10);
-    expect(generateMemePlans.mock.calls[0][6]).toEqual(getMemeTemplatesForProvider('google').map((template) => template.id));
+    expect(queries.filter(({ sql }) => sql.includes('INSERT INTO meme_generation_jobs'))).toHaveLength(0);
+    expect(generateMemePlans).not.toHaveBeenCalled();
+  });
+
+  it('converts every active uploaded asset into reusable campaign memes without legacy AI creation', async () => {
+    parseMultipleXUrls.mockReturnValue([{ postId: 'one' }]);
+    fetchXPosts.mockResolvedValue([post('one')]);
+    checkCampaignSafety.mockResolvedValue({ allowed: true, category: 'safe', reason: 'ok' });
+    generateSecureSlug.mockReturnValue('uploaded-memes');
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    const assets = Array.from({ length: 11 }, (_, index) => ({
+      id: `asset-${index}`, storage_provider: 'blob', storage_key: `draft/${index}.png`, storage_url: `https://blob.test/${index}.png`,
+      mime_type: 'image/png', size_bytes: 100 + index, width: 10, height: 20, sha256_hash: `hash-${index}`,
+    }));
+    withTransaction.mockImplementation(async (operation: (client: { query: ReturnType<typeof vi.fn> }) => Promise<unknown>) => operation({
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        queries.push({ sql, params });
+        if (sql.includes('INSERT INTO campaigns')) return { rows: [{ id: 'campaign-uploaded' }] };
+        if (sql.includes('INSERT INTO campaign_posts')) return { rows: [{ id: 'post-uploaded' }] };
+        if (sql.includes('INSERT INTO generation_cycles')) return { rows: [{ id: 'comment-cycle' }] };
+        if (sql.includes('FROM meme_drafts') && sql.includes('FOR UPDATE')) return { rows: [{ id: 'draft-1', status: 'active' }] };
+        if (sql.includes('FROM meme_assets') && sql.includes('FOR UPDATE')) return { rows: assets };
+        return { rows: [] };
+      }),
+    }));
+
+    await createCampaign({ urlsInput: 'one post', includeMemes: true, draftId: 'draft-1', memeEveryComments: 7, memeModelKey: 'gemini-3.1-flash-image' });
+
+    const campaignInsert = queries.find(({ sql }) => sql.includes('INSERT INTO campaigns'))!;
+    expect(campaignInsert.params).toContain(7);
+    expect(queries.filter(({ sql }) => sql.includes('INSERT INTO campaign_memes'))).toHaveLength(11);
+    expect(queries.filter(({ sql }) => sql.includes('INSERT INTO campaign_meme_posts'))).toHaveLength(0);
+    expect(queries.filter(({ sql }) => /\b(meme_generation_cycles|meme_generation_jobs|memes|meme_api_calls)\b/.test(sql))).toHaveLength(0);
+    expect(queries.some(({ sql }) => /DELETE\s+FROM\s+meme_assets/i.test(sql))).toBe(false);
+    expect(generateMemePlans).not.toHaveBeenCalled();
+    expect(queries.some(({ sql }) => sql.includes("UPDATE meme_drafts SET status = 'converted'"))).toBe(true);
   });
 
   it('replenishes only the depleted manual post with ten jobs', async () => {

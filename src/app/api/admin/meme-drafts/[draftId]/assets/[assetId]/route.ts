@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { isAdminAuthenticated, validateSameOrigin } from '@/lib/auth';
-import { queryDb, withTransaction } from '@/lib/db';
-import { del } from '@vercel/blob';
+import { withTransaction } from '@/lib/db';
+import { deleteBlobStrict } from '@/lib/memes/blob';
 import { z } from 'zod';
 
 export const runtime = 'nodejs';
@@ -12,6 +12,9 @@ const patchSchema = z.object({
   percentage: z.number().int().min(0).max(100),
   instruction: z.string().max(500).optional().default(''),
 });
+
+class DraftConflictError extends Error {}
+class SharedAssetError extends Error {}
 
 export async function PATCH(req: Request, props: { params: Promise<{ draftId: string, assetId: string }> }) {
   if (!(await isAdminAuthenticated())) {
@@ -34,6 +37,14 @@ export async function PATCH(req: Request, props: { params: Promise<{ draftId: st
 
   try {
     const asset = await withTransaction(async (client) => {
+      const draftRes = await client.query(
+        `SELECT id FROM meme_drafts WHERE id = $1 AND status = 'active' FOR UPDATE`,
+        [draftId]
+      );
+      if (draftRes.rows.length !== 1) {
+        throw new DraftConflictError('El borrador ya no está activo.');
+      }
+
       // Bloquear los assets activos del draft con FOR UPDATE
       const assetsRes = await client.query(
         `SELECT id, appearance_percentage FROM meme_assets WHERE draft_id = $1 AND status = 'active' FOR UPDATE`,
@@ -70,6 +81,9 @@ export async function PATCH(req: Request, props: { params: Promise<{ draftId: st
     return NextResponse.json({ success: true, asset });
   } catch (error: unknown) {
     const dbErr = error as { code?: string; message?: string };
+    if (error instanceof DraftConflictError) {
+      return NextResponse.json({ error: dbErr.message }, { status: 409 });
+    }
     if (dbErr.code === '23514') {
       return NextResponse.json({ error: 'Error de validación de base de datos.' }, { status: 400 });
     }
@@ -96,47 +110,61 @@ export async function DELETE(req: Request, props: { params: Promise<{ draftId: s
   const { draftId, assetId } = await props.params;
 
   try {
-    // Verificamos pertenencia y storage_key
-    const assetRes = await queryDb<{ id: string, storage_key: string, storage_url: string }>(
-      `SELECT id, storage_key, storage_url FROM meme_assets WHERE id = $1 AND draft_id = $2`,
-      [assetId, draftId]
-    );
-
-    if (assetRes.length === 0) {
-      return NextResponse.json({ error: 'Asset no encontrado.' }, { status: 404 });
-    }
-
-    const asset = assetRes[0];
-
-    // Verificar referencias: jobs, memes
-    const jobRes = await queryDb(`SELECT 1 FROM meme_generation_jobs WHERE asset_snapshot->>'id' = $1 LIMIT 1`, [assetId]);
-    const memeRes = await queryDb(`SELECT 1 FROM memes WHERE asset_id = $1 LIMIT 1`, [assetId]);
-
-    const hasReferences = jobRes.length > 0 || memeRes.length > 0;
-
-    if (hasReferences) {
-      // Borrado lógico
-      await queryDb(
-        `UPDATE meme_assets SET status = 'retired', retired_at = NOW() WHERE id = $1 AND draft_id = $2`,
-        [assetId, draftId]
+    const deletion = await withTransaction(async (client) => {
+      const draftRes = await client.query(
+        `SELECT id FROM meme_drafts WHERE id = $1 AND status = 'active' FOR UPDATE`,
+        [draftId]
       );
-    } else {
-      // Borrado físico
-      const storageKey = asset.storage_key || asset.storage_url;
-      try {
-        await del(storageKey, { token: process.env.BLOB_READ_WRITE_TOKEN });
-      } catch (e) {
-        console.error('Blob delete error', e);
+      if (draftRes.rows.length !== 1) {
+        throw new DraftConflictError('El borrador ya no está activo.');
       }
 
-      await queryDb(
-        `DELETE FROM meme_assets WHERE id = $1 AND draft_id = $2`,
+      const assetRes = await client.query<{ id: string, storage_key: string, storage_url: string, sha256_hash: string }>(
+        `SELECT id, storage_key, storage_url, sha256_hash
+         FROM meme_assets WHERE id = $1 AND draft_id = $2 FOR UPDATE`,
         [assetId, draftId]
       );
+      if (assetRes.rows.length === 0) {
+        throw new Error('Asset no encontrado.');
+      }
+      const asset = assetRes.rows[0];
+
+      const sharedRes = await client.query(
+        `SELECT 1 FROM campaign_memes
+         WHERE storage_key = $1 OR sha256_hash = $2
+         LIMIT 1`,
+        [asset.storage_key, asset.sha256_hash]
+      );
+      if (sharedRes.rows.length > 0) {
+        throw new SharedAssetError('El asset está compartido por memes de campaña.');
+      }
+
+      const jobRes = await client.query(`SELECT 1 FROM meme_generation_jobs WHERE asset_snapshot->>'id' = $1 LIMIT 1`, [assetId]);
+      const memeRes = await client.query(`SELECT 1 FROM memes WHERE asset_id = $1 LIMIT 1`, [assetId]);
+      if (jobRes.rows.length > 0 || memeRes.rows.length > 0) {
+        await client.query(
+          `UPDATE meme_assets SET status = 'retired', retired_at = NOW() WHERE id = $1 AND draft_id = $2`,
+          [assetId, draftId]
+        );
+        return null;
+      }
+
+      await client.query(`DELETE FROM meme_assets WHERE id = $1 AND draft_id = $2`, [assetId, draftId]);
+      return asset.storage_key || asset.storage_url;
+    });
+
+    if (deletion) {
+      await deleteBlobStrict(deletion);
     }
 
     return NextResponse.json({ success: true });
   } catch (error: unknown) {
+    if (error instanceof DraftConflictError || error instanceof SharedAssetError) {
+      return NextResponse.json({ error: error.message }, { status: 409 });
+    }
+    if (error instanceof Error && error.message === 'Asset no encontrado.') {
+      return NextResponse.json({ error: error.message }, { status: 404 });
+    }
     console.error('Error deleting asset:', error);
     return NextResponse.json({ error: 'Error al eliminar el asset' }, { status: 500 });
   }

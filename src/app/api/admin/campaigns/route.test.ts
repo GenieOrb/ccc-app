@@ -93,6 +93,42 @@ describe('admin campaigns route', () => {
     expect(createPerpetualCampaign).toHaveBeenCalledWith(expect.objectContaining({ accountsInput: '@author', postActiveLifetimeHours: 24, isInactive: true }));
   });
 
+  it('propagates an uploaded-meme draft and cadence for manual and perpetual campaigns', async () => {
+    createPerpetualCampaign.mockResolvedValue({ id: 'perpetual-1', slug: 'perpetual-slug', initialSync: null });
+    const payloads = [
+      { campaignType: 'manual', urlsInput: 'https://x.com/a/status/1' },
+      { campaignType: 'perpetual', accountsInput: '@author', postActiveLifetimeHours: 24 },
+    ];
+
+    for (const payload of payloads) {
+      const response = await POST(new Request('http://localhost/api/admin/campaigns', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...payload, includeMemes: true, draftId: 'draft-1', memeEveryComments: 7 }),
+      }));
+      expect(response.status).toBe(200);
+    }
+
+    expect(createCampaign).toHaveBeenLastCalledWith(expect.objectContaining({ includeMemes: true, draftId: 'draft-1', memeEveryComments: 7 }));
+    expect(createPerpetualCampaign).toHaveBeenLastCalledWith(expect.objectContaining({ includeMemes: true, draftId: 'draft-1', memeEveryComments: 7 }));
+  });
+
+  it('rejects draft/cadence combinations that cannot create uploaded-meme campaigns', async () => {
+    const requests = [
+      { campaignType: 'manual', urlsInput: 'https://x.com/a/status/1', includeMemes: false, draftId: 'draft-1' },
+      { campaignType: 'perpetual', accountsInput: '@author', postActiveLifetimeHours: 24, includeMemes: true, draftId: 'draft-1', memeEveryComments: 0 },
+    ];
+
+    for (const body of requests) {
+      const response = await POST(new Request('http://localhost/api/admin/campaigns', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      }));
+      expect(response.status).toBe(400);
+    }
+    expect(createCampaign).not.toHaveBeenCalled();
+    expect(createPerpetualCampaign).not.toHaveBeenCalled();
+  });
+
   describe('maxCommentsTotal validation', () => {
     it('accepts a valid maxCommentsTotal', async () => {
       const response = await POST(new Request('http://localhost/api/admin/campaigns', {

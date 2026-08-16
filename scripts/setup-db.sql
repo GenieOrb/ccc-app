@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
     direction TEXT,
     post_active_lifetime_hours INTEGER,
     is_active BOOLEAN NOT NULL DEFAULT false,
+    cancelled_at TIMESTAMPTZ,
     safety_allowed BOOLEAN NOT NULL DEFAULT true,
     safety_category TEXT,
     safety_reason TEXT,
@@ -37,6 +38,7 @@ BEGIN
 END $$;
 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS campaign_type TEXT NOT NULL DEFAULT 'manual';
 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS post_active_lifetime_hours INTEGER;
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
 ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS max_comments_total INT;
 ALTER TABLE campaigns ALTER COLUMN max_comments_total DROP DEFAULT;
 
@@ -999,6 +1001,227 @@ BEGIN
     FOREIGN KEY (meme_id, campaign_id, campaign_post_id) REFERENCES memes (id, campaign_id, campaign_post_id) ON DELETE RESTRICT;
 END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS unique_assignment_meme_id ON assignments(meme_id) WHERE meme_id IS NOT NULL;
+
+-- ==========================================
+-- CAMPAIGN MEME REUSE AND CADENCE
+-- ==========================================
+
+-- A NULL cadence disables meme scheduling for the campaign. The counter is
+-- deliberately global to the campaign so callers can increment it atomically
+-- with UPDATE ... RETURNING.
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS meme_every_comments INTEGER;
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS meme_global_comment_count INTEGER;
+UPDATE campaigns
+SET meme_every_comments = NULL
+WHERE meme_every_comments IS NOT NULL AND meme_every_comments <= 0;
+UPDATE campaigns
+SET meme_global_comment_count = 0
+WHERE meme_global_comment_count IS NULL OR meme_global_comment_count < 0;
+ALTER TABLE campaigns ALTER COLUMN meme_global_comment_count SET DEFAULT 0;
+ALTER TABLE campaigns ALTER COLUMN meme_global_comment_count SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_campaign_meme_every_comments' AND conrelid = 'campaigns'::regclass) THEN
+        ALTER TABLE campaigns
+        ADD CONSTRAINT chk_campaign_meme_every_comments
+        CHECK (meme_every_comments IS NULL OR meme_every_comments > 0);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_campaign_meme_global_comment_count' AND conrelid = 'campaigns'::regclass) THEN
+        ALTER TABLE campaigns
+        ADD CONSTRAINT chk_campaign_meme_global_comment_count
+        CHECK (meme_global_comment_count >= 0);
+    END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS campaign_memes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE RESTRICT,
+    storage_provider TEXT NOT NULL,
+    storage_key TEXT NOT NULL,
+    storage_url TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    width INTEGER CHECK (width IS NULL OR width > 0),
+    height INTEGER CHECK (height IS NULL OR height > 0),
+    sha256_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available', 'assigned', 'withdrawn', 'rejected', 'failed', 'retired')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT unique_campaign_meme_compound UNIQUE (id, campaign_id)
+);
+
+CREATE INDEX IF NOT EXISTS campaign_memes_available_idx
+ON campaign_memes(campaign_id, status, created_at)
+WHERE status = 'available';
+
+CREATE TABLE IF NOT EXISTS campaign_meme_posts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE RESTRICT,
+    campaign_meme_id UUID NOT NULL,
+    campaign_post_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT unique_campaign_meme_post UNIQUE (campaign_meme_id, campaign_post_id),
+    CONSTRAINT unique_campaign_meme_post_compound UNIQUE (id, campaign_id),
+    CONSTRAINT fk_campaign_meme_posts_meme_compound
+        FOREIGN KEY (campaign_meme_id, campaign_id)
+        REFERENCES campaign_memes (id, campaign_id) ON DELETE RESTRICT,
+    CONSTRAINT fk_campaign_meme_posts_post_compound
+        FOREIGN KEY (campaign_post_id, campaign_id)
+        REFERENCES campaign_posts (id, campaign_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS campaign_meme_posts_post_idx
+ON campaign_meme_posts(campaign_post_id, created_at);
+
+-- Cycle 1 created this table without campaign_id. Infer it only when both
+-- ends agree; otherwise preserve the rows and abort for operator resolution.
+ALTER TABLE campaign_meme_posts ADD COLUMN IF NOT EXISTS campaign_id UUID;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM campaign_meme_posts cmp
+        LEFT JOIN campaign_memes cm ON cm.id = cmp.campaign_meme_id
+        LEFT JOIN campaign_posts cp ON cp.id = cmp.campaign_post_id
+        WHERE cm.id IS NULL
+           OR cp.id IS NULL
+           OR cm.campaign_id IS DISTINCT FROM cp.campaign_id
+           OR (cmp.campaign_id IS NOT NULL AND cmp.campaign_id IS DISTINCT FROM cm.campaign_id)
+    ) THEN
+        RAISE EXCEPTION 'Cannot backfill campaign_meme_posts.campaign_id: history contains missing or cross-campaign references';
+    END IF;
+
+    UPDATE campaign_meme_posts cmp
+    SET campaign_id = cm.campaign_id
+    FROM campaign_memes cm
+    WHERE cmp.campaign_meme_id = cm.id
+      AND cmp.campaign_id IS NULL;
+
+    IF EXISTS (SELECT 1 FROM campaign_meme_posts WHERE campaign_id IS NULL) THEN
+        RAISE EXCEPTION 'Cannot set campaign_meme_posts.campaign_id NOT NULL: unresolved history rows exist';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'unique_campaign_meme_post_compound' AND conrelid = 'campaign_meme_posts'::regclass) THEN
+        ALTER TABLE campaign_meme_posts
+        ADD CONSTRAINT unique_campaign_meme_post_compound UNIQUE (id, campaign_id);
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_campaign_meme_posts_meme_compound' AND conrelid = 'campaign_meme_posts'::regclass) THEN
+        ALTER TABLE campaign_meme_posts
+        ADD CONSTRAINT fk_campaign_meme_posts_meme_compound
+        FOREIGN KEY (campaign_meme_id, campaign_id)
+        REFERENCES campaign_memes (id, campaign_id) ON DELETE RESTRICT;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_campaign_meme_posts_post_compound' AND conrelid = 'campaign_meme_posts'::regclass) THEN
+        ALTER TABLE campaign_meme_posts
+        ADD CONSTRAINT fk_campaign_meme_posts_post_compound
+        FOREIGN KEY (campaign_post_id, campaign_id)
+        REFERENCES campaign_posts (id, campaign_id) ON DELETE RESTRICT;
+    END IF;
+END $$;
+ALTER TABLE campaign_meme_posts ALTER COLUMN campaign_id SET NOT NULL;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM campaign_memes
+        WHERE status IN ('available', 'assigned')
+        GROUP BY campaign_id, sha256_hash
+        HAVING COUNT(*) > 1
+    ) THEN
+        RAISE EXCEPTION 'Cannot add unique active campaign meme hash: duplicate campaign_id/sha256_hash rows exist';
+    END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS unique_campaign_meme_hash_active
+ON campaign_memes(campaign_id, sha256_hash)
+WHERE status IN ('available', 'assigned');
+
+ALTER TABLE assignments ADD COLUMN IF NOT EXISTS campaign_meme_id UUID;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_assignments_campaign_meme_compound' AND conrelid = 'assignments'::regclass) THEN
+        ALTER TABLE assignments
+        ADD CONSTRAINT fk_assignments_campaign_meme_compound
+        FOREIGN KEY (campaign_meme_id, campaign_id)
+        REFERENCES campaign_memes (id, campaign_id) ON DELETE RESTRICT;
+    END IF;
+END $$;
+
+-- Legacy meme_id rows remain valid. New reusable campaign memes use
+-- campaign_meme_id and are protected per post by campaign_meme_posts.
+ALTER TABLE assignments DISABLE TRIGGER trigger_prevent_assignment_mutation;
+ALTER TABLE assignments DROP CONSTRAINT IF EXISTS chk_assignment_exact_content;
+ALTER TABLE assignments ADD CONSTRAINT chk_assignment_exact_content CHECK (
+    (content_type = 'comment' AND suggestion_id IS NOT NULL AND meme_id IS NULL AND campaign_meme_id IS NULL) OR
+    (content_type = 'meme' AND suggestion_id IS NULL AND (
+        (meme_id IS NOT NULL AND campaign_meme_id IS NULL) OR
+        (meme_id IS NULL AND campaign_meme_id IS NOT NULL)
+    ))
+);
+
+-- Preserve legacy inventory and assignment history while making it available
+-- through the reusable campaign meme model. Reusing the legacy UUID makes the
+-- migration repeatable and keeps the historical assignment link intact.
+INSERT INTO campaign_memes (
+    id, campaign_id, storage_provider, storage_key, storage_url, mime_type,
+    size_bytes, width, height, sha256_hash, status, created_at, updated_at
+)
+SELECT
+    m.id, m.campaign_id, m.storage_provider, m.storage_key, m.storage_url, m.mime_type,
+    m.size_bytes, m.width, m.height, m.sha256_hash,
+    CASE WHEN m.status IN ('available', 'assigned', 'withdrawn', 'rejected', 'failed') THEN m.status ELSE 'retired' END,
+    m.created_at, m.created_at
+FROM memes m
+WHERE m.campaign_id IS NOT NULL
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO campaign_meme_posts (campaign_meme_id, campaign_post_id, campaign_id, created_at)
+SELECT m.id, m.campaign_post_id, m.campaign_id, m.created_at
+FROM memes m
+WHERE m.campaign_id IS NOT NULL AND m.campaign_post_id IS NOT NULL
+ON CONFLICT (campaign_meme_id, campaign_post_id) DO NOTHING;
+
+ALTER TABLE assignments ENABLE TRIGGER trigger_prevent_assignment_mutation;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM assignments a
+        LEFT JOIN campaign_meme_posts cmp
+          ON cmp.campaign_meme_id = a.campaign_meme_id
+         AND cmp.campaign_post_id = a.campaign_post_id
+        WHERE a.campaign_meme_id IS NOT NULL
+          AND cmp.id IS NULL
+    ) THEN
+        RAISE EXCEPTION 'Cannot add assignments campaign meme history FK: assignments without matching history exist';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM assignments
+        WHERE campaign_meme_id IS NOT NULL
+        GROUP BY campaign_meme_id, campaign_post_id
+        HAVING COUNT(*) > 1
+    ) THEN
+        RAISE EXCEPTION 'Cannot add unique campaign meme assignment: duplicate campaign_meme_id/campaign_post_id rows exist';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_assignments_campaign_meme_history' AND conrelid = 'assignments'::regclass) THEN
+        ALTER TABLE assignments
+        ADD CONSTRAINT fk_assignments_campaign_meme_history
+        FOREIGN KEY (campaign_meme_id, campaign_post_id)
+        REFERENCES campaign_meme_posts (campaign_meme_id, campaign_post_id) ON DELETE RESTRICT;
+    END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS unique_assignment_campaign_meme_post
+ON assignments(campaign_meme_id, campaign_post_id)
+WHERE campaign_meme_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS perpetual_scheduler_state (
     singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),

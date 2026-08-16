@@ -44,82 +44,6 @@ describe('administration campaign cards', () => {
     expect((await screen.findByLabelText(/habilitar sistema de memes/i) as HTMLInputElement).checked).toBe(true);
   });
 
-  it('blocks meme-dependent actions with no configured image model while leaving comment preview available', async () => {
-    fetchMock.mockImplementation((input: string) => {
-      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
-      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [] }));
-      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
-      return Promise.resolve(json({}));
-    });
-    render(<AdminDashboardPage />);
-    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
-    const imageSelector = screen.getByLabelText(/modelo generador de im[aá]genes/i) as HTMLSelectElement;
-    expect(imageSelector.disabled).toBe(true);
-    expect(imageSelector.value).toBe('');
-    expect((screen.getByRole('button', { name: /crear campa[añ]a/i }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole('button', { name: /^guardar$/i }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole('button', { name: /generar 3 memes/i }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole('button', { name: /generar preview de comentarios/i }) as HTMLButtonElement).disabled).toBe(false);
-    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
-    expect(fetchMock.mock.calls.some(([url, init]) => String(url) === '/api/admin/campaigns/preview/memes' && (init as RequestInit | undefined)?.method === 'POST')).toBe(false);
-  });
-
-  it('keeps all meme actions blocked while the image-model catalog is loading', async () => {
-    let resolveCatalog: ((value: ReturnType<typeof json>) => void) | undefined;
-    fetchMock.mockImplementation((input: string) => {
-      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
-      if (input.includes('/api/admin/image-models')) return new Promise((resolve) => { resolveCatalog = resolve; });
-      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
-      return Promise.resolve(json({}));
-    });
-    render(<AdminDashboardPage />);
-    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
-    expect(screen.getByRole('status').textContent).toMatch(/cargando catálogo/i);
-    expect((screen.getByRole('button', { name: /crear campaña/i }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole('button', { name: /generar 3 memes/i }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole('button', { name: /generar preview de comentarios/i }) as HTMLButtonElement).disabled).toBe(false);
-    resolveCatalog?.(json({ models: [] }));
-  });
-
-  it('reports a catalog error, blocks meme POSTs, and allows a campaign without memes', async () => {
-    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
-      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
-      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ error: 'unavailable' }, false));
-      if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true }));
-      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
-      return Promise.resolve(json({}));
-    });
-    render(<AdminDashboardPage />);
-    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
-    expect((await screen.findByRole('alert')).textContent).toMatch(/no se pudo cargar/i);
-    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
-    expect(fetchMock.mock.calls.some(([url, init]) => String(url) === '/api/admin/campaigns/preview/memes' && (init as RequestInit | undefined)?.method === 'POST')).toBe(false);
-    fireEvent.click(screen.getByLabelText(/habilitar sistema de memes/i));
-    fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
-    await waitFor(() => {
-      const request = fetchMock.mock.calls.find(([url, init]) => String(url) === '/api/admin/campaigns' && (init as RequestInit | undefined)?.method === 'POST');
-      expect(request).toBeTruthy();
-      const payload = JSON.parse((request?.[1] as RequestInit).body as string);
-      expect(payload).toMatchObject({ includeMemes: false });
-      expect(payload).not.toHaveProperty('memeModelKey');
-      expect(payload).not.toHaveProperty('memePercentage');
-    });
-  });
-
-  it('selects the first configured image model and allows meme actions', async () => {
-    fetchMock.mockImplementation((input: string) => {
-      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
-      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
-      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
-      return Promise.resolve(json({}));
-    });
-    render(<AdminDashboardPage />);
-    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
-    await waitFor(() => expect((screen.getByLabelText(/modelo generador de im[aá]genes/i) as HTMLSelectElement).value).toBe('image-ready'));
-    expect((screen.getByRole('button', { name: /crear campa[añ]a/i }) as HTMLButtonElement).disabled).toBe(false);
-    expect((screen.getByRole('button', { name: /generar 3 memes/i }) as HTMLButtonElement).disabled).toBe(false);
-  });
-
   it('starts collapsed, exposes an accessible arrow, and only fetches preview after expansion', async () => {
     render(<AdminDashboardPage />);
     const arrow = await screen.findByRole('button', { name: /expandir/i });
@@ -174,6 +98,20 @@ describe('administration campaign cards', () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/toggle'))).toBe(true));
     expect(arrow.getAttribute('aria-expanded')).toBe('true');
+  });
+
+  it('confirms irreversible cancellation before posting to the cancel endpoint', async () => {
+    const confirmMock = vi.fn(() => true);
+    vi.stubGlobal('confirm', confirmMock);
+    render(<AdminDashboardPage />);
+    fireEvent.click(await screen.findByRole('button', { name: /expandir/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /cancelar campaña/i }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) =>
+      String(url) === '/api/admin/campaigns/campaign-1/cancel' && (init as RequestInit | undefined)?.method === 'POST',
+    )).toBe(true));
+    expect(confirmMock).toHaveBeenCalledWith(expect.stringMatching(/irreversible/i));
+    vi.unstubAllGlobals();
   });
 
   it('updates only the toggled card after a successful persisted response', async () => {
@@ -243,6 +181,7 @@ describe('administration campaign cards', () => {
     fireEvent.change(screen.getByLabelText(/urls de los posts de x/i), {
       target: { value: 'https://x.com/genieorb/status/123' },
     });
+    fireEvent.click(screen.getByLabelText(/habilitar sistema de memes/i));
     fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
 
     await waitFor(() => {
@@ -362,138 +301,173 @@ describe('administration campaign cards', () => {
     ).toBe(false);
   });
 
-  it('includes existing brand variants in the meme preview request', async () => {
+  it('submits meme cadence and an uploaded draft id without requiring an image model', async () => {
     fetchMock.mockImplementation((input: string, init?: RequestInit) => {
       if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
-      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
-      if (input === '/api/admin/campaigns/preview/memes' && init?.method === 'POST') return Promise.resolve(json({ error: 'stop after payload' }, false));
+      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [] }));
+      if (input === '/api/admin/meme-drafts/assets' && init?.method === 'POST') return Promise.resolve(json({ draftId: 'draft-uploaded' }));
+      if (input === '/api/admin/meme-drafts/draft-uploaded/assets') return Promise.resolve(json({ assets: [{ id: 'asset-1', mime_type: 'image/png' }] }));
+      if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true }));
       if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
       return Promise.resolve(json({}));
     });
     render(<AdminDashboardPage />);
+
     fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
-    fireEvent.click(screen.getByRole('button', { name: /añadir variante/i }));
-    fireEvent.change(screen.getByPlaceholderText(/texto exacto/i), { target: { value: 'GenieOrb' } });
-    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
+    fireEvent.change(screen.getByLabelText(/meme cada x comentarios/i), { target: { value: '4' } });
+    fireEvent.change(screen.getByLabelText(/subir memes manuales/i), { target: { files: [new File(['meme'], 'meme.png', { type: 'image/png' })] } });
+    await screen.findByText('image/png');
+    expect(screen.queryByLabelText(/modelo generador de im[aá]genes/i)).toBeNull();
+    expect(screen.queryByRole('button', { name: /generar 3 memes/i })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
 
     await waitFor(() => {
-      const call = fetchMock.mock.calls.find(([url, init]) => String(url) === '/api/admin/campaigns/preview/memes' && (init as RequestInit)?.method === 'POST');
-      expect(call).toBeTruthy();
-      expect(JSON.parse((call?.[1] as RequestInit).body as string)).toMatchObject({ brandVariants: [{ value: 'GenieOrb', percentage: 100 }] });
+      const request = fetchMock.mock.calls.find(([url, init]) => String(url) === '/api/admin/campaigns' && (init as RequestInit | undefined)?.method === 'POST');
+      expect(request).toBeTruthy();
+      expect(JSON.parse((request?.[1] as RequestInit).body as string)).toMatchObject({ includeMemes: true, memeEveryComments: 4, draftId: 'draft-uploaded' });
     });
   });
 
-  it('reuses the draftId returned by a retryable meme preview error', async () => {
-    const retryableErrorResponse = () => ({
-      ...json({
-        error: 'La generación no terminó en esta invocación.',
-        retryable: true,
-        draftId: 'draft-retry-1',
-        cycleId: 'cycle-retry-1',
-      }, false),
-      status: 502,
-    });
-
+  it('uploads selected memes sequentially, retains the draft id, reloads successful assets, and reports a partial failure', async () => {
+    let releaseThirdUpload: (() => void) | undefined;
     fetchMock.mockImplementation((input: string, init?: RequestInit) => {
       if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
-      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
-      if (input === '/api/admin/campaigns/preview/memes' && init?.method === 'POST') {
-        return Promise.resolve(retryableErrorResponse());
+      if (input === '/api/admin/meme-drafts/assets' && init?.method === 'POST') {
+        const file = (init.body as FormData).get('file') as File;
+        const submittedDraft = (init.body as FormData).get('draftId');
+        if (file.name === 'one.png') return Promise.resolve(json({ draftId: 'draft-sequential' }));
+        if (file.name === 'two.png') return Promise.resolve(json({ error: 'second file rejected' }, false));
+        expect(submittedDraft).toBe('draft-sequential');
+        return new Promise((resolve) => { releaseThirdUpload = () => resolve(json({ draftId: 'draft-sequential' })); });
+      }
+      if (input === '/api/admin/meme-drafts/draft-sequential/assets') {
+        return Promise.resolve(json({ assets: [{ id: 'asset-one', mime_type: 'image/png' }, { id: 'asset-three', mime_type: 'image/webp' }] }));
       }
       if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
       return Promise.resolve(json({}));
     });
-
     render(<AdminDashboardPage />);
+    fireEvent.change(await screen.findByLabelText(/subir memes manuales/i), {
+      target: { files: [new File(['1'], 'one.png', { type: 'image/png' }), new File(['2'], 'two.png', { type: 'image/png' }), new File(['3'], 'three.webp', { type: 'image/webp' })] },
+    });
+
+    expect((await screen.findByRole('status')).textContent).toMatch(/subiendo 3 de 3: three\.webp/i);
+    releaseThirdUpload?.();
+    expect((await screen.findByRole('alert')).textContent).toContain('second file rejected');
+    expect(await screen.findByText('image/webp')).toBeTruthy();
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url) === '/api/admin/meme-drafts/assets' && (init as RequestInit).method === 'POST')).toHaveLength(3);
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === '/api/admin/meme-drafts/draft-sequential/assets')).toBe(true);
+  });
+
+  it('deletes a draft asset only after successful deletion and preserves it with an alert on failure', async () => {
+    let deletionShouldFail = false;
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input === '/api/admin/meme-drafts/assets' && init?.method === 'POST') return Promise.resolve(json({ draftId: 'draft-delete' }));
+      if (input === '/api/admin/meme-drafts/draft-delete/assets') return Promise.resolve(json({ assets: [{ id: 'asset-delete', mime_type: 'image/png' }] }));
+      if (input === '/api/admin/meme-drafts/draft-delete/assets/asset-delete' && init?.method === 'DELETE') return Promise.resolve(json({ error: 'delete failed' }, !deletionShouldFail));
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+    render(<AdminDashboardPage />);
+    fireEvent.change(await screen.findByLabelText(/subir memes manuales/i), { target: { files: [new File(['meme'], 'meme.png', { type: 'image/png' })] } });
+    await screen.findByText('image/png');
+
+    deletionShouldFail = true;
+    fireEvent.click(screen.getByRole('button', { name: /eliminar meme/i }));
+    expect((await screen.findByRole('alert')).textContent).toContain('delete failed');
+    expect(screen.getByText('image/png')).toBeTruthy();
+
+    deletionShouldFail = false;
+    fireEvent.click(screen.getByRole('button', { name: /eliminar meme/i }));
+    await waitFor(() => expect(screen.queryByText('image/png')).toBeNull());
+  });
+
+  it('keeps brand variants ordered, trims and omits blanks, and excludes legacy meme fields from the campaign payload', async () => {
+    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true }));
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+    render(<AdminDashboardPage />);
+    fireEvent.click(await screen.findByLabelText(/habilitar sistema de memes/i));
+    fireEvent.change(screen.getByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
+    fireEvent.click(screen.getByRole('button', { name: /añadir variante/i }));
+    fireEvent.click(screen.getByRole('button', { name: /añadir variante/i }));
+    const values = screen.getAllByPlaceholderText(/texto exacto/i);
+    fireEvent.change(values[0], { target: { value: '  First  ' } });
+    fireEvent.change(values[1], { target: { value: '   ' } });
+    fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
+    await waitFor(() => {
+      const request = fetchMock.mock.calls.find(([url, init]) => String(url) === '/api/admin/campaigns' && (init as RequestInit).method === 'POST');
+      const payload = JSON.parse((request?.[1] as RequestInit).body as string);
+      expect(payload.brandVariants).toEqual([{ value: 'First', percentage: 100 }]);
+      expect(payload).not.toHaveProperty('memePercentage');
+      expect(payload).not.toHaveProperty('memeModelKey');
+    });
+  });
+
+  it('orders direction and brand variants before the meme configuration', async () => {
+    render(<AdminDashboardPage />);
+    await screen.findByLabelText(/dirección de los comentarios/i);
+    const formText = document.querySelector('form')?.textContent || '';
+    expect(formText.indexOf('Máximo de comentarios')).toBeLessThan(formText.indexOf('Dirección de los comentarios'));
+    expect(formText.indexOf('Dirección de los comentarios')).toBeLessThan(formText.indexOf('Variantes de Marca'));
+    expect(formText.indexOf('Variantes de Marca')).toBeLessThan(formText.indexOf('Habilitar Sistema de Memes'));
+  });
+
+  it('does not submit a meme campaign before at least one manual meme is uploaded', async () => {
+    render(<AdminDashboardPage />);
+
     fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
       target: { value: 'https://x.com/genieorb/status/123' },
     });
+    fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
 
-    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
-    expect(await screen.findByText('La generación no terminó en esta invocación.')).toBeTruthy();
+    expect(await screen.findByText(/sube al menos un meme antes de crear la campaña/i)).toBeTruthy();
+    expect(fetchMock.mock.calls.some(([url, init]) =>
+      String(url) === '/api/admin/campaigns' && (init as RequestInit | undefined)?.method === 'POST',
+    )).toBe(false);
+  });
 
-    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
+  it('clears the converted draft and its assets after creation so a second submit cannot reuse them', async () => {
+    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
+      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
+      if (input === '/api/admin/meme-drafts/assets' && init?.method === 'POST') return Promise.resolve(json({ draftId: 'draft-converted' }));
+      if (input === '/api/admin/meme-drafts/draft-converted/assets') return Promise.resolve(json({ assets: [{ id: 'asset-1', mime_type: 'image/png' }] }));
+      if (input === '/api/admin/campaigns' && init?.method === 'POST') return Promise.resolve(json({ success: true }));
+      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
+      return Promise.resolve(json({}));
+    });
+    render(<AdminDashboardPage />);
 
+    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
+      target: { value: 'https://x.com/genieorb/status/123' },
+    });
+    const memeFile = new File(['meme'], 'meme.png', { type: 'image/png' });
+    fireEvent.change(screen.getByLabelText(/subir memes manuales/i), { target: { files: [memeFile] } });
+    await screen.findByText('image/png');
+
+    fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
     await waitFor(() => {
-      const previewCalls = fetchMock.mock.calls.filter(([url, callInit]) =>
-        String(url) === '/api/admin/campaigns/preview/memes' && (callInit as RequestInit | undefined)?.method === 'POST',
+      const request = fetchMock.mock.calls.find(([url, callInit]) =>
+        String(url) === '/api/admin/campaigns' && (callInit as RequestInit | undefined)?.method === 'POST',
       );
-      expect(previewCalls).toHaveLength(2);
-      expect(JSON.parse((previewCalls[1][1] as RequestInit).body as string)).toMatchObject({
-        draftId: 'draft-retry-1',
-      });
-    });
-  });
-
-  it('rechaza terminal parcial de dos memes con diagnostico y no lo renderiza', async () => {
-    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
-      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
-      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
-      if (input === '/api/admin/campaigns/preview/memes' && init?.method === 'POST') return Promise.resolve(json({ success: true, draftId: 'draft-partial', cycleId: 'cycle-partial' }));
-      if (input.includes('/api/admin/meme-drafts/draft-partial/status')) return Promise.resolve(json({
-        terminal: true, targetCount: 3, completedCount: 2, failedCount: 0, cancelledCount: 0, actualMemesCount: 2,
-        memes: [
-          { id: 'meme-1', url: 'local://one', plan: { slotIndex: 0 } },
-          { id: 'meme-2', url: 'local://two', plan: { slotIndex: 1 } },
-        ],
-      }));
-      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
-      return Promise.resolve(json({}));
-    });
-    render(<AdminDashboardPage />);
-    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
-    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
-
-    expect(await screen.findByText(/preview incompleta.*esperados=3.*recibidos=2/i)).toBeTruthy();
-    expect(screen.queryByRole('region', { name: /preview de memes generados/i })).toBeNull();
-    expect(screen.queryByAltText('Meme 1')).toBeNull();
-  });
-
-  it('renders all three memes from a terminal preview status', async () => {
-    const memeUrls = [
-      'https://cdn.example.test/memes/one.png',
-      'https://cdn.example.test/memes/two.png',
-      'https://cdn.example.test/memes/three.png',
-    ];
-
-    fetchMock.mockImplementation((input: string, init?: RequestInit) => {
-      if (input.includes('/api/admin/models')) return Promise.resolve(json({ models: [] }));
-      if (input.includes('/api/admin/image-models')) return Promise.resolve(json({ models: [{ key: 'image-ready', displayName: 'Image Ready', costPerImage: 0.01, configured: true, enabled: true }] }));
-      if (input === '/api/admin/campaigns/preview/memes' && init?.method === 'POST') return Promise.resolve(json({ success: true, draftId: 'draft-three', cycleId: 'cycle-three' }));
-      if (input === '/api/admin/meme-drafts/draft-three/status?cycleId=cycle-three') return Promise.resolve(json({
-        terminal: true,
-        targetCount: 3,
-        completedCount: 3,
-        failedCount: 0,
-        cancelledCount: 0,
-        actualMemesCount: 3,
-        memes: memeUrls.map((url, slotIndex) => ({ id: `meme-${slotIndex + 1}`, url, plan: { slotIndex } })),
-      }));
-      if (input.includes('/api/admin/campaigns')) return Promise.resolve(json({ items: [campaign], page: 1, total: 1, totalPages: 1 }));
-      return Promise.resolve(json({}));
+      expect(JSON.parse((request?.[1] as RequestInit).body as string)).toMatchObject({ draftId: 'draft-converted' });
     });
 
-    render(<AdminDashboardPage />);
-    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
-    await waitFor(() => expect((screen.getByLabelText(/modelo generador/i) as HTMLSelectElement).value).toBe('image-ready'));
-    fireEvent.click(screen.getByRole('button', { name: /generar 3 memes/i }));
-
-    const preview = await screen.findByRole('region', { name: /preview de memes generados/i });
-    expect(preview).toBeTruthy();
-    memeUrls.forEach((url, index) => expect(screen.getByAltText(`Meme ${index + 1}`).getAttribute('src')).toBe(url));
-
-    const previewCall = fetchMock.mock.calls.find(([url, callInit]) =>
-      String(url) === '/api/admin/campaigns/preview/memes' && (callInit as RequestInit | undefined)?.method === 'POST',
-    );
-    expect(previewCall).toBeTruthy();
-    expect(JSON.parse((previewCall?.[1] as RequestInit).body as string)).toMatchObject({
-      campaignType: 'manual',
-      urlsInput: 'https://x.com/genieorb/status/123',
-      memeModelKey: 'image-ready',
+    await waitFor(() => expect(screen.queryByText('image/png')).toBeNull());
+    fireEvent.change(screen.getByLabelText(/urls de los posts de x/i), {
+      target: { value: 'https://x.com/genieorb/status/456' },
     });
-    expect(fetchMock.mock.calls.some(([url, callInit]) =>
-      String(url) === '/api/admin/meme-drafts/draft-three/status?cycleId=cycle-three' && !(callInit as RequestInit | undefined)?.method,
-    )).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
+
+    expect(await screen.findByText(/sube al menos un meme antes de crear la campaña/i)).toBeTruthy();
+    expect(fetchMock.mock.calls.filter(([url, callInit]) =>
+      String(url) === '/api/admin/campaigns' && (callInit as RequestInit | undefined)?.method === 'POST',
+    )).toHaveLength(1);
   });
 
   describe('maxCommentsTotal optional field', () => {
@@ -514,6 +488,7 @@ describe('administration campaign cards', () => {
       });
       render(<AdminDashboardPage />);
 
+      fireEvent.click(await screen.findByLabelText(/habilitar sistema de memes/i));
       fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
         target: { value: 'https://x.com/genieorb/status/123' },
       });
@@ -537,6 +512,7 @@ describe('administration campaign cards', () => {
       });
       render(<AdminDashboardPage />);
 
+      fireEvent.click(await screen.findByLabelText(/habilitar sistema de memes/i));
       fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
         target: { value: 'https://x.com/genieorb/status/123' },
       });

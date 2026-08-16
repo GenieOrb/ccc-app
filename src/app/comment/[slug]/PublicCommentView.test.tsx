@@ -182,4 +182,34 @@ describe('PublicCommentView banner', () => {
 
     unmount();
   });
+
+  it('renders a meme assignment with download and only completes after Post', async () => {
+    const complete = vi.fn().mockResolvedValue(json({ status: 'success' }));
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(json({
+        status: 'success', type: 'meme', assignmentId: 'meme-assignment',
+        postUrl: 'https://x.com/user/status/1',
+        viewUrl: '/api/public/comment/test/assignment/meme-assignment/view',
+        downloadUrl: '/api/public/comment/test/assignment/meme-assignment/download',
+      }))
+      .mockImplementationOnce(complete));
+    const user = userEvent.setup();
+    render(<PublicCommentView slug="test" />);
+
+    expect(await screen.findByText(/tap “download” to save the image/i)).toBeTruthy();
+    expect(screen.getByRole('img', { name: 'Meme' }).getAttribute('src')).toContain('/view');
+    const download = screen.getByRole('link', { name: 'Download' });
+    expect(download.getAttribute('href')).toContain('/download');
+    expect(download.hasAttribute('download')).toBe(true);
+    expect((screen.getByRole('button', { name: 'Post' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(complete).not.toHaveBeenCalled();
+
+    await user.click(download);
+    const post = screen.getByRole('link', { name: 'Post' });
+    expect(complete).not.toHaveBeenCalled();
+    await user.click(post);
+    await waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(fetch).mock.calls[1][0]).toContain('/assignment/complete');
+    expect(JSON.parse((vi.mocked(fetch).mock.calls[1][1] as RequestInit).body as string)).toEqual({ assignmentId: 'meme-assignment' });
+  });
 });

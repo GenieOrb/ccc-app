@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { isAdminAuthenticated, validateSameOrigin } from '@/lib/auth';
-import { queryDb } from '@/lib/db';
-import { uploadMemeAsset, deleteBlob } from '@/lib/memes/blob';
+import { queryDb, withTransaction } from '@/lib/db';
+import { uploadMemeAsset, deleteBlobStrict } from '@/lib/memes/blob';
 import sharp from 'sharp';
 import crypto from 'crypto';
 
@@ -11,6 +11,15 @@ export const maxDuration = 60; // Max allowed for Vercel Hobby is 60 (for pro 30
 
 const MAX_SIZE_BYTES = 4 * 1024 * 1024; // 4MB
 const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+
+class DraftConflictError extends Error {}
+
+function boundedError(error: unknown): { name: string; message: string } {
+  if (error instanceof Error) {
+    return { name: error.name.slice(0, 80), message: error.message.slice(0, 240) };
+  }
+  return { name: 'UnknownError', message: String(error).slice(0, 240) };
+}
 
 export async function POST(req: Request) {
   const isAuth = await isAdminAuthenticated();
@@ -27,6 +36,7 @@ export async function POST(req: Request) {
     const formData = await req.formData();
     const file = formData.get('file') as File | null;
     let draftId = formData.get('draftId') as string | null;
+    let createdDraftId: string | null = null;
 
     if (!file) {
       return NextResponse.json({ error: 'No file provided' }, { status: 400 });
@@ -79,6 +89,7 @@ export async function POST(req: Request) {
         `INSERT INTO meme_drafts (status, config, inputs_digest, expires_at) VALUES ('active', '{}'::jsonb, '', NOW() + INTERVAL '2 hours') RETURNING id`
       );
       draftId = draftRes[0].id;
+      createdDraftId = draftId;
     }
 
     // Upload to Vercel Blob
@@ -89,35 +100,60 @@ export async function POST(req: Request) {
     try {
       blobResult = await uploadMemeAsset(processedBuffer, filename, 'image/png');
     } catch (e: unknown) {
-      console.error('Blob upload error', e);
-      return NextResponse.json({ error: 'Fallo al subir a almacenamiento privado' }, { status: 500 });
+      console.error('Blob upload failed', boundedError(e));
+      let cleanupPending = false;
+      if (createdDraftId) {
+        try {
+          await queryDb(
+            `DELETE FROM meme_drafts AS draft
+             WHERE draft.id = $1
+               AND NOT EXISTS (SELECT 1 FROM meme_assets AS asset WHERE asset.draft_id = draft.id)`,
+            [createdDraftId]
+          );
+        } catch (cleanupError) {
+          cleanupPending = true;
+          console.error('Draft cleanup failed', boundedError(cleanupError));
+        }
+      }
+      return NextResponse.json({ error: 'Fallo al subir a almacenamiento privado', cleanupPending }, { status: 500 });
     }
 
-    const finalMetadata = await sharp(processedBuffer).metadata();
-
     try {
-      // Insert into DB
-      const assetRes = await queryDb<{ id: string }>(
-        `INSERT INTO meme_assets (
-          draft_id, asset_type, appearance_percentage, instruction, 
-          storage_provider, storage_key, storage_url, mime_type, 
-          size_bytes, width, height, sha256_hash, status
-        ) VALUES (
-          $1, 'other', 10, '', 'vercel-blob', $2, $3, 'image/png', $4, $5, $6, $7, 'active'
-        ) RETURNING id`,
-        [
-          draftId,
-          blobResult.pathname,
-          blobResult.url,
-          finalSize,
-          finalMetadata.width,
-          finalMetadata.height,
-          sha256
-        ]
-      );
+      const finalMetadata = await sharp(processedBuffer).metadata();
+      const asset = await withTransaction(async (client) => {
+        const draftRes = await client.query<{ id: string }>(
+          `SELECT id FROM meme_drafts
+           WHERE id = $1 AND status = 'active' AND expires_at > NOW()
+           FOR UPDATE`,
+          [draftId]
+        );
+        if (draftRes.rows.length !== 1) {
+          throw new DraftConflictError('Draft is no longer active');
+        }
+
+        const assetRes = await client.query<{ id: string }>(
+          `INSERT INTO meme_assets (
+            draft_id, asset_type, appearance_percentage, instruction,
+            storage_provider, storage_key, storage_url, mime_type,
+            size_bytes, width, height, sha256_hash, status
+          ) VALUES (
+            $1, 'other', 10, '', 'vercel-blob', $2, $3, 'image/png', $4, $5, $6, $7, 'active'
+          ) RETURNING id`,
+          [
+            draftId,
+            blobResult.pathname,
+            blobResult.url,
+            finalSize,
+            finalMetadata.width,
+            finalMetadata.height,
+            sha256
+          ]
+        );
+        return assetRes.rows[0];
+      });
       
       return NextResponse.json({
-        assetId: assetRes[0].id,
+        assetId: asset.id,
         draftId,
         assetType: 'other',
         appearancePercentage: 10,
@@ -126,17 +162,25 @@ export async function POST(req: Request) {
         sizeBytes: finalSize,
         width: finalMetadata.width,
         height: finalMetadata.height,
-        viewUrl: `/api/admin/meme-drafts/${draftId}/assets/${assetRes[0].id}/view`
+        viewUrl: `/api/admin/meme-drafts/${draftId}/assets/${asset.id}/view`
       });
     } catch (e: unknown) {
-      // Rollback Blob upload on DB failure
-      await deleteBlob(blobResult.pathname);
-      console.error('DB insert error', e);
-      return NextResponse.json({ error: 'Fallo de persistencia al guardar metadatos' }, { status: 500 });
+      let cleanupPending = false;
+      try {
+        await deleteBlobStrict(blobResult.pathname);
+      } catch (deleteError) {
+        cleanupPending = true;
+        console.error('Blob cleanup failed', boundedError(deleteError));
+      }
+      if (e instanceof DraftConflictError) {
+        return NextResponse.json({ error: 'El borrador ya no está activo o ha caducado.', cleanupPending }, { status: 409 });
+      }
+      console.error('DB insert failed', boundedError(e));
+      return NextResponse.json({ error: 'Fallo de persistencia al guardar metadatos', cleanupPending }, { status: 500 });
     }
 
   } catch (error: unknown) {
-    console.error('Asset upload error:', error);
+    console.error('Asset upload failed', boundedError(error));
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
   }
 }

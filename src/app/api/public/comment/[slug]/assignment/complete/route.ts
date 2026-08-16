@@ -152,7 +152,7 @@ export async function POST(
     }
 
     if (result.campaignId) {
-      triggerReplenishmentIfNeeded(result.campaignId).catch(() => undefined);
+      await triggerReplenishmentIfNeeded(result.campaignId).catch(() => undefined);
     }
 
     return NextResponse.json(

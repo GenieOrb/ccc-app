@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 
 export interface CampaignSummary {
@@ -90,6 +90,7 @@ function CampaignCardItem({
   c,
   fetchCampaigns,
   handleToggleStatus,
+  handleCancelCampaign,
   handleRetryGeneration,
   handleCopyUrl,
   copiedId,
@@ -98,6 +99,7 @@ function CampaignCardItem({
   c: CampaignSummary;
   fetchCampaigns: () => Promise<void>;
   handleToggleStatus: (id: string, currentStatus: boolean) => Promise<boolean>;
+  handleCancelCampaign: (id: string) => Promise<boolean>;
   handleRetryGeneration: (id: string) => Promise<void>;
   handleCopyUrl: (url: string, id: string) => void;
   copiedId: string | null;
@@ -105,6 +107,7 @@ function CampaignCardItem({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [togglingStatus, setTogglingStatus] = useState(false);
+  const [cancellingCampaign, setCancellingCampaign] = useState(false);
   const [showComments, setShowComments] = useState(false);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
@@ -147,6 +150,16 @@ function CampaignCardItem({
       await handleToggleStatus(c.id, c.isActive);
     } finally {
       setTogglingStatus(false);
+    }
+  };
+
+  const handleCancel = async () => {
+    if (cancellingCampaign || !confirm('¿Cancelar esta campaña de forma irreversible? Esta acción no se puede deshacer.')) return;
+    setCancellingCampaign(true);
+    try {
+      await handleCancelCampaign(c.id);
+    } finally {
+      setCancellingCampaign(false);
     }
   };
 
@@ -537,6 +550,14 @@ function CampaignCardItem({
         >
           {togglingStatus ? 'Guardando...' : c.isActive ? 'Desactivar' : 'Activar'}
         </button>
+        <button
+          type="button"
+          onClick={() => void handleCancel()}
+          className="btn-admin btn-danger"
+          disabled={cancellingCampaign}
+        >
+          {cancellingCampaign ? 'Cancelando...' : 'Cancelar campaña'}
+        </button>
 
         {(c.failedJobsCount > 0 || c.hasUnresolvedFailedCycle) && (
           <button
@@ -642,7 +663,6 @@ function CampaignCardItem({
 }
 
 export default function AdminDashboardPage() {
-  const abortControllerRef = useRef<AbortController | null>(null);
   const [campaigns, setCampaigns] = useState<CampaignSummary[]>([]);
   const [campaignPage, setCampaignPage] = useState(1);
   const [totalCampaigns, setTotalCampaigns] = useState(0);
@@ -656,37 +676,8 @@ export default function AdminDashboardPage() {
   const [displayName, setDisplayName] = useState('');
   const [modelKey, setModelKey] = useState('deepseek-v4-flash');
   const [models, setModels] = useState<Array<{key:string;displayName:string;inputPricePerMillion:number;outputPricePerMillion:number;configured:boolean;enabled:boolean}>>([]);
-  type ImageModel = { key: string; displayName: string; costPerImage: number; configured: boolean; enabled: boolean };
-  type ImageModelCatalog =
-    | { status: 'loading' }
-    | { status: 'ready'; models: ImageModel[] }
-    | { status: 'error'; message: string };
-  const [imageModelCatalog, setImageModelCatalog] = useState<ImageModelCatalog>({ status: 'loading' });
-
   useEffect(() => {
     fetch('/api/admin/models').then(r => r.ok ? r.json() : null).then(data => { if (data?.models) setModels(data.models); }).catch(() => {});
-    let disposed = false;
-    void (async () => {
-      try {
-        const response = await fetch('/api/admin/image-models');
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        if (!Array.isArray(data?.models)) throw new Error('payload inválido');
-        const imageModels = data.models as ImageModel[];
-        const available = imageModels.filter((model) => model.enabled && model.configured);
-        if (disposed) return;
-        setImageModelCatalog({ status: 'ready', models: imageModels });
-        setMemeModelKey((previous) => {
-          if (previous && available.some((model) => model.key === previous)) return previous;
-          const defaultKey = 'gemini-3.1-flash-image';
-          if (available.some((model) => model.key === defaultKey)) return defaultKey;
-          return available[0]?.key || '';
-        });
-      } catch {
-        if (!disposed) setImageModelCatalog({ status: 'error', message: 'No se pudo cargar el catálogo de modelos de imagen.' });
-      }
-    })();
-    return () => { disposed = true; };
   }, []);
 
   const [urlsInput, setUrlsInput] = useState('');
@@ -696,14 +687,7 @@ export default function AdminDashboardPage() {
   const [direction, setDirection] = useState('');
 
   const [includeMemes, setIncludeMemes] = useState(true);
-  const [memePercentage, setMemePercentage] = useState('25');
-  const [memeModelKey, setMemeModelKey] = useState('');
-  const imageModels = imageModelCatalog.status === 'ready' ? imageModelCatalog.models : [];
-  const availableImageModels = imageModels.filter((model) => model.enabled && model.configured);
-  const hasSelectedImageModel = availableImageModels.some((model) => model.key === memeModelKey);
-  const memePreconditionMissing = includeMemes && (imageModelCatalog.status !== 'ready' || !hasSelectedImageModel);
-
-
+  const [memeEveryComments, setMemeEveryComments] = useState('4');
   const [draftId, setDraftId] = useState<string | null>(null);
   const [memeAssets, setMemeAssets] = useState<Array<{
     id: string;
@@ -715,6 +699,8 @@ export default function AdminDashboardPage() {
     size_bytes: number;
   }>>([]);
   const [uploadingAsset, setUploadingAsset] = useState(false);
+  const [assetUploadProgress, setAssetUploadProgress] = useState<string | null>(null);
+  const [assetUploadError, setAssetUploadError] = useState<string | null>(null);
 
   const [creating, setCreating] = useState(false);
   const [generatingPreview, setGeneratingPreview] = useState(false);
@@ -724,79 +710,58 @@ export default function AdminDashboardPage() {
   const [brandVariants, setBrandVariants] = useState<Array<{value: string, percentage: number}>>([]);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (memeAssets.length >= 10) {
-      alert('Máximo 10 assets permitidos.');
-      return;
-    }
-    
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
     setUploadingAsset(true);
-    const formData = new FormData();
-    formData.append('file', file);
-    if (draftId) formData.append('draftId', draftId);
-
-    try {
-      const res = await fetch('/api/admin/meme-drafts/assets', {
-        method: 'POST',
-        body: formData
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Error subiendo asset');
-      
-      if (!draftId && data.draftId) {
-        setDraftId(data.draftId);
+    setAssetUploadError(null);
+    let activeDraftId = draftId;
+    const errors: string[] = [];
+    for (const [index, file] of files.entries()) {
+      setAssetUploadProgress(`Subiendo ${index + 1} de ${files.length}: ${file.name}`);
+      const formData = new FormData();
+      formData.append('file', file);
+      if (activeDraftId) formData.append('draftId', activeDraftId);
+      try {
+        const res = await fetch('/api/admin/meme-drafts/assets', { method: 'POST', body: formData });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `Error subiendo ${file.name}`);
+        if (typeof data.draftId === 'string' && data.draftId) {
+          activeDraftId = data.draftId;
+          setDraftId(activeDraftId);
+        }
+      } catch (error: unknown) {
+        errors.push(error instanceof Error ? error.message : `Error subiendo ${file.name}`);
       }
-      
-      // Recargar assets
-      const draftToFetch = draftId || data.draftId;
-      const listRes = await fetch(`/api/admin/meme-drafts/${draftToFetch}/assets`);
-      const listData = await listRes.json();
-      if (listRes.ok) setMemeAssets(listData.assets);
-      
-    } catch (error: unknown) {
-      alert(error instanceof Error ? error.message : 'Error subiendo asset');
-    } finally {
-      setUploadingAsset(false);
-      e.target.value = ''; // reset input
     }
-  };
-
-  const handleUpdateAssetLocal = (assetId: string, field: 'asset_type'|'appearance_percentage'|'instruction', val: string|number) => {
-    const updated = memeAssets.map(a => a.id === assetId ? { ...a, [field]: val } : a);
-    setMemeAssets(updated);
-  };
-
-  const handleSaveAsset = async (assetId: string) => {
-    try {
-      const asset = memeAssets.find(a => a.id === assetId);
-      if (!asset) return;
-      const sum = memeAssets.reduce((s, a) => s + (Number(a.appearance_percentage) || 0), 0);
-      if (sum > 100) {
-         // Silently ignore or show local alert, don't ping backend if sum > 100
-         return;
+    if (activeDraftId) {
+      try {
+        const listRes = await fetch(`/api/admin/meme-drafts/${activeDraftId}/assets`);
+        const listData = await listRes.json();
+        if (!listRes.ok) throw new Error(listData.error || 'No se pudieron cargar los memes subidos.');
+        setMemeAssets(listData.assets);
+      } catch (error: unknown) {
+        errors.push(error instanceof Error ? error.message : 'No se pudieron cargar los memes subidos.');
       }
-      const res = await fetch(`/api/admin/meme-drafts/${draftId}/assets/${assetId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ assetType: asset.asset_type, percentage: Number(asset.appearance_percentage) || 0, instruction: asset.instruction })
-      });
-      if (!res.ok) {
-        const d = await res.json();
-        console.error(d.error || 'Error guardando asset');
-      }
-    } catch (e) {
-      console.error(e);
     }
+    if (errors.length > 0) {
+      setAssetUploadError(errors.join(' '));
+    }
+    setUploadingAsset(false);
+    setAssetUploadProgress(null);
+    e.target.value = '';
   };
 
   const handleDeleteAsset = async (assetId: string) => {
     if (!confirm('¿Borrar este asset?')) return;
     try {
-      await fetch(`/api/admin/meme-drafts/${draftId}/assets/${assetId}`, { method: 'DELETE' });
+      const res = await fetch(`/api/admin/meme-drafts/${draftId}/assets/${assetId}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || 'No se pudo eliminar el meme.');
+      }
       setMemeAssets(memeAssets.filter(a => a.id !== assetId));
-    } catch (e) {
-      console.error(e);
+    } catch (error: unknown) {
+      setAssetUploadError(error instanceof Error ? error.message : 'No se pudo eliminar el meme.');
     }
   };
 
@@ -869,7 +834,6 @@ export default function AdminDashboardPage() {
     router.refresh();
   }
 
-  const [createdMemePreview, setCreatedMemePreview] = useState<Array<{imageBlobUrl: string; prompt: string; dimensions: {subjectType: string, visualStyle: string, tone: string}}> | null>(null);
 
   async function generatePreview(e: React.MouseEvent) {
     e.preventDefault();
@@ -881,7 +845,6 @@ export default function AdminDashboardPage() {
     setPreviewFormError(null);
     setGeneratingPreview(true);
     setCreatedPreview(null);
-    setCreatedMemePreview(null);
 
     try {
       const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, displayName, modelKey };
@@ -930,190 +893,29 @@ export default function AdminDashboardPage() {
     }
   }
 
-  async function generateMemePreview(e: React.MouseEvent) {
-    e.preventDefault();
-    e.stopPropagation();
-
-    if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
-    if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
-    if (imageModelCatalog.status !== 'ready' || !hasSelectedImageModel) return;
-
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-    const abortController = new AbortController();
-    abortControllerRef.current = abortController;
-    const signal = abortController.signal;
-
-    setPreviewFormError(null);
-    setGeneratingPreview(true);
-    setCreatedPreview(null);
-    setCreatedMemePreview(null);
-
-    try {
-      const payload: Record<string, unknown> = { campaignType: campaignTypeToCreate, direction, memeModelKey, draftId };
-      if (campaignTypeToCreate === 'manual') {
-        payload.urlsInput = urlsInput;
-      } else {
-        payload.accountsInput = accountsInput;
-      }
-
-      if (brandVariants.length > 0) {
-        payload.brandVariants = brandVariants.map(bv => ({ value: bv.value.trim(), percentage: bv.percentage })).filter(bv => bv.value);
-      }
-
-      const previewResponse = await fetch(`/api/admin/campaigns/preview/memes`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal
-      });
-
-      if (previewResponse.status === 504) {
-        throw new Error('La preview de memes tardó demasiado. Vuelve a intentarlo.');
-      }
-
-      const contentType = previewResponse.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        await previewResponse.text();
-        throw new Error(`Respuesta inesperada (HTTP ${previewResponse.status}).`);
-      }
-
-      const previewData = await previewResponse.json();
-      if (
-        previewData.retryable === true &&
-        typeof previewData.draftId === 'string' &&
-        previewData.draftId.trim() &&
-        typeof previewData.cycleId === 'string' &&
-        previewData.cycleId.trim()
-      ) {
-        setDraftId(previewData.draftId);
-      }
-      if (!previewResponse.ok) throw new Error(previewData.error || `Error HTTP ${previewResponse.status}.`);
-
-      if (!previewData.draftId || !previewData.cycleId) {
-        throw new Error('No se recibió el draftId o cycleId para la preview de memes.');
-      }
-      
-      const newDraftId = previewData.draftId;
-      const newCycleId = previewData.cycleId;
-      setDraftId(newDraftId);
-      
-      // Polling
-      let totalTime = 0;
-      let lastCompletedCount = 0;
-      let inactivityTime = 0;
-      const POLLING_INTERVAL = 2000;
-      const MAX_TOTAL_TIME = 300_000; // 5 minutos
-      const MAX_INACTIVITY_TIME = 90_000; // 90 segundos sin progreso
-      let finalMemes = null;
-      let terminalState = false;
-
-      while (totalTime < MAX_TOTAL_TIME) {
-        if (signal.aborted) throw new Error('Preview de memes cancelada por el usuario.');
-
-        const statusRes = await fetch(`/api/admin/meme-drafts/${newDraftId}/status?cycleId=${newCycleId}`, { signal });
-        if (!statusRes.ok) {
-          let serverErr = '';
-          try {
-            const errJson = await statusRes.json();
-            serverErr = errJson.error || '';
-          } catch {
-            // non-json response
-          }
-          throw new Error(serverErr || `Error HTTP ${statusRes.status} al consultar estado de preview.`);
-        }
-        const statusData = await statusRes.json();
-        
-        const completedJobsCount = statusData.completedCount + statusData.failedCount + statusData.cancelledCount;
-        const actualMemesCount = statusData.actualMemesCount || 0;
-
-        if (completedJobsCount > lastCompletedCount) {
-          lastCompletedCount = completedJobsCount;
-          inactivityTime = 0;
-        } else {
-          inactivityTime += POLLING_INTERVAL;
-        }
-
-        if (statusData.terminal || actualMemesCount === 3 || (statusData.targetCount > 0 && completedJobsCount >= statusData.targetCount)) {
-          finalMemes = statusData.memes || [];
-          terminalState = true;
-          
-          if (finalMemes.length < 3 && statusData.failedCount > 0) {
-             const errors = (statusData.jobs || []).filter((j: { error_message?: string | null }) => j.error_message).map((j: { error_message?: string | null }) => j.error_message);
-             if (errors.length > 0) {
-                throw new Error(`Fallo terminal: ${errors.join(' | ')}`);
-             }
-             if (statusData.errorMessage) {
-                throw new Error(`Fallo terminal: ${statusData.errorMessage}`);
-             }
-          }
-          break;
-        }
-
-        if (inactivityTime >= MAX_INACTIVITY_TIME) {
-          throw new Error('La generación no ha arrancado o se ha estancado. Vuelve a intentarlo.');
-        }
-        
-        await new Promise(r => {
-          const timeout = setTimeout(r, POLLING_INTERVAL);
-          signal.addEventListener('abort', () => {
-             clearTimeout(timeout);
-             r(null);
-          });
-        });
-        totalTime += POLLING_INTERVAL;
-      }
-
-      if (signal.aborted) throw new Error('Preview de memes cancelada por el usuario.');
-
-      if (!terminalState && !finalMemes) {
-        throw new Error('La preview de memes superó el tiempo de espera máximo (5 minutos).');
-      }
-      
-      if (!finalMemes || finalMemes.length !== 3) {
-        const receivedCount = Array.isArray(finalMemes) ? finalMemes.length : 0;
-        throw new Error(`Preview incompleta: esperados=3, recibidos=${receivedCount}. La respuesta terminal no se renderizará parcialmente.`);
-      }
-
-      if (finalMemes && finalMemes.length === 0) {
-        throw new Error('La generación finalizó pero no produjo imágenes válidas.');
-      }
-
-      // Map to the expected format for the UI
-      const mappedMemes = finalMemes.map((m: { url: string, id: string, plan: { slotIndex: number, [key: string]: unknown } }) => ({
-        imageBlobUrl: m.url,
-        prompt: `Generado mediante job: ${m.id}`,
-        slotIndex: m.plan.slotIndex,
-        dimensions: m.plan
-      }));
-
-      setCreatedMemePreview(mappedMemes);
-    } catch (previewError: unknown) {
-      if (abortControllerRef.current?.signal.aborted || (previewError instanceof Error && previewError.name === 'AbortError')) {
-         console.log('Preview fetch aborted');
-         return; // Don't show error if aborted on purpose
-      }
-      setPreviewFormError(previewError instanceof Error ? previewError.message : 'No se pudo generar el preview de memes.');
-      setCreatedMemePreview(null);
-    } finally {
-      if (abortControllerRef.current === abortController) {
-        setGeneratingPreview(false);
-      }
-    }
-  }
-
   async function handleCreateCampaign(creationMode: 'active' | 'inactive') {
     if (campaignTypeToCreate === 'manual' && !urlsInput.trim()) return;
     if (campaignTypeToCreate === 'perpetual' && !accountsInput.trim()) return;
-    if (memePreconditionMissing) return;
     const parsedDuration = Number(postActiveLifetimeHours);
     if (campaignTypeToCreate === 'perpetual' && (!Number.isInteger(parsedDuration) || parsedDuration < 1 || parsedDuration > 720)) return;
-
     setError(null);
     setCreating(true);
 
     try {
+      const trimmedMax = maxCommentsTotalInput.trim();
+      if (trimmedMax !== '') {
+        const parsedMaxTotal = Number(trimmedMax);
+        if (!Number.isInteger(parsedMaxTotal) || parsedMaxTotal < 1 || parsedMaxTotal > 1000000) {
+          setError('El máximo de comentarios debe ser un entero entre 1 y 1.000.000.');
+          setCreating(false);
+          return;
+        }
+      }
+      if (includeMemes && (!draftId || memeAssets.length === 0)) {
+        setError('Sube al menos un meme antes de crear la campaña.');
+        setCreating(false);
+        return;
+      }
       const payload: Record<string, unknown> = {
         campaignType: campaignTypeToCreate,
         direction,
@@ -1123,19 +925,12 @@ export default function AdminDashboardPage() {
         includeMemes,
       };
       if (includeMemes) {
-        payload.memePercentage = Number(memePercentage);
-        payload.memeModelKey = memeModelKey;
+        payload.memeEveryComments = Number(memeEveryComments);
         payload.draftId = draftId;
       }
 
-      const trimmedMax = maxCommentsTotalInput.trim();
       if (trimmedMax !== '') {
         const parsedMaxTotal = Number(trimmedMax);
-        if (!Number.isInteger(parsedMaxTotal) || parsedMaxTotal < 1 || parsedMaxTotal > 1000000) {
-          setError('El máximo de comentarios debe ser un entero entre 1 y 1.000.000.');
-          setCreating(false);
-          return;
-        }
         payload.maxCommentsTotal = parsedMaxTotal;
       }
 
@@ -1168,6 +963,10 @@ export default function AdminDashboardPage() {
       setAccountsInput('');
       setDirection('');
       setMaxCommentsTotalInput('');
+      setDraftId(null);
+      setMemeAssets([]);
+      setAssetUploadError(null);
+      setAssetUploadProgress(null);
       await fetchCampaigns(1);
 
       if (creationMode === 'inactive') {
@@ -1225,6 +1024,23 @@ export default function AdminDashboardPage() {
       await fetchCampaigns();
     } catch {
       setError('Error al solicitar reintento de generación.');
+    }
+  }
+
+  async function handleCancelCampaign(campaignId: string) {
+    setError(null);
+    try {
+      const res = await fetch(`/api/admin/campaigns/${campaignId}/cancel`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || 'No se pudo cancelar la campaña.');
+        return false;
+      }
+      await fetchCampaigns();
+      return true;
+    } catch {
+      setError('Error de red al cancelar la campaña.');
+      return false;
     }
   }
 
@@ -1367,108 +1183,6 @@ export default function AdminDashboardPage() {
               </p>
             </div>
 
-            <div className="form-group" style={{ padding: '16px', background: 'var(--surface-sunken)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
-                <input type="checkbox" id="include-memes" checked={includeMemes} onChange={(e) => setIncludeMemes(e.target.checked)} disabled={creating} />
-                <label htmlFor="include-memes" className="form-label" style={{ marginBottom: 0, fontWeight: 'bold' }}>Habilitar Sistema de Memes Multimodal</label>
-              </div>
-
-              {includeMemes && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                  <div>
-                    <label className="form-label">Porcentaje de Memes (%)</label>
-                    <input type="number" min="0" max="100" className="form-textarea" style={{ minHeight: 'auto', padding: '8px' }} value={memePercentage} onChange={(e) => setMemePercentage(e.target.value)} disabled={creating} />
-                  </div>
-                  <div>
-                    <label htmlFor="meme-image-model" className="form-label">Modelo Generador de Imágenes</label>
-                    <select id="meme-image-model" className="form-textarea" style={{ minHeight: 'auto', padding: '8px' }} value={memeModelKey} onChange={(e) => setMemeModelKey(e.target.value)} disabled={creating || imageModelCatalog.status !== 'ready' || availableImageModels.length === 0}>
-                      {imageModelCatalog.status === 'loading' ? (
-                        <option value="">Cargando modelos de imagen…</option>
-                      ) : imageModelCatalog.status === 'error' ? (
-                        <option value="">No se pudo cargar el catálogo de imágenes</option>
-                      ) : availableImageModels.length === 0 ? (
-                        <option value="">No hay modelos de imagen configurados</option>
-                      ) : availableImageModels.map(model => (
-                        <option key={model.key} value={model.key}>
-                          {model.displayName} — Base Cost ${model.costPerImage}
-                        </option>
-                      ))}
-                    </select>
-                    {imageModelCatalog.status === 'loading' && <p role="status" style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: 4 }}>Cargando catálogo de modelos de imagen…</p>}
-                    {imageModelCatalog.status === 'error' && <p role="alert" style={{ fontSize: '0.8rem', color: 'var(--color-danger)', marginTop: 4 }}>{imageModelCatalog.message}</p>}
-
-                  </div>
-                  
-                  <div style={{ marginTop: '16px', borderTop: '1px solid var(--border-color)', paddingTop: '16px' }}>
-                    <label className="form-label" style={{ fontWeight: 'bold' }}>Material visual para los memes (opcional)</label>
-                    <p style={{ fontSize: '0.85em', color: 'var(--text-secondary)', marginBottom: '12px' }}>
-                      Sube logos, mascotas, productos u otras referencias (máximo 10).
-                    </p>
-                    
-                    {memeAssets.length > 0 && (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '12px' }}>
-                        {memeAssets.map(asset => (
-                          <div key={asset.id} style={{ display: 'flex', gap: '12px', padding: '12px', background: 'var(--bg-color)', borderRadius: '6px', border: '1px solid var(--border-color)' }}>
-                            <img src={`/api/admin/meme-drafts/${draftId}/assets/${asset.id}/view`} alt="Asset" style={{ width: '80px', height: '80px', objectFit: 'cover', borderRadius: '4px' }} />
-                            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                              <div style={{ display: 'flex', gap: '8px' }}>
-                                <select 
-                                  className="form-textarea" style={{ minHeight: 'auto', padding: '4px', flex: 1 }}
-                                  value={asset.asset_type}
-                                  onChange={e => handleUpdateAssetLocal(asset.id, 'asset_type', e.target.value)}
-                                  onBlur={() => handleSaveAsset(asset.id)}
-                                  disabled={creating}
-                                >
-                                  <option value="logo">Logo</option>
-                                  <option value="mascot">Mascota</option>
-                                  <option value="product">Producto</option>
-                                  <option value="fictional_character">Personaje</option>
-                                  <option value="object">Objeto</option>
-                                  <option value="other">Otro</option>
-                                </select>
-                                <input 
-                                  type="number" min="1" max="100" 
-                                  className="form-textarea" style={{ width: '80px', minHeight: 'auto', padding: '4px' }}
-                                  value={asset.appearance_percentage === '' as unknown as number ? '' : asset.appearance_percentage}
-                                  onChange={e => handleUpdateAssetLocal(asset.id, 'appearance_percentage', e.target.value === '' ? ('' as unknown as number) : parseInt(e.target.value) || 0)}
-                                  onBlur={() => handleSaveAsset(asset.id)}
-                                  disabled={creating}
-                                  title="Porcentaje de aparición"
-                                />
-                                <button type="button" onClick={() => handleDeleteAsset(asset.id)} disabled={creating} className="btn-admin btn-danger" style={{ padding: '4px 8px' }}>X</button>
-                              </div>
-                              <input 
-                                type="text"
-                                className="form-textarea" style={{ minHeight: 'auto', padding: '4px' }}
-                                placeholder="Instrucciones para la IA (ej. No deformar el logo)"
-                                value={asset.instruction}
-                                onChange={e => handleUpdateAssetLocal(asset.id, 'instruction', e.target.value)}
-                                onBlur={() => handleSaveAsset(asset.id)}
-                                disabled={creating}
-                              />
-                            </div>
-                          </div>
-                        ))}
-                        {memeAssets.reduce((sum, a) => sum + a.appearance_percentage, 0) > 100 && (
-                          <div style={{ color: 'red', fontSize: '0.85em', fontWeight: 'bold' }}>Error: La suma de porcentajes no puede superar el 100%</div>
-                        )}
-                      </div>
-                    )}
-                    
-                    <input 
-                      type="file" 
-                      accept="image/png, image/jpeg, image/webp"
-                      onChange={handleFileUpload} 
-                      disabled={uploadingAsset || creating || memeAssets.length >= 10} 
-                      className="form-textarea"
-                      style={{ padding: '8px', minHeight: 'auto' }}
-                    />
-                    {uploadingAsset && <span style={{ fontSize: '0.85em', marginLeft: '8px' }}>Subiendo...</span>}
-                  </div>
-                </div>
-              )}
-            </div>
-
             <div className="form-group">
               <label htmlFor="direction-input" className="form-label">
                 Dirección de los comentarios (opcional)
@@ -1498,11 +1212,55 @@ export default function AdminDashboardPage() {
               </div>
             </div>
 
+            <div className="form-group" style={{ padding: '16px', background: 'var(--surface-sunken)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+                <input type="checkbox" id="include-memes" checked={includeMemes} onChange={(e) => setIncludeMemes(e.target.checked)} disabled={creating} />
+                <label htmlFor="include-memes" className="form-label" style={{ marginBottom: 0, fontWeight: 'bold' }}>Habilitar Sistema de Memes Multimodal</label>
+              </div>
+
+              {includeMemes && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  <div>
+                    <label htmlFor="meme-every-comments" className="form-label">Meme cada X comentarios</label>
+                    <input id="meme-every-comments" type="number" min="1" step="1" className="form-textarea" style={{ minHeight: 'auto', padding: '8px' }} value={memeEveryComments} onChange={(e) => setMemeEveryComments(e.target.value)} disabled={creating} />
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {includeMemes && (
+              <div className="form-group">
+                <label htmlFor="meme-files" className="form-label">Subir memes manuales (opcional)</label>
+                <input
+                  id="meme-files"
+                  type="file"
+                  multiple
+                  accept="image/png, image/jpeg, image/webp"
+                  onChange={handleFileUpload}
+                  disabled={uploadingAsset || creating}
+                  className="form-textarea"
+                  style={{ padding: '8px', minHeight: 'auto' }}
+                />
+                {assetUploadProgress && <p role="status">{assetUploadProgress}</p>}
+                {assetUploadError && <p role="alert">{assetUploadError}</p>}
+                {memeAssets.length > 0 && (
+                  <ul>
+                    {memeAssets.map((asset) => (
+                      <li key={asset.id}>
+                        {asset.mime_type}
+                        <button type="button" onClick={() => void handleDeleteAsset(asset.id)} disabled={creating}>Eliminar meme</button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+
             <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
               <button
                 type="submit"
                 className="btn-admin btn-primary"
-                disabled={creating || generatingPreview || memePreconditionMissing || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
+                disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
               >
                 {creating ? 'Creando campaña...' : 'Crear Campaña'}
               </button>
@@ -1510,7 +1268,7 @@ export default function AdminDashboardPage() {
                 type="button"
                 onClick={() => handleCreateCampaign('inactive')}
                 className="btn-admin btn-secondary"
-                disabled={creating || generatingPreview || memePreconditionMissing || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
+                disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
               >
                 {creating ? 'Guardando...' : 'Guardar'}
               </button>
@@ -1522,16 +1280,6 @@ export default function AdminDashboardPage() {
               >
                 {generatingPreview ? 'Generando preview...' : 'Generar preview de comentarios'}
               </button>
-              {includeMemes && (
-                <button
-                  type="button"
-                  className="btn-admin btn-secondary"
-                  disabled={creating || generatingPreview || !hasSelectedImageModel || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
-                  onClick={generateMemePreview}
-                >
-                  {generatingPreview ? 'Generando preview...' : 'Generar 3 memes'}
-                </button>
-              )}
             </div>
             {previewFormError && (
               <div style={{ marginTop: '16px', color: 'var(--error-color)' }}>
@@ -1544,26 +1292,6 @@ export default function AdminDashboardPage() {
                 <ol style={{ whiteSpace: 'pre-wrap', listStyleType: 'decimal', paddingLeft: '20px' }}>
                   {createdPreview.map((comment, index) => <li key={index} style={{ marginBottom: '12px' }}>{comment}</li>)}
                 </ol>
-              </section>
-            )}
-            {createdMemePreview && (
-              <section aria-label="Preview de memes generados" style={{ marginTop: '16px' }}>
-                <strong>Preview de memes</strong>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: '16px', marginTop: '12px' }}>
-                  {createdMemePreview.map((meme, index) => (
-                    <div key={index} style={{ border: '1px solid var(--border-color)', borderRadius: '8px', overflow: 'hidden' }}>
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src={meme.imageBlobUrl} alt={`Meme ${index + 1}`} style={{ width: '100%', height: 'auto', display: 'block' }} />
-                      <div style={{ padding: '12px', fontSize: '0.8rem', background: 'var(--surface-sunken)' }}>
-                        <p style={{ margin: '0 0 8px 0', fontWeight: 'bold' }}>Prompt:</p>
-                        <p style={{ margin: 0, color: 'var(--text-muted)' }}>{meme.prompt}</p>
-                        <div style={{ marginTop: '8px', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                          <em>Dimensiones: {meme.dimensions.subjectType} / {meme.dimensions.visualStyle} / {meme.dimensions.tone}</em>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
               </section>
             )}
           </form>
@@ -1589,6 +1317,7 @@ export default function AdminDashboardPage() {
                   c={c}
                   fetchCampaigns={fetchCampaigns}
                   handleToggleStatus={handleToggleStatus}
+                  handleCancelCampaign={handleCancelCampaign}
                   handleRetryGeneration={handleRetryGeneration}
                   handleCopyUrl={handleCopyUrl}
                   copiedId={copiedId}

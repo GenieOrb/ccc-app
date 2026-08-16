@@ -123,6 +123,11 @@ export async function processMemeBackgroundQueue(
   let totalCost = 0;
   let boundedErrors = 0;
 
+  const expiredDraftCycleIds = await cancelExpiredDraftMemeJobs(cycleId);
+  for (const expiredDraftCycleId of expiredDraftCycleIds) {
+    await recalculateMemeCycleStatus(expiredDraftCycleId);
+  }
+
   while (hasSafeJobBudget() && (maxJobs === undefined || totalProcessed < maxJobs)) {
     const claimedJobs: MemeClaimedJob[] = [];
 
@@ -181,6 +186,30 @@ export async function processMemeBackgroundQueue(
   };
 }
 
+async function cancelExpiredDraftMemeJobs(cycleId?: string): Promise<string[]> {
+  const affectedCycles = await withTransaction(async (client) => {
+    const cancelledRes = await client.query<{ cycle_id: string }>(
+      `UPDATE meme_generation_jobs j
+       SET status = 'cancelled',
+           lease_owner = NULL,
+           lease_expires_at = NULL,
+           error_message = 'Draft expired or inactive',
+           updated_at = NOW()
+       FROM meme_drafts md
+       WHERE j.draft_id = md.id
+         AND j.draft_id IS NOT NULL
+         AND (md.status <> 'active' OR md.expires_at <= NOW())
+         AND (j.status = 'pending' OR (j.status = 'processing' AND j.lease_expires_at < NOW()))
+         AND ($1::uuid IS NULL OR j.cycle_id = $1::uuid)
+       RETURNING j.cycle_id`,
+      [cycleId || null]
+    );
+    return cancelledRes.rows.flatMap((row) => typeof row.cycle_id === 'string' ? [row.cycle_id] : []);
+  });
+
+  return [...new Set(affectedCycles)];
+}
+
 async function claimNextMemeJob(
   workerId: string,
   cycleId?: string
@@ -232,8 +261,9 @@ async function claimNextMemeJob(
          OR (j.status = 'processing' AND j.lease_expires_at < NOW())
        )
        AND (
-         (c.is_active = true) OR (md.status = 'active')
+         (c.is_active = true) OR (md.status = 'active' AND md.expires_at > NOW())
        )
+       AND (j.campaign_id IS NULL OR c.cancelled_at IS NULL)
        ${cycleFilter}
        ORDER BY j.created_at ASC
        LIMIT 1
@@ -331,27 +361,30 @@ async function verifyLease(jobId: string, workerId: string): Promise<boolean> {
   return res.length > 0;
 }
 
-async function releaseLease(jobId: string, transition: 'pending' | 'failed' | 'cancelled' = 'pending', errorMessage?: string) {
+async function releaseLease(jobId: string, workerId: string, transition: 'pending' | 'failed' | 'cancelled' = 'pending', errorMessage?: string) {
   if (transition === 'pending') {
     await queryDb(
       `UPDATE meme_generation_jobs
-       SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL, next_attempt_at = NOW() + INTERVAL '15 seconds', updated_at = NOW(), error_message = COALESCE($2, error_message)
-       WHERE id = $1 AND status = 'processing'`,
-      [jobId, errorMessage || null]
+       SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL, next_attempt_at = NOW() + INTERVAL '15 seconds', updated_at = NOW(), error_message = COALESCE($3, error_message)
+       WHERE id = $1 AND status = 'processing' AND lease_owner = $2
+         AND (campaign_id IS NULL OR EXISTS (SELECT 1 FROM campaigns c WHERE c.id = meme_generation_jobs.campaign_id AND c.cancelled_at IS NULL))`,
+      [jobId, workerId, errorMessage || null]
     );
   } else if (transition === 'failed') {
     await queryDb(
       `UPDATE meme_generation_jobs
-       SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL, attempts_count = GREATEST(attempts_count, 3), updated_at = NOW(), error_message = COALESCE($2, error_message)
-       WHERE id = $1 AND status = 'processing'`,
-      [jobId, errorMessage || null]
+       SET status = 'failed', lease_owner = NULL, lease_expires_at = NULL, attempts_count = GREATEST(attempts_count, 3), updated_at = NOW(), error_message = COALESCE($3, error_message)
+       WHERE id = $1 AND status = 'processing' AND lease_owner = $2
+         AND (campaign_id IS NULL OR EXISTS (SELECT 1 FROM campaigns c WHERE c.id = meme_generation_jobs.campaign_id AND c.cancelled_at IS NULL))`,
+      [jobId, workerId, errorMessage || null]
     );
   } else if (transition === 'cancelled') {
     await queryDb(
       `UPDATE meme_generation_jobs
-       SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = NOW(), error_message = COALESCE($2, error_message)
-       WHERE id = $1 AND status = 'processing'`,
-      [jobId, errorMessage || null]
+       SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = NOW(), error_message = COALESCE($3, error_message)
+       WHERE id = $1 AND status = 'processing' AND lease_owner = $2
+         AND (campaign_id IS NULL OR EXISTS (SELECT 1 FROM campaigns c WHERE c.id = meme_generation_jobs.campaign_id AND c.cancelled_at IS NULL))`,
+      [jobId, workerId, errorMessage || null]
     );
   }
 }
@@ -564,7 +597,7 @@ async function executeMemeJobTask(
     }
 
     if (!hasRemainingBudget()) {
-      await releaseLease(job.jobId, 'pending', 'Budget timeout before starting job');
+      await releaseLease(job.jobId, workerId, 'pending', 'Budget timeout before starting job');
       return { success: false, error: 'Budget timeout before starting job', metrics };
     }
 
@@ -577,12 +610,18 @@ async function executeMemeJobTask(
     );
     if (existingMemes.length > 0) {
       await withTransaction(async (client) => {
-        await client.query(
+        const completedRes = await client.query<{ id: string }>(
           `UPDATE meme_generation_jobs
            SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL, error_message = NULL, updated_at = NOW()
-           WHERE id = $1`,
-          [job.jobId]
+           WHERE id = $1 AND status = 'processing' AND lease_owner = $2 AND lease_expires_at > NOW()
+             AND (campaign_id IS NULL OR EXISTS (SELECT 1 FROM campaigns c WHERE c.id = meme_generation_jobs.campaign_id AND c.cancelled_at IS NULL))
+             AND (draft_id IS NULL OR EXISTS (SELECT 1 FROM meme_drafts md WHERE md.id = meme_generation_jobs.draft_id AND md.status = 'active' AND md.expires_at > NOW()))
+           RETURNING id`,
+          [job.jobId, workerId]
         );
+        if (completedRes.rows.length === 0) {
+          throw new Error('Existing meme completion lost lease or campaign eligibility');
+        }
       });
       await recalculateMemeCycleStatus(job.cycleId);
       metrics.validMemes = 1;
@@ -647,7 +686,7 @@ async function executeMemeJobTask(
     if (job.slotPlan.requiresAsset && assetReferences.length === 0) throw new Error('Required asset blob is unavailable');
 
     if (!hasRemainingBudget(WORKER_DURABLE_WRITE_RESERVE_MS + 10000)) {
-      await releaseLease(job.jobId, 'pending', 'Insufficient budget for image generation');
+      await releaseLease(job.jobId, workerId, 'pending', 'Insufficient budget for image generation');
       return { success: false, error: 'Insufficient budget for image generation', metrics };
     }
 
@@ -686,10 +725,8 @@ async function executeMemeJobTask(
       return { success: false, error: 'Lost worker lease after image generation', metrics };
     }
 
-    metrics.validMemes = 1;
-
     if (!hasRemainingBudget(WORKER_DURABLE_WRITE_RESERVE_MS)) {
-      await releaseLease(job.jobId, 'pending', 'Insufficient budget for Blob storage and DB write');
+      await releaseLease(job.jobId, workerId, 'pending', 'Insufficient budget for Blob storage and DB write');
       return { success: false, error: 'Insufficient budget for Blob storage and DB write', metrics };
     }
 
@@ -706,9 +743,10 @@ async function executeMemeJobTask(
       throw new Error('No se pudo guardar la imagen en el almacenamiento de blobs.');
     }
 
-    let insertSuccess = false;
+    type PersistenceResult = 'lease_lost' | 'cancelled_ineligible' | 'inserted';
+    let persistenceResult: PersistenceResult;
     try {
-      await withTransaction(async (client) => {
+      persistenceResult = await withTransaction(async (client): Promise<PersistenceResult> => {
         const leaseRes = await client.query<{ id: string }>(
           `SELECT id FROM meme_generation_jobs
            WHERE id = $1 AND status = 'processing' AND lease_owner = $2 AND lease_expires_at > NOW()
@@ -716,19 +754,31 @@ async function executeMemeJobTask(
           [job.jobId, workerId]
         );
 
-        if (leaseRes.rows.length === 0) return;
+        if (leaseRes.rows.length === 0) return 'lease_lost';
 
         if (job.draftId) {
-          const draftLock = await client.query(`SELECT id FROM meme_drafts WHERE id = $1 AND status = 'active' FOR SHARE`, [job.draftId]);
+          const draftLock = await client.query(`SELECT id FROM meme_drafts WHERE id = $1 AND status = 'active' AND expires_at > NOW() FOR SHARE`, [job.draftId]);
           if (draftLock.rows.length === 0) {
-            await client.query(`UPDATE meme_generation_jobs SET status = 'cancelled', error_message = 'Draft expired' WHERE id = $1`, [job.jobId]);
-            return;
+            const cancelledRes = await client.query<{ id: string }>(
+              `UPDATE meme_generation_jobs
+               SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, error_message = $3, updated_at = NOW()
+               WHERE id = $1 AND status = 'processing' AND lease_owner = $2 AND lease_expires_at > NOW()
+               RETURNING id`,
+              [job.jobId, workerId, 'Draft expired']
+            );
+            return cancelledRes.rows.length > 0 ? 'cancelled_ineligible' : 'lease_lost';
           }
         } else {
-          const postLock = await client.query(`SELECT p.id FROM campaign_posts p JOIN campaigns c ON p.campaign_id = c.id WHERE p.id = $1 AND p.retired_at IS NULL AND (p.expires_at IS NULL OR p.expires_at > NOW()) AND c.is_active = true FOR SHARE`, [job.campaignPostId]);
+          const postLock = await client.query(`SELECT p.id FROM campaign_posts p JOIN campaigns c ON p.campaign_id = c.id WHERE p.id = $1 AND p.retired_at IS NULL AND (p.expires_at IS NULL OR p.expires_at > NOW()) AND c.is_active = true AND c.cancelled_at IS NULL FOR SHARE`, [job.campaignPostId]);
           if (postLock.rows.length === 0) {
-            await client.query(`UPDATE meme_generation_jobs SET status = 'cancelled', error_message = 'Post retired' WHERE id = $1`, [job.jobId]);
-            return;
+            const cancelledRes = await client.query<{ id: string }>(
+              `UPDATE meme_generation_jobs
+               SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, error_message = $3, updated_at = NOW()
+               WHERE id = $1 AND status = 'processing' AND lease_owner = $2 AND lease_expires_at > NOW()
+               RETURNING id`,
+              [job.jobId, workerId, 'Post retired']
+            );
+            return cancelledRes.rows.length > 0 ? 'cancelled_ineligible' : 'lease_lost';
           }
         }
 
@@ -749,14 +799,19 @@ async function executeMemeJobTask(
           [finalDraftId, finalCampaignId, finalCampaignPostId, job.jobId, finalStatus, storageResult.pathname, storageResult.url, generation.mimeType, generation.imageBuffer.length, generation.width, generation.height, storageResult.sha256Hash, JSON.stringify({ ...resolvedSlotPlan, analysisEvidence: analysis.entityEvidence }), job.modelSnapshot.key, currentCost, job.slotIndex, primaryAssetSnapshot?.id || null]
         );
 
-        await client.query(
+        const completedRes = await client.query<{ id: string }>(
           `UPDATE meme_generation_jobs
            SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL, error_message = NULL, accumulated_cost = accumulated_cost + $1, updated_at = NOW()
-           WHERE id = $2`,
-          [currentCost, job.jobId]
+           WHERE id = $2 AND status = 'processing' AND lease_owner = $3 AND lease_expires_at > NOW()
+             AND (campaign_id IS NULL OR EXISTS (SELECT 1 FROM campaigns c WHERE c.id = meme_generation_jobs.campaign_id AND c.cancelled_at IS NULL))
+           RETURNING id`,
+          [currentCost, job.jobId, workerId]
         );
+        if (completedRes.rows.length === 0) {
+          throw new Error('Meme completion lost lease or campaign eligibility');
+        }
 
-        insertSuccess = true;
+        return 'inserted';
       });
     } catch (dbErr) {
       console.error('DB Insert meme failed, attempting blob cleanup', dbErr);
@@ -768,14 +823,19 @@ async function executeMemeJobTask(
       throw dbErr;
     }
 
-    if (!insertSuccess) {
+    if (persistenceResult !== 'inserted') {
       if (storageResult?.url) {
         try { await deleteBlob(storageResult.url); } catch {}
+      }
+      if (persistenceResult === 'cancelled_ineligible') {
+        await recalculateMemeCycleStatus(job.cycleId);
+        return { success: false, error: 'Job became ineligible after Blob upload', metrics };
       }
       return { success: false, error: 'Failed to insert meme or lost lease', metrics };
     }
     await checkpointApiCall(genCall.callKey, `checkpoint=db_persisted;template=${resolvedSlotPlan.templateId}`);
 
+    metrics.validMemes = 1;
     await recalculateMemeCycleStatus(job.cycleId);
     return { success: true, metrics };
   } catch (err: unknown) {
@@ -803,7 +863,7 @@ async function executeMemeJobTask(
       providerError: classified.originalMessage.slice(0, 300),
     });
 
-    await queryDb(
+    const errorTransition = await queryDb<{ status: string }>(
       `UPDATE meme_generation_jobs
        SET status = CASE WHEN $1::boolean THEN 'failed' ELSE 'pending' END,
            attempts_count = $2,
@@ -813,12 +873,15 @@ async function executeMemeJobTask(
            lease_owner = NULL,
            lease_expires_at = NULL,
            updated_at = NOW()
-       WHERE id = $5
+       WHERE id = $5 AND status = 'processing' AND lease_owner = $6 AND lease_expires_at > NOW()
+         AND (campaign_id IS NULL OR EXISTS (SELECT 1 FROM campaigns c WHERE c.id = meme_generation_jobs.campaign_id AND c.cancelled_at IS NULL))
        RETURNING status`,
-      [isTerminal, isTerminal ? 3 : nextAttemptCount, finalErrorMessage, currentCost, job.jobId]
+      [isTerminal, isTerminal ? 3 : nextAttemptCount, finalErrorMessage, currentCost, job.jobId, workerId]
     );
 
-    await recalculateMemeCycleStatus(job.cycleId, finalErrorMessage);
+    if (errorTransition.length > 0) {
+      await recalculateMemeCycleStatus(job.cycleId, finalErrorMessage);
+    }
     return { success: false, error: finalErrorMessage, metrics };
   } finally {
     stopHeartbeat();

@@ -1,6 +1,7 @@
 import 'server-only';
-import { randomUUID, createHash } from 'node:crypto';
-import { queryDb, withTransaction } from './db';
+import { randomUUID } from 'node:crypto';
+import type { PoolClient } from '@neondatabase/serverless';
+import { queryDb, withAdvisoryLock, withTransaction } from './db';
 
 import { parseMultipleXUrls, fetchXPosts, resolveXUsername } from './x-api';
 import { normalizeXAccounts } from './x-accounts';
@@ -9,6 +10,7 @@ import { generateSecureSlug } from './crypto';
 import { generateDeterministicSlotPlans } from './planner';
 import { parseBrandVariantsSafe } from './brand-variants';
 import { getMemeTemplatesForProvider } from './memes/templates';
+import { deleteBlobStrict } from './memes/blob';
 
 function createMemeAssetSnapshot(
   plan: { assetId?: string; secondaryAssetId?: string },
@@ -18,6 +20,48 @@ function createMemeAssetSnapshot(
   if (!primaryAsset) return null;
   const secondaryAsset = availableAssets.find((asset) => asset.id === plan.secondaryAssetId);
   return { primaryAsset, secondaryAsset: secondaryAsset || null };
+}
+
+function resolveUploadedMemeConfiguration(params: { includeMemes?: boolean; draftId?: string | null; memeEveryComments?: number }) {
+  const includeMemes = params.includeMemes === true;
+  if (!includeMemes) {
+    if (params.draftId) throw new Error('No se puede usar un draft de memes si los memes están desactivados.');
+    return { includeMemes: false, draftId: null, memeEveryComments: null };
+  }
+  if (!params.draftId?.trim()) throw new Error('Debes proporcionar un draft activo con assets para incluir memes.');
+  if (typeof params.memeEveryComments !== 'number' || !Number.isInteger(params.memeEveryComments) || params.memeEveryComments <= 0) throw new Error('La cadencia de memes debe ser un entero positivo.');
+  return { includeMemes: true, draftId: params.draftId, memeEveryComments: params.memeEveryComments };
+}
+
+async function convertUploadedMemeDraft(client: PoolClient, campaignId: string, draftId: string): Promise<void> {
+  const draftResult = await client.query(
+    `SELECT id FROM meme_drafts WHERE id = $1 AND status = 'active' AND expires_at > NOW() FOR UPDATE`,
+    [draftId],
+  );
+  if (draftResult.rows.length === 0) throw new Error('El draft de memes debe estar activo y no expirado.');
+
+  const assetsResult = await client.query<{
+    storage_provider: string; storage_key: string; storage_url: string; mime_type: string;
+    size_bytes: number; width: number | null; height: number | null; sha256_hash: string;
+  }>(
+    `SELECT storage_provider, storage_key, storage_url, mime_type, size_bytes, width, height, sha256_hash
+     FROM meme_assets WHERE draft_id = $1 AND status = 'active' FOR UPDATE`,
+    [draftId],
+  );
+  if (assetsResult.rows.length === 0) throw new Error('El draft de memes no tiene assets activos.');
+
+  for (const asset of assetsResult.rows) {
+    await client.query(
+      `INSERT INTO campaign_memes (
+         campaign_id, storage_provider, storage_key, storage_url, mime_type,
+         size_bytes, width, height, sha256_hash, status
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'available')
+       ON CONFLICT (campaign_id, sha256_hash) WHERE status IN ('available', 'assigned') DO NOTHING`,
+      [campaignId, asset.storage_provider, asset.storage_key, asset.storage_url, asset.mime_type, asset.size_bytes, asset.width, asset.height, asset.sha256_hash],
+    );
+  }
+
+  await client.query(`UPDATE meme_drafts SET status = 'converted', campaign_id = $1 WHERE id = $2`, [campaignId, draftId]);
 }
 import { DEFAULT_MODEL_KEY, getAiModel, isProviderConfigured } from './ai/models';
 import { generateSingleComment } from './openai';
@@ -337,6 +381,7 @@ export async function createCampaign(params: {
   memePercentage?: number;
   memeModelKey: string;
   draftId?: string | null;
+  memeEveryComments?: number;
 }): Promise<{ id: string; slug: string }> {
   const attributionKey = randomUUID();
 
@@ -346,6 +391,7 @@ export async function createCampaign(params: {
   const displayName = params.displayName?.trim() || null;
   if (displayName && displayName.length > 120) throw new Error('El nombre no puede superar 120 caracteres.');
   const maxCommentsTotal = resolveMaxCommentsTotal(params.maxCommentsTotal);
+  const uploadedMemes = resolveUploadedMemeConfiguration(params);
 
   // 2. Fetch posts from X API
   const fetchedPosts = await fetchXPosts(extractedUrls, { attributionKey });
@@ -370,14 +416,14 @@ export async function createCampaign(params: {
       `INSERT INTO campaigns (
          slug, campaign_type, direction, post_active_lifetime_hours, max_comments_total, is_active, safety_allowed, safety_category, safety_reason,
          initial_size, replenishment_threshold, replenishment_size, display_name, model_key, brand_variants,
-         include_memes, meme_percentage, meme_model_key
+         include_memes, meme_percentage, meme_model_key, meme_every_comments
        ) VALUES (
-         $1, 'manual', $2, NULL, $3, $9, true, $4, $5, 30, 5, 10, $6, $7, $8::jsonb, $10, $11, $12
+         $1, 'manual', $2, NULL, $3, $9, true, $4, $5, 30, 5, 10, $6, $7, $8::jsonb, $10, $11, $12, $13
        ) RETURNING id`,
       [
         slug, params.direction || null, maxCommentsTotal, safetyResult.category, safetyResult.reason,
         displayName, model.key, JSON.stringify(params.brandVariants || []), !params.isInactive,
-        params.includeMemes ?? true, params.memePercentage ?? 25, params.memeModelKey || ''
+        uploadedMemes.includeMemes, params.memePercentage ?? 25, params.memeModelKey || '', uploadedMemes.memeEveryComments,
       ]
     );
     const campaignId = campRes.rows[0].id;
@@ -438,70 +484,7 @@ export async function createCampaign(params: {
       }
     }
 
-    // Memes Initialization for manual campaigns
-    if (params.includeMemes !== false) {
-      const { resolveImageModel } = await import('./ai/image-models');
-      const { generateDeterministicMemeSlotPlans } = await import('./memes/planner');
-      const memeModelKey = params.memeModelKey || '';
-      const memeModel = resolveImageModel(memeModelKey);
-
-      let existingPreviewsCount = 0;
-
-      if (params.draftId) {
-         await client.query(`UPDATE meme_drafts SET status = 'converted', campaign_id = $1 WHERE id = $2`, [campaignId, params.draftId]);
-         await client.query(`UPDATE meme_assets SET draft_id = NULL, campaign_id = $1 WHERE draft_id = $2`, [campaignId, params.draftId]);
-         await client.query(`UPDATE meme_generation_cycles SET draft_id = NULL, campaign_id = $1, campaign_post_id = $3 WHERE draft_id = $2`, [campaignId, params.draftId, campaignPostIds[0]]);
-         await client.query(`UPDATE meme_generation_jobs SET draft_id = NULL, campaign_id = $1, campaign_post_id = $3 WHERE draft_id = $2`, [campaignId, params.draftId, campaignPostIds[0]]);
-
-         const memesPromoteRes = await client.query(`UPDATE memes SET draft_id = NULL, campaign_id = $1, campaign_post_id = $3, status = 'available', preview_origin_draft_id = $2 WHERE draft_id = $2 RETURNING id`, [campaignId, params.draftId, campaignPostIds[0]]);
-         existingPreviewsCount = memesPromoteRes.rowCount!;
-
-         await client.query(`UPDATE meme_api_calls SET draft_id = NULL, campaign_id = $1 WHERE draft_id = $2`, [campaignId, params.draftId]);
-      }
-
-      const remainingToGenerate = 10 - existingPreviewsCount;
-      if (remainingToGenerate > 0) {
-        // Find existing assets for the campaign
-        const assetsRes = await client.query(
-          `SELECT id, asset_type, appearance_percentage, instruction, storage_key, mime_type, sha256_hash, width, height
-           FROM meme_assets WHERE campaign_id = $1 AND status = 'active'`,
-          [campaignId]
-        );
-        const availableAssets = assetsRes.rows.map(a => ({
-          id: a.id, assetType: a.asset_type, appearancePercentage: a.appearance_percentage,
-          instruction: a.instruction, storageKey: a.storage_key, mimeType: a.mime_type,
-          sha256: a.sha256_hash, width: a.width, height: a.height
-        }));
-
-        const memePlans = generateDeterministicMemeSlotPlans(campaignId, null, [campaignPostIds[0]], remainingToGenerate, availableAssets, params.brandVariants || [], getMemeTemplatesForProvider(memeModel.provider).map((template) => template.id));
-        const mCycleRes = await client.query<{ id: string }>(
-          `INSERT INTO meme_generation_cycles (
-              campaign_id, campaign_post_id, cycle_type, target_count, status, model_key, provider, api_model, planner_version, pricing_snapshot
-           ) VALUES (
-              $1, $2, 'initial', $3, 'pending', $4, $5, $6, 3, $7::jsonb
-           ) RETURNING id`,
-          [campaignId, campaignPostIds[0], remainingToGenerate, memeModel.key, memeModel.provider, memeModel.apiModel, JSON.stringify(memeModel)]
-        );
-        const mCycleId = mCycleRes.rows[0].id;
-
-        for (const plan of memePlans) {
-          const assetSnapshot = createMemeAssetSnapshot(plan, availableAssets);
-          await client.query(
-            `INSERT INTO meme_generation_jobs (
-               cycle_id, campaign_id, campaign_post_id, slot_index, slot_plan,
-               deterministic_dimensions, model_snapshot, asset_snapshot, status
-             ) VALUES (
-               $1, $2, $3, $4, $5, $6, $7, $8, 'pending'
-             )`,
-            [
-              mCycleId, campaignId, plan.assignedPostId, plan.slotIndex, JSON.stringify(plan),
-              JSON.stringify({ text: plan.textQuantity, structure: plan.visualStructure, tone: plan.humorTone }),
-              JSON.stringify(memeModel), assetSnapshot ? JSON.stringify(assetSnapshot) : null
-            ]
-          );
-        }
-      }
-    }
+    if (uploadedMemes.includeMemes) await convertUploadedMemeDraft(client, campaignId, uploadedMemes.draftId!);
 
     await client.query(`UPDATE generation_api_calls SET campaign_id = $1 WHERE attribution_key = $2 AND campaign_id IS NULL`, [campaignId, attributionKey]);
     await client.query(`UPDATE x_api_calls SET campaign_id = $1 WHERE attribution_key = $2 AND campaign_id IS NULL`, [campaignId, attributionKey]);
@@ -518,8 +501,8 @@ export async function createCampaign(params: {
 
 export async function toggleCampaignStatus(campaignId: string, desiredStatus: boolean): Promise<boolean> {
   const result = await withTransaction(async (client) => {
-    const campRes = await client.query<{ is_active: boolean; campaign_type: 'manual' | 'perpetual' }>(
-      `SELECT is_active, campaign_type FROM campaigns WHERE id = $1 FOR UPDATE`,
+    const campRes = await client.query<{ is_active: boolean; campaign_type: 'manual' | 'perpetual'; cancelled_at: Date | null }>(
+      `SELECT is_active, campaign_type, cancelled_at FROM campaigns WHERE id = $1 FOR UPDATE`,
       [campaignId]
     );
     if (campRes.rows.length === 0) {
@@ -528,6 +511,10 @@ export async function toggleCampaignStatus(campaignId: string, desiredStatus: bo
 
     const currentStatus = campRes.rows[0].is_active;
     const campaignType = campRes.rows[0].campaign_type;
+
+    if (desiredStatus && campRes.rows[0].cancelled_at != null) {
+      throw new Error('No se puede reactivar una campaña cancelada.');
+    }
 
     if (currentStatus === desiredStatus) {
       return { isActive: currentStatus, synchronizePerpetualCampaign: false, triggerManualReplenishment: false, reconcileScheduler: campaignType === 'perpetual' };
@@ -644,13 +631,172 @@ export async function toggleCampaignStatus(campaignId: string, desiredStatus: bo
   return result.isActive;
 }
 
+export interface CampaignCancellationResult {
+  cancelledAt: string;
+  cleanupPending: boolean;
+  attemptedCount: number;
+  retiredCount: number;
+  failedCount: number;
+}
+
+function campaignCancellationLockId(campaignId: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < campaignId.length; index += 1) {
+    hash ^= campaignId.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash & 0x7fffffff;
+}
+
+export async function cancelCampaign(campaignId: string): Promise<CampaignCancellationResult> {
+  return withAdvisoryLock(campaignCancellationLockId(campaignId), async () => {
+  const cancellation = await withTransaction(async (client) => {
+    const campaignRes = await client.query<{ cancelled_at: Date | string | null }>(
+      `SELECT cancelled_at FROM campaigns WHERE id = $1 FOR UPDATE`,
+      [campaignId],
+    );
+    if (campaignRes.rows.length === 0) {
+      throw new Error('Campaña no encontrada.');
+    }
+
+    const wasAlreadyCancelled = campaignRes.rows[0].cancelled_at != null;
+    const updatedCampaign = await client.query<{ cancelled_at: Date | string }>(
+      `UPDATE campaigns
+       SET is_active = false, cancelled_at = COALESCE(cancelled_at, NOW()), updated_at = NOW()
+       WHERE id = $1
+       RETURNING cancelled_at`,
+      [campaignId],
+    );
+
+    // A toggle is reversible, while cancellation must make all outstanding
+    // generation work terminal before its transaction commits.  Workers that
+    // already hold a job still need their own cancelled-campaign guard, but no
+    // new claim may be made from these queues after this point.
+    await client.query(
+      `UPDATE generation_jobs
+       SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = NOW()
+       WHERE campaign_id = $1 AND status IN ('pending', 'processing')`,
+      [campaignId],
+    );
+    await client.query(
+      `UPDATE generation_cycles
+       SET status = 'cancelled', finished_at = COALESCE(finished_at, NOW())
+       WHERE campaign_id = $1 AND status IN ('pending', 'processing')`,
+      [campaignId],
+    );
+    await client.query(
+      `UPDATE meme_generation_jobs
+       SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL, updated_at = NOW()
+       WHERE campaign_id = $1 AND status IN ('pending', 'processing')`,
+      [campaignId],
+    );
+    await client.query(
+      `UPDATE meme_generation_cycles
+       SET status = 'cancelled', finished_at = COALESCE(finished_at, NOW())
+       WHERE campaign_id = $1 AND status IN ('pending', 'processing')`,
+      [campaignId],
+    );
+
+    const statuses = wasAlreadyCancelled ? ['failed'] : ['available', 'assigned', 'failed', 'rejected'];
+    const campaignMemes = await client.query<{ id: string; storage_key: string }>(
+      `UPDATE campaign_memes
+       SET status = 'withdrawn', updated_at = NOW()
+       WHERE campaign_id = $1
+         AND status = ANY($2::text[])
+       RETURNING id, storage_key`,
+      [campaignId, statuses],
+    );
+
+    // The backfill may not have represented every legacy row (and old data can
+    // share a key with an imported row). Claim only legacy rows with neither
+    // identity, so each blob is handled safely below exactly once.
+    const legacyMemes = await client.query<{ id: string; storage_key: string }>(
+      `UPDATE memes m
+       SET status = 'withdrawn', withdrawn_at = COALESCE(withdrawn_at, NOW())
+       WHERE m.campaign_id = $1
+         AND m.status = ANY($2::text[])
+         AND NOT EXISTS (
+           SELECT 1 FROM campaign_memes cm
+           WHERE cm.campaign_id = m.campaign_id
+             AND (cm.id = m.id OR cm.storage_key = m.storage_key)
+         )
+       RETURNING m.id, m.storage_key`,
+      [campaignId, statuses],
+    );
+
+    return {
+      cancelledAt: updatedCampaign.rows[0].cancelled_at,
+      claims: [
+        ...campaignMemes.rows.map((meme) => ({ ...meme, source: 'campaign' as const })),
+        ...legacyMemes.rows.map((meme) => ({ ...meme, source: 'legacy' as const })),
+      ],
+    };
+  });
+
+  let retiredCount = 0;
+  let failedCount = 0;
+  const claimsByStorageKey = new Map<string, typeof cancellation.claims>();
+  for (const claim of cancellation.claims) {
+    const claims = claimsByStorageKey.get(claim.storage_key) ?? [];
+    claims.push(claim);
+    claimsByStorageKey.set(claim.storage_key, claims);
+  }
+
+  for (const [storageKey, claims] of claimsByStorageKey) {
+    const campaignMemeIds = claims.filter((claim) => claim.source === 'campaign').map((claim) => claim.id);
+    const legacyMemeIds = claims.filter((claim) => claim.source === 'legacy').map((claim) => claim.id);
+    try {
+      await deleteBlobStrict(storageKey);
+      if (campaignMemeIds.length > 0) {
+        await queryDb(
+          `UPDATE campaign_memes
+           SET status = 'retired', updated_at = NOW()
+           WHERE campaign_id = $1 AND id = ANY($2::uuid[]) AND status = 'withdrawn'`,
+          [campaignId, campaignMemeIds],
+        );
+      }
+      retiredCount += 1;
+    } catch {
+      if (campaignMemeIds.length > 0) {
+        await queryDb(
+          `UPDATE campaign_memes
+           SET status = 'failed', updated_at = NOW()
+           WHERE campaign_id = $1 AND id = ANY($2::uuid[]) AND status = 'withdrawn'`,
+          [campaignId, campaignMemeIds],
+        );
+      }
+      if (legacyMemeIds.length > 0) {
+        await queryDb(
+          `UPDATE memes
+           SET status = 'failed', withdrawn_at = NULL
+           WHERE campaign_id = $1 AND id = ANY($2::uuid[]) AND status = 'withdrawn'`,
+          [campaignId, legacyMemeIds],
+        );
+      }
+      failedCount += 1;
+    }
+  }
+
+  const cancelledAt = cancellation.cancelledAt instanceof Date
+    ? cancellation.cancelledAt.toISOString()
+    : cancellation.cancelledAt;
+  return {
+    cancelledAt,
+    cleanupPending: failedCount > 0,
+    attemptedCount: claimsByStorageKey.size,
+    retiredCount,
+    failedCount,
+  };
+  });
+}
+
 export async function retryFailedCampaignJobs(campaignId: string): Promise<void> {
   await withTransaction(async (client) => {
-    const campaignRes = await client.query<{ id: string }>(
-      `SELECT id FROM campaigns WHERE id = $1 FOR UPDATE`,
+    const campaignRes = await client.query<{ id: string; cancelled_at: Date | null }>(
+      `SELECT id, cancelled_at FROM campaigns WHERE id = $1 FOR UPDATE`,
       [campaignId]
     );
-    if (campaignRes.rows.length === 0) return;
+    if (campaignRes.rows.length === 0 || campaignRes.rows[0].cancelled_at != null) return;
 
     // Find a cycle that has failed jobs, prioritizing 'initial' over others, oldest first.
     const cycleRes = await client.query<{ id: string; campaign_post_id: string | null }>(
@@ -716,6 +862,9 @@ export async function retryFailedCampaignJobs(campaignId: string): Promise<void>
 }
 
 export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<void> {
+  // Campaign memes are uploaded assets. Replenishment only queues comments;
+  // it must never create image-generation cycles or jobs.
+  const queueMemeAiJobs = false;
   // Determine campaign type first outside transaction for fast paths
   const campTypeRes = await queryDb<{ campaign_type: string, replenishment_threshold: number, replenishment_size: number, model_key: string, max_comments_total: number | null, brand_variants: unknown, include_memes: boolean, meme_percentage: number, meme_model_key: string | null }>(
     `SELECT campaign_type, replenishment_threshold, replenishment_size, model_key, max_comments_total, brand_variants, include_memes, meme_percentage, meme_model_key FROM campaigns WHERE id = $1 AND is_active = true`,
@@ -811,7 +960,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
         }
 
         // Memes replenishment
-        if (campaignInfo.include_memes) {
+        if (campaignInfo.include_memes && queueMemeAiJobs) {
           const mAvailRowsLock = await client.query<{ count: string }>(
             `SELECT COUNT(*) as count FROM memes WHERE campaign_id = $1 AND campaign_post_id = $2 AND status = 'available'`,
             [campaignId, postId]
@@ -991,7 +1140,7 @@ export async function triggerReplenishmentIfNeeded(campaignId: string): Promise<
         }
 
         // Memes replenishment
-        if (campaignInfo.include_memes) {
+        if (campaignInfo.include_memes && queueMemeAiJobs) {
           const mAvailRowsLock = await client.query<{ count: string }>(
             `SELECT COUNT(*) as count FROM memes WHERE campaign_id = $1 AND campaign_post_id = $2 AND status = 'available'`,
             [campaignId, postId]
@@ -1106,9 +1255,10 @@ export async function assignCommentToVisitor(
   checkRateLimit?: () => Promise<boolean>
 ): Promise<AssignmentResponse> {
   const txResult = await withTransaction<InternalAssignmentResponse>(async (client) => {
-    // 1. Fetch campaign by slug FOR SHARE
-    const campaignRows = await client.query<{ id: string; is_active: boolean; include_memes: boolean; meme_percentage: number }>(
-      `SELECT id, is_active, include_memes, meme_percentage FROM campaigns WHERE slug = $1 FOR SHARE`,
+    // The global cadence is shared by every visitor, so this lock serializes
+    // deciding, reserving and counting a new assignment for the campaign.
+    const campaignRows = await client.query<{ id: string; is_active: boolean; include_memes: boolean; meme_every_comments: number | null; meme_global_comment_count: number }>(
+      `SELECT id, is_active, include_memes, meme_every_comments, meme_global_comment_count FROM campaigns WHERE slug = $1 FOR UPDATE`,
       [slug]
     );
 
@@ -1154,10 +1304,11 @@ export async function assignCommentToVisitor(
         content_type: string;
         suggestion_id: string | null;
         meme_id: string | null;
+        campaign_meme_id: string | null;
         canonical_url: string;
         x_post_id: string;
       }>(
-        `SELECT a.campaign_post_id, a.content_type, a.suggestion_id, a.meme_id, p.canonical_url, p.x_post_id
+        `SELECT a.campaign_post_id, a.content_type, a.suggestion_id, a.meme_id, a.campaign_meme_id, p.canonical_url, p.x_post_id
          FROM assignments a
          JOIN campaign_posts p ON a.campaign_post_id = p.id
          WHERE a.id = $1`,
@@ -1166,7 +1317,7 @@ export async function assignCommentToVisitor(
 
       if (existingRes.rows.length > 0) {
         const row = existingRes.rows[0];
-        if (row.content_type === 'meme' && row.meme_id) {
+        if (row.content_type === 'meme' && (row.meme_id || row.campaign_meme_id)) {
           return {
             status: 'success',
             type: 'meme',
@@ -1195,10 +1346,9 @@ export async function assignCommentToVisitor(
       }
     }
 
-    // 5. No active assignment. Deterministic decision for preferred type
-    const hashHex = createHash('sha256').update(`${visitorId}:${campaignId}`).digest('hex');
-    const hashInt = parseInt(hashHex.substring(0, 8), 16);
-    const preferMeme = campaign.include_memes && (hashInt % 100) < campaign.meme_percentage;
+    // 5. No active assignment. A due meme is selected before comments.
+    const memeEveryComments = campaign.include_memes ? campaign.meme_every_comments : null;
+    const memeIsDue = memeEveryComments !== null && campaign.meme_global_comment_count >= memeEveryComments;
 
     const findAvailableSuggestion = () => client.query<{
       suggestion_id: string;
@@ -1224,26 +1374,30 @@ export async function assignCommentToVisitor(
       [campaignId, visitorId]
     );
 
-    const findAvailableMeme = () => client.query<{
-      meme_id: string;
+    const findEligibleCampaignMeme = () => client.query<{
+      campaign_meme_id: string;
       campaign_post_id: string;
       canonical_url: string;
       x_post_id: string;
     }>(
-      `SELECT m.id as meme_id, m.campaign_post_id, p.canonical_url, p.x_post_id
-       FROM memes m
-       JOIN campaign_posts p ON m.campaign_post_id = p.id
-       WHERE m.campaign_id = $1 AND m.status = 'available' AND p.retired_at IS NULL
+      `SELECT cm.id AS campaign_meme_id, p.id AS campaign_post_id, p.canonical_url, p.x_post_id
+       FROM campaign_memes cm
+       JOIN campaign_posts p ON p.campaign_id = cm.campaign_id
+       WHERE cm.campaign_id = $1 AND cm.status IN ('available', 'assigned') AND p.retired_at IS NULL
        AND (p.expires_at IS NULL OR p.expires_at > NOW())
        AND NOT EXISTS (
-           SELECT 1 FROM assignments a
-           WHERE a.campaign_id = m.campaign_id
-             AND a.visitor_id = $2
-             AND a.campaign_post_id = m.campaign_post_id
+           SELECT 1 FROM campaign_meme_posts cmp
+           WHERE cmp.campaign_meme_id = cm.id AND cmp.campaign_post_id = p.id
        )
-       ORDER BY p.posted_at DESC NULLS LAST, p.created_at DESC, m.delivery_order ASC, m.created_at ASC
+       AND NOT EXISTS (
+           SELECT 1 FROM assignments a
+           WHERE a.campaign_id = cm.campaign_id
+             AND a.visitor_id = $2
+             AND a.campaign_post_id = p.id
+       )
+       ORDER BY random()
        LIMIT 1
-       FOR UPDATE OF m SKIP LOCKED`,
+       FOR UPDATE OF cm SKIP LOCKED`,
       [campaignId, visitorId]
     );
 
@@ -1251,18 +1405,21 @@ export async function assignCommentToVisitor(
     let claimedItem: {
       suggestion_id?: string;
       meme_id?: string;
+      campaign_meme_id?: string;
       campaign_post_id: string;
       comment_text?: string;
       canonical_url: string;
       x_post_id: string;
     } | null = null;
 
-    if (preferMeme) {
-      const memeRes = await findAvailableMeme();
+    if (memeIsDue) {
+      const memeRes = await findEligibleCampaignMeme();
       if (memeRes.rows.length > 0) {
         chosenType = 'meme';
         claimedItem = memeRes.rows[0];
       } else {
+        // Do not advance the counter while it is due: a later post can take
+        // the pending meme immediately.
         const suggRes = await findAvailableSuggestion();
         if (suggRes.rows.length > 0) {
           chosenType = 'comment';
@@ -1274,12 +1431,6 @@ export async function assignCommentToVisitor(
       if (suggRes.rows.length > 0) {
         chosenType = 'comment';
         claimedItem = suggRes.rows[0];
-      } else if (campaign.include_memes) {
-        const memeRes = await findAvailableMeme();
-        if (memeRes.rows.length > 0) {
-          chosenType = 'meme';
-          claimedItem = memeRes.rows[0];
-        }
       }
     }
 
@@ -1307,14 +1458,27 @@ export async function assignCommentToVisitor(
     // Apply rate limit now that we actually have an item
     if (checkRateLimit && !(await checkRateLimit())) return { status: 'rate_limited' };
 
-    // 8. Create Assignment record
+    // 8. Reserve a campaign meme for this post and create the assignment in
+    // the same transaction. Legacy meme_id remains supported for recovery.
+    if (chosenType === 'meme') {
+      const reservation = await client.query<{ campaign_meme_id: string }>(
+        `INSERT INTO campaign_meme_posts (campaign_meme_id, campaign_post_id, campaign_id)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (campaign_meme_id, campaign_post_id) DO NOTHING
+         RETURNING campaign_meme_id`,
+        [claimedItem.campaign_meme_id, claimedItem.campaign_post_id, campaignId],
+      );
+      if (reservation.rows.length !== 1) throw new Error('Failed to reserve campaign meme securely');
+    }
+
     const insertAssignmentRes = await client.query<{ id: string }>(
-      `INSERT INTO assignments (campaign_id, visitor_id, campaign_post_id, content_type, suggestion_id, meme_id)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      `INSERT INTO assignments (campaign_id, visitor_id, campaign_post_id, content_type, suggestion_id, meme_id, campaign_meme_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
       [
         campaignId, visitorId, claimedItem.campaign_post_id, chosenType,
         chosenType === 'comment' ? claimedItem.suggestion_id : null,
-        chosenType === 'meme' ? claimedItem.meme_id : null
+        null,
+        chosenType === 'meme' ? claimedItem.campaign_meme_id : null,
       ]
     );
 
@@ -1327,12 +1491,19 @@ export async function assignCommentToVisitor(
         [claimedItem.suggestion_id]
       );
       if (updateSuggRes.rows.length !== 1) throw new Error('Failed to update suggestion status securely');
+      if (memeEveryComments !== null) {
+        await client.query(
+          `UPDATE campaigns
+           SET meme_global_comment_count = LEAST(meme_global_comment_count + 1, meme_every_comments), updated_at = NOW()
+           WHERE id = $1`,
+          [campaignId],
+        );
+      }
     } else {
-      const updateMemeRes = await client.query(
-        `UPDATE memes SET status = 'assigned', assigned_at = NOW() WHERE id = $1 AND status = 'available' RETURNING id`,
-        [claimedItem.meme_id]
+      await client.query(
+        `UPDATE campaigns SET meme_global_comment_count = 0, updated_at = NOW() WHERE id = $1`,
+        [campaignId],
       );
-      if (updateMemeRes.rows.length !== 1) throw new Error('Failed to update meme status securely');
     }
 
     // 10. Update visitor_campaign_states
@@ -1428,6 +1599,8 @@ export async function createPerpetualCampaign(params: {
   includeMemes?: boolean;
   memePercentage?: number;
   memeModelKey: string;
+  draftId?: string | null;
+  memeEveryComments?: number;
 }): Promise<{ id: string; slug: string; initialSync: PerpetualMonitorSummary | null }> {
   const attributionKey = randomUUID();
   const normalizedAccounts = normalizeXAccounts(params.accountsInput);
@@ -1435,6 +1608,7 @@ export async function createPerpetualCampaign(params: {
   const displayName = params.displayName?.trim() || null;
   if (displayName && displayName.length > 120) throw new Error('El nombre no puede superar 120 caracteres.');
   const maxCommentsTotal = resolveMaxCommentsTotal(params.maxCommentsTotal);
+  const uploadedMemes = resolveUploadedMemeConfiguration(params);
 
   if (params.postActiveLifetimeHours < 1 || params.postActiveLifetimeHours > 720 || !Number.isInteger(params.postActiveLifetimeHours)) {
     throw new Error('La duración de los posts debe ser un número entero entre 1 y 720 horas.');
@@ -1458,17 +1632,19 @@ export async function createPerpetualCampaign(params: {
       `INSERT INTO campaigns (
          slug, campaign_type, direction, post_active_lifetime_hours, max_comments_total, is_active, safety_allowed,
          initial_size, replenishment_threshold, replenishment_size, display_name, model_key, brand_variants,
-         include_memes, meme_percentage, meme_model_key
+         include_memes, meme_percentage, meme_model_key, meme_every_comments
        ) VALUES (
-         $1, 'perpetual', $2, $3, $4, $8, true, 30, 5, 10, $5, $6, $7::jsonb, $9, $10, $11
+         $1, 'perpetual', $2, $3, $4, $8, true, 30, 5, 10, $5, $6, $7::jsonb, $9, $10, $11, $12
        ) RETURNING id`,
       [
         slug, params.direction || null, params.postActiveLifetimeHours, maxCommentsTotal,
         displayName, model.key, JSON.stringify(params.brandVariants || []), !params.isInactive,
-        params.includeMemes ?? true, params.memePercentage ?? 25, params.memeModelKey || ''
+        uploadedMemes.includeMemes, params.memePercentage ?? 25, params.memeModelKey || '', uploadedMemes.memeEveryComments,
       ]
     );
     const campaignId = campRes.rows[0].id;
+
+    if (uploadedMemes.includeMemes) await convertUploadedMemeDraft(client, campaignId, uploadedMemes.draftId!);
 
     const accountIds: string[] = [];
     for (const acc of resolvedAccounts) {
