@@ -41,7 +41,17 @@ describe('administration campaign cards', () => {
 
   it('enables the meme system by default', async () => {
     render(<AdminDashboardPage />);
-    expect((await screen.findByLabelText(/habilitar sistema de memes/i) as HTMLInputElement).checked).toBe(true);
+    expect((await screen.findByLabelText(/incluir memes/i) as HTMLInputElement).checked).toBe(true);
+  });
+
+  it('renders the campaigns hierarchy with a concise campaign header and semantic status', async () => {
+    render(<AdminDashboardPage />);
+
+    expect(await screen.findByRole('heading', { name: 'Campañas', level: 1 })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Crear campaña', level: 2 })).toBeTruthy();
+    expect(screen.getByText('#1 · Campaña de prueba')).toBeTruthy();
+    expect(screen.getByText('Posts específicos', { selector: '.campaign-origin-badge' })).toBeTruthy();
+    expect(screen.getByText('Activa').classList.contains('status-active')).toBe(true);
   });
 
   it('starts collapsed, exposes an accessible arrow, and only fetches preview after expansion', async () => {
@@ -59,7 +69,7 @@ describe('administration campaign cards', () => {
   it('shows the campaign accumulated recorded cost', async () => {
     render(<AdminDashboardPage />);
 
-    const label = await screen.findByText('Costo acumulado');
+    const label = await screen.findByText('Coste');
     const costItem = label.closest('.stat-item');
 
     expect(costItem).not.toBeNull();
@@ -176,12 +186,12 @@ describe('administration campaign cards', () => {
     });
     render(<AdminDashboardPage />);
 
-    expect((await screen.findByLabelText(/tipo de campaña/i) as HTMLSelectElement).value).toBe('manual');
-    expect(screen.queryByLabelText(/cuentas de x a monitorizar/i)).toBeNull();
-    fireEvent.change(screen.getByLabelText(/urls de los posts de x/i), {
+    expect((await screen.findByLabelText(/origen de los posts/i) as HTMLSelectElement).value).toBe('manual');
+    expect(screen.queryByLabelText(/cuentas de x/i)).toBeNull();
+    fireEvent.change(screen.getByLabelText(/^posts de x$/i), {
       target: { value: 'https://x.com/genieorb/status/123' },
     });
-    fireEvent.click(screen.getByLabelText(/habilitar sistema de memes/i));
+    fireEvent.click(screen.getByLabelText(/incluir memes/i));
     fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
 
     await waitFor(() => {
@@ -265,7 +275,7 @@ describe('administration campaign cards', () => {
     render(<AdminDashboardPage />);
 
     fireEvent.change(
-      await screen.findByLabelText(/urls de los posts de x/i),
+      await screen.findByLabelText(/^posts de x$/i),
       {
         target: {
           value: 'https://x.com/genieorb/status/123',
@@ -275,7 +285,7 @@ describe('administration campaign cards', () => {
 
     fireEvent.click(
       screen.getByRole('button', {
-        name: /^generar preview de comentarios$/i,
+        name: /^generar vista previa$/i,
       })
     );
 
@@ -313,9 +323,9 @@ describe('administration campaign cards', () => {
     });
     render(<AdminDashboardPage />);
 
-    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
-    fireEvent.change(screen.getByLabelText(/meme cada x comentarios/i), { target: { value: '4' } });
-    fireEvent.change(screen.getByLabelText(/subir memes manuales/i), { target: { files: [new File(['meme'], 'meme.png', { type: 'image/png' })] } });
+    fireEvent.change(await screen.findByLabelText(/^posts de x$/i), { target: { value: 'https://x.com/genieorb/status/123' } });
+    fireEvent.change(screen.getByLabelText(/frecuencia de memes/i), { target: { value: '4' } });
+    fireEvent.change(screen.getByLabelText(/memes propios/i), { target: { files: [new File(['meme'], 'meme.png', { type: 'image/png' })] } });
     await screen.findByText('image/png');
     expect(screen.queryByLabelText(/modelo generador de im[aá]genes/i)).toBeNull();
     expect(screen.queryByRole('button', { name: /generar 3 memes/i })).toBeNull();
@@ -347,7 +357,7 @@ describe('administration campaign cards', () => {
       return Promise.resolve(json({}));
     });
     render(<AdminDashboardPage />);
-    fireEvent.change(await screen.findByLabelText(/subir memes manuales/i), {
+    fireEvent.change(await screen.findByLabelText(/memes propios/i), {
       target: { files: [new File(['1'], 'one.png', { type: 'image/png' }), new File(['2'], 'two.png', { type: 'image/png' }), new File(['3'], 'three.webp', { type: 'image/webp' })] },
     });
 
@@ -371,7 +381,7 @@ describe('administration campaign cards', () => {
       return Promise.resolve(json({}));
     });
     render(<AdminDashboardPage />);
-    fireEvent.change(await screen.findByLabelText(/subir memes manuales/i), { target: { files: [new File(['meme'], 'meme.png', { type: 'image/png' })] } });
+    fireEvent.change(await screen.findByLabelText(/memes propios/i), { target: { files: [new File(['meme'], 'meme.png', { type: 'image/png' })] } });
     await screen.findByText('image/png');
 
     deletionShouldFail = true;
@@ -392,11 +402,11 @@ describe('administration campaign cards', () => {
       return Promise.resolve(json({}));
     });
     render(<AdminDashboardPage />);
-    fireEvent.click(await screen.findByLabelText(/habilitar sistema de memes/i));
-    fireEvent.change(screen.getByLabelText(/urls de los posts de x/i), { target: { value: 'https://x.com/genieorb/status/123' } });
+    fireEvent.click(await screen.findByLabelText(/incluir memes/i));
+    fireEvent.change(screen.getByLabelText(/^posts de x$/i), { target: { value: 'https://x.com/genieorb/status/123' } });
     fireEvent.click(screen.getByRole('button', { name: /añadir variante/i }));
     fireEvent.click(screen.getByRole('button', { name: /añadir variante/i }));
-    const values = screen.getAllByPlaceholderText(/texto exacto/i);
+    const values = screen.getAllByPlaceholderText(/variante, ej\. nombre de marca/i);
     fireEvent.change(values[0], { target: { value: '  First  ' } });
     fireEvent.change(values[1], { target: { value: '   ' } });
     fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
@@ -411,17 +421,17 @@ describe('administration campaign cards', () => {
 
   it('orders direction and brand variants before the meme configuration', async () => {
     render(<AdminDashboardPage />);
-    await screen.findByLabelText(/dirección de los comentarios/i);
+    await screen.findByLabelText(/instrucciones/i);
     const formText = document.querySelector('form')?.textContent || '';
-    expect(formText.indexOf('Máximo de comentarios')).toBeLessThan(formText.indexOf('Dirección de los comentarios'));
-    expect(formText.indexOf('Dirección de los comentarios')).toBeLessThan(formText.indexOf('Variantes de Marca'));
-    expect(formText.indexOf('Variantes de Marca')).toBeLessThan(formText.indexOf('Habilitar Sistema de Memes'));
+    expect(formText.indexOf('Límite de comentarios')).toBeLessThan(formText.indexOf('Instrucciones'));
+    expect(formText.indexOf('Instrucciones')).toBeLessThan(formText.indexOf('Variantes de marca'));
+    expect(formText.indexOf('Variantes de marca')).toBeLessThan(formText.indexOf('Incluir memes'));
   });
 
   it('does not submit a meme campaign before at least one manual meme is uploaded', async () => {
     render(<AdminDashboardPage />);
 
-    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
+    fireEvent.change(await screen.findByLabelText(/^posts de x$/i), {
       target: { value: 'https://x.com/genieorb/status/123' },
     });
     fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
@@ -443,11 +453,11 @@ describe('administration campaign cards', () => {
     });
     render(<AdminDashboardPage />);
 
-    fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
+    fireEvent.change(await screen.findByLabelText(/^posts de x$/i), {
       target: { value: 'https://x.com/genieorb/status/123' },
     });
     const memeFile = new File(['meme'], 'meme.png', { type: 'image/png' });
-    fireEvent.change(screen.getByLabelText(/subir memes manuales/i), { target: { files: [memeFile] } });
+    fireEvent.change(screen.getByLabelText(/memes propios/i), { target: { files: [memeFile] } });
     await screen.findByText('image/png');
 
     fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
@@ -459,7 +469,7 @@ describe('administration campaign cards', () => {
     });
 
     await waitFor(() => expect(screen.queryByText('image/png')).toBeNull());
-    fireEvent.change(screen.getByLabelText(/urls de los posts de x/i), {
+    fireEvent.change(screen.getByLabelText(/^posts de x$/i), {
       target: { value: 'https://x.com/genieorb/status/456' },
     });
     fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
@@ -473,7 +483,7 @@ describe('administration campaign cards', () => {
   describe('maxCommentsTotal optional field', () => {
     it('is initially empty and not required', async () => {
       render(<AdminDashboardPage />);
-      const maxInput = await screen.findByLabelText(/máximo de comentarios/i) as HTMLInputElement;
+      const maxInput = await screen.findByLabelText(/límite de comentarios/i) as HTMLInputElement;
       expect(maxInput.value).toBe('');
       expect(maxInput.required).toBe(false);
     });
@@ -488,8 +498,8 @@ describe('administration campaign cards', () => {
       });
       render(<AdminDashboardPage />);
 
-      fireEvent.click(await screen.findByLabelText(/habilitar sistema de memes/i));
-      fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
+      fireEvent.click(await screen.findByLabelText(/incluir memes/i));
+      fireEvent.change(await screen.findByLabelText(/^posts de x$/i), {
         target: { value: 'https://x.com/genieorb/status/123' },
       });
       fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
@@ -512,11 +522,11 @@ describe('administration campaign cards', () => {
       });
       render(<AdminDashboardPage />);
 
-      fireEvent.click(await screen.findByLabelText(/habilitar sistema de memes/i));
-      fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
+      fireEvent.click(await screen.findByLabelText(/incluir memes/i));
+      fireEvent.change(await screen.findByLabelText(/^posts de x$/i), {
         target: { value: 'https://x.com/genieorb/status/123' },
       });
-      const maxInput = await screen.findByLabelText(/máximo de comentarios/i);
+      const maxInput = await screen.findByLabelText(/límite de comentarios/i);
       fireEvent.change(maxInput, { target: { value: '1000' } });
       fireEvent.click(screen.getByRole('button', { name: /crear campaña/i }));
 
@@ -529,7 +539,7 @@ describe('administration campaign cards', () => {
 
       // verifies it clears the field after creation
       await waitFor(() => {
-        expect((screen.getByLabelText(/máximo de comentarios/i) as HTMLInputElement).value).toBe('');
+        expect((screen.getByLabelText(/límite de comentarios/i) as HTMLInputElement).value).toBe('');
       });
     });
 
@@ -542,10 +552,10 @@ describe('administration campaign cards', () => {
       });
       render(<AdminDashboardPage />);
 
-      fireEvent.change(await screen.findByLabelText(/urls de los posts de x/i), {
+      fireEvent.change(await screen.findByLabelText(/^posts de x$/i), {
         target: { value: 'https://x.com/genieorb/status/123' },
       });
-      const maxInput = await screen.findByLabelText(/máximo de comentarios/i);
+      const maxInput = await screen.findByLabelText(/límite de comentarios/i);
 
       // Test decimal
       fireEvent.change(maxInput, { target: { value: '10.5' } });

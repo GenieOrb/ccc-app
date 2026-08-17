@@ -305,10 +305,11 @@ function CampaignCardItem({
   return (
     <div className="campaign-card">
       <div className="campaign-header-row">
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <strong>#{c.internalNumber} / {c.campaignType === 'manual' ? 'Manual' : '⭐ Perpetua'} / {c.displayName || 'Sin nombre'}</strong>
+        <div className="campaign-identity">
+          <strong className="campaign-title">#{c.internalNumber} · {c.displayName || 'Sin nombre'}</strong>
+          <span className="campaign-origin-badge">{c.campaignType === 'manual' ? 'Posts específicos' : 'Cuentas de X'}</span>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <div className="campaign-header-actions">
           <span className={`status-badge ${c.isActive ? 'status-active' : 'status-inactive'}`}>
             {c.isActive ? 'Activa' : 'Desactivada'}
           </span>
@@ -326,16 +327,16 @@ function CampaignCardItem({
       </div>
 
 
-      <div id={`campaign-details-${c.id}`} hidden={!expanded}>
+      <div id={`campaign-details-${c.id}`} hidden={!expanded} className="campaign-content">
       <form onSubmit={(e) => { e.preventDefault(); void saveSetting({ displayName: displayNameInput }); }} style={{ marginTop: '10px' }}>
-        <label htmlFor={`campaign-name-${c.id}`} className="form-label">Nombre de campaña</label>
+        <label htmlFor={`campaign-name-${c.id}`} className="form-label">Nombre</label>
         <div style={{ display: 'flex', gap: '8px' }}>
           <input id={`campaign-name-${c.id}`} className="form-textarea" value={displayNameInput} maxLength={120} onChange={(e) => setDisplayNameInput(e.target.value)} disabled={savingIdentity} />
           <button className="btn-admin btn-secondary" type="submit" disabled={savingIdentity}>Guardar</button>
         </div>
       </form>
       <form onSubmit={(e) => { e.preventDefault(); void saveSetting({ modelKey: modelKeyInput }); }} style={{ marginTop: '8px' }}>
-        <label htmlFor={`campaign-model-${c.id}`} className="form-label">Modelo de generación</label>
+        <label htmlFor={`campaign-model-${c.id}`} className="form-label">Modelo</label>
         <div style={{ display: 'flex', gap: '8px' }}>
           <select id={`campaign-model-${c.id}`} className="form-textarea" value={modelKeyInput} onChange={(e) => setModelKeyInput(e.target.value)} disabled={savingIdentity}>
             {models.map((model) => <option key={model.key} value={model.key} disabled={!model.enabled || !model.configured}>{model.displayName}{!model.configured ? ' (no configurado)' : ''}</option>)}
@@ -351,11 +352,11 @@ function CampaignCardItem({
         </details>
       )}
 
-      <div>
+      <section className="campaign-section campaign-posts-section">
         {c.campaignType === 'manual' && (
           <>
             <span style={{ fontSize: '0.8rem', fontWeight: '600', color: 'var(--text-muted)' }}>
-              POSTS DE X INCLUIDOS:
+              Posts de X
             </span>
             <ul style={{ paddingLeft: '20px', fontSize: '0.85rem' }}>
               {c.xPosts.map((post) => (
@@ -407,7 +408,7 @@ function CampaignCardItem({
             </form>
 
             <span style={{ fontSize: '0.8rem', fontWeight: '600', color: 'var(--text-muted)' }}>
-              CUENTAS DE X:
+              Cuentas de X
             </span>
             <ul style={{ paddingLeft: '20px', fontSize: '0.85rem' }}>
               {c.xAccounts.map((acc) => (
@@ -455,7 +456,7 @@ function CampaignCardItem({
             {c.xPosts.length > 0 && (
               <div style={{ marginTop: '16px', opacity: 0.8 }}>
                 <span style={{ fontSize: '0.8rem', fontWeight: '600', color: 'var(--text-muted)' }}>
-                  POSTS EXISTENTES EN LA CAMPAÑA:
+                  Posts de X
                 </span>
                 <ul style={{ paddingLeft: '20px', fontSize: '0.8rem', marginTop: '4px' }}>
                   {c.xPosts.map((post) => (
@@ -470,14 +471,13 @@ function CampaignCardItem({
             )}
           </>
         )}
-      </div>
+      </section>
 
       {/* Campaign Statistics Grid */}
+      <section className="campaign-section generation-section" aria-label="Generación">
+        <div className="generation-summary"><span className="generation-title">Generación</span><span className="generation-value">{c.validGeneratedCount}{c.maxCommentsTotal !== undefined && c.maxCommentsTotal !== null ? ` / ${c.maxCommentsTotal}` : ''}</span><span className="generation-progress">{c.generationProgress}%</span></div>
+        <div className="generation-progress-bar" aria-hidden="true"><span style={{ width: `${Math.min(100, Math.max(0, c.generationProgress))}%` }} /></div>
       <div className="campaign-details-grid">
-        <div className="stat-item">
-          <span className="stat-label">Progreso</span>
-          <span className="stat-value">{c.generationProgress}%</span>
-        </div>
         <div className="stat-item">
           <span className="stat-label">Generados</span>
           <span className="stat-value">
@@ -502,7 +502,7 @@ function CampaignCardItem({
           <span className="stat-value" style={{ color: 'var(--error-color)' }}>{c.withdrawnCount}</span>
         </div>
         <div className="stat-item">
-          <span className="stat-label">En Cola</span>
+          <span className="stat-label">En cola</span>
           <span className="stat-value">{c.pendingProcessingJobsCount}</span>
         </div>
         <div className="stat-item">
@@ -512,7 +512,7 @@ function CampaignCardItem({
           </span>
         </div>
         <div className="stat-item" style={{ gridColumn: '1 / -1' }}>
-          <span className="stat-label">Costo acumulado</span>
+          <span className="stat-label">Coste</span>
           <span className="stat-value">
             ${safeFiniteNumber(c.recordedCost).toFixed(3)}
             <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginLeft: '8px' }}>
@@ -526,9 +526,10 @@ function CampaignCardItem({
           )}
         </div>
       </div>
+      </section>
 
       {/* Public URL Box */}
-      <div className="url-box">
+      <section className="campaign-section public-link-section" aria-label="Enlace público"><span className="campaign-section-title">Enlace público</span><div className="url-box">
         <span className="url-text">{c.publicUrl}</span>
         <button
           type="button"
@@ -536,12 +537,12 @@ function CampaignCardItem({
           className="btn-admin btn-secondary"
           style={{ padding: '6px 12px', fontSize: '0.85rem' }}
         >
-          {copiedId === c.id ? '¡Copiada!' : 'Copiar URL'}
+          {copiedId === c.id ? '¡Copiado!' : 'Copiar enlace'}
         </button>
-      </div>
+      </div></section>
 
       {/* Action Controls */}
-      <div style={{ display: 'flex', gap: '12px', alignItems: 'center', marginBottom: '16px' }}>
+      <div className="campaign-actions">
         <button
           type="button"
           onClick={() => void handleStatusToggle()}
@@ -570,16 +571,16 @@ function CampaignCardItem({
         )}
       </div>
 
-      <section style={{ borderTop: '1px solid var(--border-warm)', paddingTop: '16px', marginBottom: '16px' }} aria-label="Previews de comentarios">
+      <section className="campaign-section preview-section" aria-label="Vista previa">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', marginBottom: '10px' }}>
-          <strong>Preview de comentarios</strong>
+          <strong>Vista previa</strong>
         </div>
 
         {previewError && <p role="alert" style={{ color: 'var(--error-color)', margin: '0 0 10px' }}>{previewError}</p>}
         {loadingPreviews ? (
           <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: 0 }}>Cargando historial de previews...</p>
         ) : previews.length === 0 ? (
-          <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: 0 }}>Aún no hay previews para esta campaña.</p>
+          <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', margin: 0 }}>Sin vista previa generada.</p>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
             {previews.map((preview) => {
@@ -611,7 +612,7 @@ function CampaignCardItem({
       </section>
 
       {/* Comments Section */}
-      <div style={{ borderTop: '1px solid var(--border-warm)', paddingTop: '16px' }}>
+      <div className="campaign-section comments-section">
         <button type="button" onClick={toggleComments} className="btn-admin btn-secondary" style={{ width: '100%' }}>
           {showComments ? 'Ocultar comentarios' : 'Ver comentarios'}
         </button>
@@ -1055,7 +1056,7 @@ export default function AdminDashboardPage() {
     <div>
       {/* Admin Header */}
       <header className="admin-header">
-        <h1 className="admin-title">Panel Administrativo</h1>
+        <h1 className="admin-title">Campañas</h1>
         <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
           <div style={{ display: 'flex', flexDirection: 'column', textAlign: 'right' }}>
             <span style={{ fontSize: '1rem', fontWeight: 'bold', color: 'var(--color-primary)' }}>
@@ -1085,13 +1086,13 @@ export default function AdminDashboardPage() {
 
         {/* Create Campaign Card */}
         <section className="admin-card">
-          <h2 className="admin-card-header">Crear Nueva Campaña</h2>
+          <h2 className="admin-card-header">Crear campaña</h2>
           <form onSubmit={(e) => { e.preventDefault(); void handleCreateCampaign('active'); }} noValidate>
-            <div className="form-group"><label className="form-label">Nombre de campaña</label><input className="form-textarea" value={displayName} maxLength={120} onChange={(e) => setDisplayName(e.target.value)} /></div>
+            <div className="form-group"><label className="form-label">Nombre</label><input className="form-textarea" value={displayName} maxLength={120} onChange={(e) => setDisplayName(e.target.value)} /></div>
             <div className="form-group"><label className="form-label">Modelo</label><select className="form-textarea" value={modelKey} onChange={(e) => setModelKey(e.target.value)}>{models.map(model => <option key={model.key} value={model.key} disabled={!model.enabled || !model.configured}>{model.displayName} — Entrada ${model.inputPricePerMillion} · salida ${model.outputPricePerMillion} / 1M tokens{!model.configured ? ' · No configurado' : ''}</option>)}</select></div>
             <div className="form-group">
               <label htmlFor="campaign-type" className="form-label">
-                Tipo de campaña
+                Origen de los posts
               </label>
               <select
                 id="campaign-type"
@@ -1101,15 +1102,15 @@ export default function AdminDashboardPage() {
                 onChange={(e) => setCampaignTypeToCreate(e.target.value as 'manual' | 'perpetual')}
                 disabled={creating}
               >
-                <option value="manual">Manual (URLs de posts estáticos)</option>
-                <option value="perpetual">Perpetua (Cuentas de X automáticas)</option>
+                <option value="manual">Posts específicos</option>
+                <option value="perpetual">Cuentas de X</option>
               </select>
             </div>
 
             {campaignTypeToCreate === 'manual' && (
               <div className="form-group">
                 <label htmlFor="urls-input" className="form-label">
-                  URLs de los posts de X (una por línea o comas)
+                  Posts de X
                 </label>
                 <textarea
                   id="urls-input"
@@ -1121,6 +1122,7 @@ export default function AdminDashboardPage() {
                   required
                   disabled={creating}
                 />
+                <p className="form-help">Pega una o varias URLs, separadas por línea o coma.</p>
               </div>
             )}
 
@@ -1128,7 +1130,7 @@ export default function AdminDashboardPage() {
               <>
                 <div className="form-group">
                   <label htmlFor="accounts-input" className="form-label">
-                    Cuentas de X a monitorizar (una por línea o comas)
+                    Cuentas de X
                   </label>
                   <textarea
                     id="accounts-input"
@@ -1165,7 +1167,7 @@ export default function AdminDashboardPage() {
 
             <div className="form-group">
               <label htmlFor="max-comments-total-input" className="form-label">
-                Máximo de comentarios (opcional)
+                Límite de comentarios
               </label>
               <input
                 id="max-comments-total-input"
@@ -1179,13 +1181,13 @@ export default function AdminDashboardPage() {
                 disabled={creating}
               />
               <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '4px' }}>
-                Déjalo vacío para que la campaña no tenga un límite total de comentarios.
+                Déjalo vacío para no limitar el total.
               </p>
             </div>
 
             <div className="form-group">
               <label htmlFor="direction-input" className="form-label">
-                Dirección de los comentarios (opcional)
+                Instrucciones
               </label>
               <textarea
                 id="direction-input"
@@ -1193,36 +1195,37 @@ export default function AdminDashboardPage() {
                 rows={2}
                 value={direction}
                 onChange={(e) => setDirection(e.target.value)}
-                placeholder="Instrucciones sobre el tono, enfoque o intención deseada..."
+                placeholder="Tono, enfoque o intención deseada…"
                 disabled={creating}
               />
             </div>
 
             <div className="form-group">
-              <label className="form-label">Variantes de Marca (opcional)</label>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <label className="form-label">Variantes de marca <span className="form-optional">Opcional</span></label>
+              <p className="form-help">Define las formas de mencionar la marca y su porcentaje de uso.</p>
+              <div className="brand-variants">
                 {brandVariants.map((bv, idx) => (
-                  <div key={idx} style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                    <input type="text" placeholder="Texto exacto (ej. Marca)" className="form-textarea" style={{ minHeight: 'auto', padding: '8px', flex: 1 }} value={bv.value} onChange={(e) => handleUpdateBrandVariant(idx, 'value', e.target.value)} disabled={creating} />
-                    <input type="number" placeholder="%" className="form-textarea" style={{ minHeight: 'auto', padding: '8px', width: '80px' }} value={bv.percentage} onChange={(e) => handleUpdateBrandVariant(idx, 'percentage', Number(e.target.value))} disabled={creating} />
-                    <button type="button" onClick={() => handleRemoveBrandVariant(idx)} className="btn-admin btn-danger" disabled={creating}>X</button>
+                  <div key={idx} className="brand-variant-row">
+                    <input type="text" placeholder="Variante, ej. Nombre de marca" className="form-textarea" value={bv.value} onChange={(e) => handleUpdateBrandVariant(idx, 'value', e.target.value)} disabled={creating} />
+                    <label className="brand-usage">Uso <input type="number" aria-label={`Uso de variante ${idx + 1}`} className="form-textarea" value={bv.percentage} onChange={(e) => handleUpdateBrandVariant(idx, 'percentage', Number(e.target.value))} disabled={creating} /> <span aria-hidden="true">%</span></label>
+                    <button type="button" onClick={() => handleRemoveBrandVariant(idx)} className="btn-admin btn-danger" aria-label={`Eliminar variante ${idx + 1}`} disabled={creating}>×</button>
                   </div>
                 ))}
                 <button type="button" onClick={handleAddBrandVariant} className="btn-admin btn-secondary" style={{ alignSelf: 'flex-start' }} disabled={creating}>+ Añadir variante</button>
               </div>
             </div>
 
-            <div className="form-group" style={{ padding: '16px', background: 'var(--surface-sunken)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px' }}>
+            <div className="form-group meme-config">
+              <div className="meme-toggle-row">
                 <input type="checkbox" id="include-memes" checked={includeMemes} onChange={(e) => setIncludeMemes(e.target.checked)} disabled={creating} />
-                <label htmlFor="include-memes" className="form-label" style={{ marginBottom: 0, fontWeight: 'bold' }}>Habilitar Sistema de Memes Multimodal</label>
+                <label htmlFor="include-memes" className="form-label">Incluir memes</label>
               </div>
 
               {includeMemes && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                   <div>
-                    <label htmlFor="meme-every-comments" className="form-label">Meme cada X comentarios</label>
-                    <input id="meme-every-comments" type="number" min="1" step="1" className="form-textarea" style={{ minHeight: 'auto', padding: '8px' }} value={memeEveryComments} onChange={(e) => setMemeEveryComments(e.target.value)} disabled={creating} />
+                    <label htmlFor="meme-every-comments" className="form-label">Frecuencia de memes</label>
+                    <div className="meme-frequency">1 meme cada <input id="meme-every-comments" type="number" min="1" step="1" className="form-textarea" value={memeEveryComments} onChange={(e) => setMemeEveryComments(e.target.value)} disabled={creating} /> comentarios</div>
                   </div>
                 </div>
               )}
@@ -1230,7 +1233,7 @@ export default function AdminDashboardPage() {
 
             {includeMemes && (
               <div className="form-group">
-                <label htmlFor="meme-files" className="form-label">Subir memes manuales (opcional)</label>
+                <label htmlFor="meme-files" className="form-label">Memes propios <span className="form-optional">Opcional</span></label>
                 <input
                   id="meme-files"
                   type="file"
@@ -1256,13 +1259,13 @@ export default function AdminDashboardPage() {
               </div>
             )}
 
-            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+            <div className="form-actions">
               <button
                 type="submit"
                 className="btn-admin btn-primary"
                 disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
               >
-                {creating ? 'Creando campaña...' : 'Crear Campaña'}
+                {creating ? 'Creando campaña...' : 'Crear campaña'}
               </button>
               <button
                 type="button"
@@ -1270,7 +1273,7 @@ export default function AdminDashboardPage() {
                 className="btn-admin btn-secondary"
                 disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
               >
-                {creating ? 'Guardando...' : 'Guardar'}
+                {creating ? 'Guardando...' : 'Guardar borrador'}
               </button>
               <button
                 type="button"
@@ -1278,7 +1281,7 @@ export default function AdminDashboardPage() {
                 disabled={creating || generatingPreview || (campaignTypeToCreate === 'manual' && !urlsInput.trim()) || (campaignTypeToCreate === 'perpetual' && !accountsInput.trim())}
                 onClick={generatePreview}
               >
-                {generatingPreview ? 'Generando preview...' : 'Generar preview de comentarios'}
+                {generatingPreview ? 'Generando vista previa...' : 'Generar vista previa'}
               </button>
             </div>
             {previewFormError && (
@@ -1288,7 +1291,7 @@ export default function AdminDashboardPage() {
             )}
             {createdPreview && (
               <section aria-label="Preview recién generado" style={{ marginTop: '16px' }}>
-                <strong>Preview de comentarios</strong>
+                <strong>Vista previa</strong>
                 <ol style={{ whiteSpace: 'pre-wrap', listStyleType: 'decimal', paddingLeft: '20px' }}>
                   {createdPreview.map((comment, index) => <li key={index} style={{ marginBottom: '12px' }}>{comment}</li>)}
                 </ol>
